@@ -288,6 +288,18 @@ The write path is designed so that the synchronous portion (extraction through a
 
 One vector search, not three sequential passes. L0/L1 hits serve as directory entry points for tree expansion — discovering relevant L2 content that flat search would miss due to embedding dilution in long documents.
 
+Hierarchical expansion is enabled by default. To search only L2 content,
+set `retrieval.expand_hierarchy: false` in the service YAML, or
+`OGMEM_RETRIEVAL_EXPAND_HIERARCHY=false` when the YAML field is omitted.
+The setting applies to the whole service instance and requires restarting
+every worker. When disabled, retrieval searches L2 directly and skips roots,
+hierarchical expansion, and child searches, including empty-result fallbacks.
+Existing ranking, top-k limits, access scope, optional content filling, and
+public URI/read behavior still apply. This removes expansion work but can
+lose results discovered through L0/L1 summaries; measure recall on your
+workload. See [retrieval configuration](config/README.md#hierarchical-retrieval-expansion)
+for precedence and accepted values.
+
 **Namespace isolation:** Queries are scoped by intent type. MEMORY queries search both `users/{user}/memories/` and `agents/{agent}/memories/`. SKILL queries search only `agents/{agent}/skills/`. The `owner_space` filter is set by the QueryPlanner based on `context_type` and `visible_owner_spaces`, enforced at the vector index level — callers cannot override it.
 
 ---
@@ -371,17 +383,48 @@ python3 -m venv .venv && source .venv/bin/activate
 ```
 
 <details>
-<summary><strong>Option A: AGFS mode (default)</strong></summary>
+<summary><strong>Option A: Local OpenGauss mode (default)</strong></summary>
 
 ```bash
 pip install -e .
 
-# Interactive setup wizard (guides AGFS + LLM + Embedding + Vector DB config)
+# Interactive setup wizard (OpenGauss is the default vector and SQL backend)
 ogmem onboard
 
-# One-command start (AGFS + ContextEngine)
+# Check the existing database and start ContextEngine (SQL mode needs no AGFS)
 ogmem start local
 ```
+
+Start OpenGauss separately before onboarding. The wizard verifies connectivity
+before writing configuration; local startup checks the configured SQL database
+and launches ContextEngine. SQL startup and shutdown do not manage AGFS.
+When using a custom config, pass `-c /path/to/ogmem.yaml` to
+`ogmem start local`. The stop command uses the verified process record and does
+not need the configuration path. For
+a file-backed local setup, explicitly use
+`--vector-db chroma --storage-backend agfs`.
+
+Docker mode reuses the repository's `deploy/user-quickstart/deploy.sh` flow,
+including its OpenGauss, oGMemory, MCP, persistence, and OpenClaw checks.
+The current quickstart images and host script require ARM64 Linux, Docker,
+Bash, `ss`, and the standard GNU command-line tools:
+
+```bash
+ogmem onboard --non-interactive --mode docker --provider openai --api-key "$LLM_API_KEY" \
+  --base-url "$LLM_BASE_URL" --model "$LLM_MODEL" \
+  --embedding-provider openai --embedding-api-key "$EMBEDDING_API_KEY" \
+  --embedding-base-url "$EMBEDDING_BASE_URL" \
+  --embedding-model "$EMBEDDING_MODEL" --embedding-dimension 1024
+```
+
+This non-interactive command starts containers after preflight. To generate configuration
+and start later, run `ogmem onboard --mode docker` and decline immediate startup.
+Docker supports OpenAI, Volcengine, DashScope and Zhipu; DashScope/Zhipu embeddings
+use the OpenAI-compatible adapter with the supplied endpoint and credentials.
+Mock providers are available in local mode only.
+Zhipu's default `embedding-3` configuration uses its native 2048 dimensions.
+The configured embedding dimension must match the service's returned vectors;
+it does not change a model's output dimension by itself.
 
 <details>
 <summary><strong>Non-interactive mode (CI / automation)</strong></summary>
@@ -389,7 +432,9 @@ ogmem start local
 ```bash
 ogmem onboard --non-interactive --mode local \
   --provider openai --api-key sk-xxx \
-  --embedding-model text-embedding-ada-002 --vector-db chroma
+  --embedding-model text-embedding-ada-002 --vector-db chroma \
+  --storage-backend sql --sql-dialect opengauss \
+  --db-connection "$DB_CONNECTION"
 ```
 
 </details>
@@ -494,8 +539,17 @@ result = write_api.commit_session([
 <summary><strong>Docker / HTTP API Reference</strong></summary>
 
 ```bash
-docker compose up   # Server on :8090, PostgreSQL on :5432
+# First configure .env and follow deploy/compose/README_zh.md.
+python3 scripts/check_build_network.py  # Check images and selected dependency sources.
+docker compose build ogmemory
+docker compose up -d --wait --wait-timeout 900
+docker compose exec ogmemory python3 /opt/ogmem/scripts/bootstrap_compose.py   # HTTP :8090, MCP :8091
 ```
+
+The Compose stack includes oGMemory and openGauss, with persistent memory and database volumes.
+The current database image requires ARM64. Database and AGFS ports are internal.
+See [Docker Compose deployment and verification](deploy/compose/README_zh.md) for configuration,
+networking, model connectivity checks and cross-session persistence tests.
 
 | Endpoint | Method | Description |
 | -------- | ------ | ----------- |
@@ -528,8 +582,9 @@ Key environment variables (see [docs/OGMEMORY_ENV.md](docs/OGMEMORY_ENV.md) for 
 | `OGMEM_EMBEDDING_MODEL` | `text-embedding-ada-002` | Embedding model for vector indexing |
 | `OGMEM_EMBEDDING_API_KEY` | — | Separate key for embedding API (falls back to `OGMEM_API_KEY`) |
 | `VECTOR_DB_TYPE` | `memory` | Vector backend: `memory` / `opengauss` (pgvector) |
-| `STORAGE_BACKEND` | `sql` | Storage backend: `sql` (PostgreSQL) |
-| `SQL_CONNECTION_STRING` | — | PostgreSQL DSN (e.g. `host=127.0.0.1 port=5432 dbname=ogmemory`) |
+| `STORAGE_BACKEND` | `sql` | Storage backend: `sql` |
+| `SQL_DIALECT` | `postgresql` | SQL dialect: `postgresql` / `opengauss` |
+| `SQL_CONNECTION_STRING` | — | SQL database DSN (e.g. `host=127.0.0.1 port=5432 dbname=ogmemory`) |
 | `OGMEM_HTTP_PORT` | `8090` | HTTP server listen port |
 | `OGMEM_CONFIG` | `ogmem.yaml` | Path to YAML config file |
 | `OGMEM_AFTER_TURN_THRESHOLD` | `200` | Pending token threshold before automatic after-turn extraction |
@@ -572,17 +627,92 @@ ContextEngine/
 ├── docs/                   # Architecture, deployment, quickstart guides
 ├── examples/               # Usage examples (SDK, Claude Code integration)
 ├── cli/                    # Unified management CLI (ogmem command)
+├── plugins/ogmemory/       # Codex plugin (full-lifecycle HTTP hooks)
 ├── openclaw_context_engine_plugin/  # OpenClaw plugin (TypeScript bridge)
 └── scripts/                # Auxiliary scripts
 ```
 
 ---
 
+## Codex Integration
+
+For portable memory retrieval and writing across clients, see the
+[Agent Plugin package](agent-plugins/README.md) and
+[client tutorial](docs/integrations/agent-plugins.md).
+
+The repository-local [`ogmemory` Codex plugin](plugins/ogmemory/) connects all Codex lifecycle hooks to a local or remote oGMemory HTTP service. It captures sessions, prompts, tools, permissions, compaction, subagents, completed turns, and session shutdown. See the [Codex integration guide](docs/integrations/codex.md).
+
+---
+
+## OpenCode Integration
+
+The npm-ready [`opencode-plugin`](opencode-plugin/) package provides automatic memory recall, incremental conversation write-back, and canonical Trace capture through OpenCode lifecycle hooks. It targets OpenCode 1.15.11 or later and operates above MCP; MCP remains available for explicit memory tools.
+
+For source installation, configuration, privacy controls, and verification steps, see the [plugin README](opencode-plugin/README.md).
+
+---
+
+## DeepSeek Harness Integration
+
+The installable [`deepseek-harness-plugin`](deepseek-harness-plugin/) bundle connects
+DeepSeek Harness to an oGMemory HTTP service and provides automatic cross-session
+memory recall.
+
+See the [DeepSeek Harness integration guide](docs/integrations/deepseek-harness.md).
+
+---
+
+## LangChain Deep Agents Integration
+
+Install `python -m pip install '.[deepagents]'` and pass
+`OGMemoryMiddleware` from `integrations.deepagents` to
+`create_deep_agent(middleware=[...])` for automatic recall and turn capture.
+Both sync and async execution are supported, with `configurable.thread_id`
+isolating sessions. See the [Deep Agents integration guide](docs/integrations/deepagents.md)
+and [example](examples/deepagents_memory.py).
+
+## Hermes Agent Integration
+
+The native [`hermes_memory_plugin`](hermes_memory_plugin/) provider adds automatic
+recall, turn write-back, session commit, and explicit `ogmemory_search` and
+`ogmemory_remember` tools to Hermes Agent.
+
+See the [Hermes Agent integration guide](docs/integrations/hermes.md).
+
+---
+
 ## OpenClaw Integration
 
 ```bash
+ogmem onboard --mode plugin
+
+# Or install manually from the plugin source directory
 cd openclaw_context_engine_plugin && openclaw plugins install -l .
 ```
+
+`ogmem onboard --mode plugin` exports connection configuration for an **existing
+Agent and independently deployed oGMemory service**. It does not install the
+Agent/plugin, change active Agent settings, install backend dependencies, or
+start services. Select OpenClaw, Claude Code, Codex, OpenCode, DeepSeek Harness,
+Hermes, or Deep Agents with `--agent`; other Agent names generate HTTP MCP configuration.
+
+```bash
+ogmem onboard --mode plugin --agent openclaw --non-interactive \
+  --ogmem-url https://memory.example.com \
+  --account-id acct-1 --user-id user-1 --agent-id openclaw \
+  --ogmem-api-key-env OG_AUTH_API_KEY
+
+# Other Agents: supply the MCP endpoint explicitly; its port may differ from REST.
+ogmem onboard --mode plugin --agent my-agent --non-interactive \
+  --mcp-url https://memory.example.com:18091/mcp \
+  --ogmem-api-key-env OG_AUTH_API_KEY
+```
+
+Files are exported to `./ogmem-client-config/<adapter>/` (or `--output-dir`),
+including instructions to install the plugin, merge the configuration, and verify
+it on the Agent machine. Configuration export does not mean the integration is
+active. MCP provides tools; native lifecycle recall/writeback requires an adapter.
+See [Agent configuration export](docs/integrations/plugin-config.md).
 
 ```
 OpenClaw Agent
@@ -615,7 +745,9 @@ Evaluated on [LoCoMo](https://arxiv.org/abs/2402.10790) long-context conversatio
 
 **Lifecycle stages to cover:** ③ before_tool_call + tool_result_persist and the remaining operational hardening for ⑥ session_end + dispose.
 
-**Documentation:** [docs/OGMEMORY_ENV.md](docs/OGMEMORY_ENV.md) (environment setup) | [Quickstart](docs/QUICKSTART.md) | [Deployment](docs/deployment/deployment_operations_guide.md) | [OpenClaw Plugin](openclaw_context_engine_plugin/README.md) | [Benchmark](tests/e2e/) (LoCoMo evaluation)
+**Documentation:** [docs/OGMEMORY_ENV.md](docs/OGMEMORY_ENV.md) (environment setup) | [Client integrations](docs/integrations/README.md) | [Codex](docs/integrations/codex.md) | [DeepSeek Harness](docs/integrations/deepseek-harness.md) | [Hermes Agent](docs/integrations/hermes.md) | [Quickstart](docs/QUICKSTART.md) | [Deployment](docs/deployment/deployment_operations_guide.md) | [OpenClaw Plugin](openclaw_context_engine_plugin/README.md) | [Benchmark](tests/e2e/) (LoCoMO evaluation)
+
+**MCP:** [Protocol compatibility](docs/mcp_protocol_compatibility.md)
 
 **Testing:** `pytest tests/contract/ -v` (core invariants) | `pytest tests/ -v` (all tests) | `pytest tests/ --cov=core --cov=fs --cov=service --cov-report=html`
 

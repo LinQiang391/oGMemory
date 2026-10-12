@@ -25,7 +25,7 @@ classifiers = [
 dependencies = [
     "psycopg2-binary>=2.9.0",
     "pyagfs>=1.4.0",
-    "openai>=1.0.0",
+    "openai>=1.66.0",
     "apscheduler>=3.10.0",
     "jinja2>=3.1.0",
     "pyyaml>=6.0",
@@ -34,11 +34,13 @@ dependencies = [
     "rich>=13.0.0",
     "httpx>=0.25.0",
     "requests>=2.28.0",
+    "pydantic>=2.0",
     "python-dotenv>=1.0.0",
     "json-repair>=0.7.0",
+    "jsonschema>=4.20.0",
     "rank-bm25>=0.2.2",
     "nltk>=3.9.4",
-    "mcp[cli]>=1.28.1,<2",
+    "mcp[cli]>=2.0.0,<3",
 ]
 
 [project.scripts]
@@ -46,6 +48,7 @@ ogmem = "cli.main:main"
 
 [project.optional-dependencies]
 dev = [
+    "hatchling>=1.27",
     "pytest>=8.0",
     "pytest-asyncio>=0.24",
     "pytest-cov>=5.0",
@@ -54,6 +57,7 @@ dev = [
 ]
 opengauss = []  # psycopg2-binary now in core dependencies
 chroma = ["chromadb>=0.4.0"]
+deepagents = ["deepagents>=0.7.23,<0.8"]
 sentence-transformers = ["sentence-transformers>=2.0.0"]
 
 # E2E eval dependencies
@@ -86,6 +90,9 @@ packages = [
     "service",
     "server",
     "session",
+    "skills",
+    "scene",
+    "integrations",
 ]
 
 [tool.hatch.build.targets.sdist]
@@ -102,6 +109,9 @@ include = [
     "/service",
     "/server",
     "/session",
+    "/skills",
+    "/scene",
+    "/integrations",
 ]
 
 [tool.pytest.ini_options]
@@ -126,7 +136,7 @@ select = ["E", "F", "I", "N", "W", "UP"]
 ignore = ["E501"]  # line-length handled by formatter
 
 [tool.ruff.lint.isort]
-known-first-party = ["core", "fs", "extraction", "commit", "index", "retrieval", "providers", "service", "server"]
+known-first-party = ["core", "fs", "extraction", "commit", "index", "retrieval", "providers", "service", "server", "integrations"]
 
 # MyPy configuration
 [tool.mypy]
@@ -134,6 +144,16 @@ python_version = "3.11"
 warn_return_any = true
 warn_unused_configs = true
 disallow_untyped_defs = false
+# 存量目录整体豁免类型检查；被本次 commit 改到的其它文件仍会检查
+exclude = "^(tests/|examples/)"
 [[tool.mypy.overrides]]
 module = "pyagfs.*"
 ignore_missing_imports = true
+
+# ---- pre-commit 存量债务集中屏蔽入口（不必改老代码行，避免触发 darker 行级连锁）----
+# 示例： "core/legacy.py" = ["E501"]
+[tool.ruff.lint.per-file-ignores]
+
+# ---- Bandit：安全扫描（排除测试/示例，避免 assert 等误报）----
+[tool.bandit]
+exclude_dirs = ["tests", "examples"]

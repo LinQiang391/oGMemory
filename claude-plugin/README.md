@@ -11,10 +11,53 @@
 | `Stop` | `call_after_turn.py` (async) 或 `stop_detach.sh` | `/api/v1/after_turn` | 写入 | 对话结束增量同步 transcript 到 oGMemory（JSONL 字节偏移），支持 headless -p 模式 |
 | `PreCompact` | `call_after_turn.py` | `/api/v1/after_turn` | 写入 | 压缩前同步，防未落盘内容丢失 |
 
+### Trace 捕获
+
+`call_add_session_message.py` 还会把 Claude Code hook 转成统一的 trace event，并发送到 `POST /api/v1/trace/events`。进入服务端后只保留 canonical event 语义，不再依赖 Claude Code 的原生 hook 类型。兼容旧请求时，服务端仍会把 legacy `Stop` 当作 `turn_end` 边界处理。
+
+| Claude Code hook | Canonical event |
+| --- | --- |
+| `SessionStart` | `session_start` |
+| `UserPromptSubmit` | `user_message` |
+| `PreToolUse` | `tool_start` |
+| `PostToolUse` | `tool_success` |
+| `PostToolUseFailure` | `tool_failure` |
+| `Stop` | `turn_end` |
+| `SubagentStop` | `assistant_message` |
+| `PreCompact` | `pre_compact` |
+| `SessionEnd` | `session_end` |
+
+Trace 默认保存可诊断内容，但在 hook2Event 阶段会先做不可逆脱敏：邮箱、手机号、证件号、银行卡号、IP、Bearer/API key、cookie、带凭据的连接串等会替换成 `{{email_1}}`、`{{connection_string_1}}` 这类占位符。同一个 event 内相同敏感值复用同一个占位符；跨 event 不共享映射。若当前环境不希望捕获内容，可设置 `OGMEM_TRACE_CAPTURE_CONTENT=0`（也支持 `false` / `no` / `off`）只保留结构化边界和元信息。
+
 ## 配置与鉴权（可选）
 
 - **基址：** 默认 `http://localhost:8090`，可用 `OG_MEMORY_URL` 覆盖。
 - **与 OpenClaw 对齐的密钥：** 在 `claude` 进程环境中设置 `OG_AUTH_API_KEY` 时，请求会附带 `X-API-Key` 与 `X-Account-ID` / `X-User-ID`（身份解析见 `ogm_plugin_request.py`：可选 `OgMemConfig` 或环境变量回退）。服务端无密钥鉴权时可不设置，**禁止将密钥提交到仓库**。
+
+### 自动写入与自动召回开关
+
+两个开关相互独立，默认都开启，与 OpenClaw 的自动捕获/召回开关命名一致。
+在启动 `claude` 的进程环境中配置，例如只读取已有记忆：
+
+```bash
+export OGMEM_AUTO_CAPTURE=false
+export OGMEM_AUTO_RECALL=true
+claude
+```
+
+| 环境变量 | 默认值 | 关闭后的行为 |
+| --- | --- | --- |
+| `OGMEM_AUTO_CAPTURE` | `true` | `Stop` / `PreCompact` 不读取或同步 transcript，`PostToolUse` 不补录工具消息；Stop 包装脚本不创建临时文件或后台写入进程 |
+| `OGMEM_AUTO_RECALL` | `true` | `UserPromptSubmit` 不调用 compose，也不注入自动召回上下文 |
+
+沿用插件布尔解析规则：`1`、`true`、`yes`（忽略大小写及首尾空白）开启，
+其他显式值关闭，推荐使用 `false`、`0`、`no`、`off`。修改后重新启动 Claude Code。
+
+关闭自动写入时不创建或推进 `.ingest-offset`，也不会发起 after-turn 重试；
+重新开启后，从上次成功写入的偏移继续同步，因此关闭期间的对话可能被补录。
+这些开关控制自动记忆流程：Trace 仍会上传（包括消息内容，可通过
+`OGMEM_TRACE_CAPTURE_CONTENT=0` 仅保留元数据）。
+显式 `/og-add-history`、`/og-compose` 和 MCP 工具保持可用。
 
 ## Skills
 

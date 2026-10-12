@@ -132,6 +132,21 @@ class InMemoryVectorIndex(VectorIndex):
         hits.sort(key=lambda h: h.score, reverse=True)
         return hits[:top_k]
 
+    def get_embeddings(
+        self,
+        uris: list[str],
+        filters: dict[str, Any],
+        level: int = 0,
+    ) -> dict[str, list[float]]:
+        wanted = set(uris)
+        output: dict[str, list[float]] = {}
+        for record_id, record in self._records.items():
+            if record.uri not in wanted or record.level != level:
+                continue
+            if self._matches_raw_filters(record, filters):
+                output[record.uri] = list(self._vectors[record_id])
+        return output
+
     def search_children(
         self,
         parent_uri: str,
@@ -192,11 +207,12 @@ class InMemoryVectorIndex(VectorIndex):
             context_type=meta.get("context_type", ""),
             category=meta.get("category", ""),
             owner_space=record.filters.get("owner_space", ""),
-            abstract=record.text[:200],
+            abstract=meta.get("abstract", record.text[:200]),
             has_overview=meta.get("has_overview", False),
             has_content=meta.get("has_content", False),
             active_count=meta.get("active_count", 0),
             updated_at=meta.get("updated_at"),
+            metadata=dict(meta),
         )
 
     def get_record(self, record_id: str) -> IndexRecord | None:
@@ -210,13 +226,26 @@ class InMemoryVectorIndex(VectorIndex):
         """
         return self._records.get(record_id)
 
-    def count(self) -> int:
-        """Get total record count (for testing).
+    def count(self, filters: dict[str, Any] | None = None) -> int:
+        """Get record count, optionally constrained by filters.
 
         Returns:
             Number of records in the index
         """
-        return len(self._records)
+        if not filters:
+            return len(self._records)
+
+        def matches(record: IndexRecord) -> bool:
+            for key, expected in filters.items():
+                actual = record.filters.get(key)
+                if isinstance(expected, (list, tuple, set)):
+                    if actual not in expected:
+                        return False
+                elif actual != expected:
+                    return False
+            return True
+
+        return sum(matches(record) for record in self._records.values())
 
     def delete_account_data(self, account_id: str) -> int:
         """Delete all index records for an account.

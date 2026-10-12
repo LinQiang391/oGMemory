@@ -1,8 +1,7 @@
 """Extended tests for InMemoryVectorIndex delete operations."""
 
-import pytest
 
-from core.models import IndexRecord, RequestContext
+from core.models import IndexRecord
 from providers.vector_index.in_memory_index import InMemoryVectorIndex
 
 
@@ -75,7 +74,7 @@ class TestInMemoryDeleteOperations:
                 metadata={"category": "profile"}
             ),
             IndexRecord(
-                id="3", uri="ctx://acme/agents/a1/skills/s1",
+                id="3", uri="ctx://acme/agents/a1/skills/generated/s1",
                 level=0, text="agent skill", filters={"account_id": "acme", "owner_space": "agent:a1"},
                 metadata={"category": "skill"}
             ),
@@ -171,6 +170,34 @@ class TestInMemorySearchByVector:
 
         assert len(results) == 5
 
+    def test_search_by_vector_preserves_metadata(self):
+        """Test search_by_vector carries record metadata into SeedHit."""
+        index = InMemoryVectorIndex()
+        index.upsert([
+            IndexRecord(
+                id="1",
+                uri="ctx://acme/users/u1/memories/events/pride",
+                level=2,
+                text="Caroline attended pride.",
+                filters={"account_id": "acme", "owner_space": "user:u1"},
+                metadata={
+                    "context_type": "MEMORY",
+                    "category": "event",
+                    "when": "2023-06-26",
+                    "who": ["Caroline"],
+                },
+            )
+        ])
+
+        results = index.search_by_vector(
+            query_vector=index._mock_vector("Caroline pride"),
+            filters={"account_id": "acme"},
+            top_k=1,
+        )
+
+        assert results[0].metadata["when"] == "2023-06-26"
+        assert results[0].metadata["who"] == ["Caroline"]
+
     def test_search_children_filters_by_parent_uri(self):
         """Test search_children only returns direct children of parent_uri."""
         index = InMemoryVectorIndex()
@@ -208,3 +235,17 @@ class TestInMemorySearchByVector:
             "ctx://acme/users/u1/memories/preferences/p1",
             "ctx://acme/users/u1/memories/preferences/p2",
         }
+
+    def test_count_supports_tenant_filters(self):
+        index = InMemoryVectorIndex()
+        index.upsert([
+            IndexRecord(id="1", uri="ctx://a/1", level=0, text="one",
+                        filters={"account_id": "a", "owner_space": "user:u1"}, metadata={}),
+            IndexRecord(id="2", uri="ctx://a/2", level=0, text="two",
+                        filters={"account_id": "a", "owner_space": "user:u2"}, metadata={}),
+            IndexRecord(id="3", uri="ctx://b/1", level=0, text="three",
+                        filters={"account_id": "b", "owner_space": "user:u1"}, metadata={}),
+        ])
+
+        assert index.count({"account_id": "a"}) == 2
+        assert index.count({"account_id": "a", "owner_space": ["user:u2"]}) == 1

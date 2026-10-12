@@ -63,32 +63,8 @@ class OutboxStore:
         Returns:
             OutboxEvent that was registered
         """
-        from index.index_record_builder import build_index_records
-
-        # Build IndexRecords from ContextNode (L0/L1/L2)
-        index_records = build_index_records(node)
-
-        # Serialize IndexRecords to payload format expected by OutboxWorker
-        records_data = [
-            {
-                "id": r.id,
-                "uri": r.uri,
-                "level": r.level,
-                "text": r.text,
-                "filters": r.filters,
-                "metadata": r.metadata,
-            }
-            for r in index_records
-        ]
-
-        event_id = str(uuid.uuid4())
-        event = OutboxEvent(
-            event_id=event_id,
-            event_type=EventType.UPSERT_CONTEXT.value,
-            uri=node.uri,
-            payload={"records": records_data},
-            status="PENDING",
-        )
+        from commit.write_events import build_write_event
+        event = build_write_event(node)
 
         self._write_event(event, node.uri)
         return event

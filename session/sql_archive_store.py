@@ -12,7 +12,7 @@ import logging
 import uuid
 from datetime import UTC, datetime
 
-from core.models import RequestContext
+from core.models import RequestContext, Role
 from fs.sql_adapter.pool import PoolAdapterMixin
 from session.models import ArchiveEntry, ArchiveWriteResult
 
@@ -36,7 +36,7 @@ def _metadata_from_db(raw) -> dict:
 
 
 def _is_merged_metadata(metadata: dict) -> bool:
-    return str(metadata.get("status", "")).upper() == "MERGED"
+    return str(metadata.get("archive_status", metadata.get("status", ""))).upper() == "MERGED"
 
 
 class SQLSessionArchiveStore(PoolAdapterMixin):
@@ -53,13 +53,14 @@ class SQLSessionArchiveStore(PoolAdapterMixin):
         connection_string: str | None = None,
         pool_size: int = 5,
         pool=None,
+        dialect: str = "postgresql",
     ):
         if not _HAS_PSYCOPG2:
             raise ImportError(
                 "psycopg2 is required for SQLSessionArchiveStore. "
                 "Install with: pip install psycopg2-binary"
             )
-        self._init_pool(pool, connection_string, pool_size)
+        self._init_pool(pool, connection_string, pool_size, dialect)
         self._ensure_table()
 
     # ------------------------------------------------------------------
@@ -88,12 +89,10 @@ class SQLSessionArchiveStore(PoolAdapterMixin):
 
         conn = self._get_connection()
         try:
-            ensure_schema(conn)
+            ensure_schema(conn, self.sql_dialect)
         except Exception as exc:
             conn.rollback()
-            raise RuntimeError(
-                f"Failed to ensure schema: {exc}"
-            ) from exc
+            raise RuntimeError(f"Failed to ensure schema: {exc}") from exc
         finally:
             self._return_connection(conn)
 
@@ -111,54 +110,43 @@ class SQLSessionArchiveStore(PoolAdapterMixin):
         archive_id: str | None = None,
         metadata: dict | None = None,
     ) -> ArchiveWriteResult:
-        """Write a session archive to PostgreSQL.
-
-        Uses INSERT ON CONFLICT for idempotent upsert.
-        """
+        """Write an archive idempotently using the configured SQL dialect."""
+        self.bind_context(ctx, session_id=session_id)
         if archive_id is None:
-            archive_id = (
-                f"{datetime.now(UTC).strftime('%Y%m%d_%H%M%S')}"
-                f"_{uuid.uuid4().hex[:8]}"
-            )
+            archive_id = f"{datetime.now(UTC).strftime('%Y%m%d_%H%M%S')}_{uuid.uuid4().hex[:8]}"
 
-        uri = (
-            f"ctx://{ctx.account_id}/sessions/{session_id}"
-            f"/history/{archive_id}"
-        )
+        uri = f"ctx://{ctx.account_id}/sessions/{session_id}/history/{archive_id}"
         now = datetime.now(UTC).isoformat()
 
-        archive_metadata = {
-            "archive_id": archive_id,
-            "session_id": session_id,
-            "created_at": now,
-            "message_count": len(messages),
-        }
-        if metadata:
-            archive_metadata.update(metadata)
+        archive_metadata = dict(metadata or {})
+        archive_metadata.update(
+            {
+                "archive_id": archive_id,
+                "session_id": session_id,
+                "created_at": now,
+                "message_count": len(messages),
+                "owner_user_id": ctx.user_id,
+                "owner_agent_id": ctx.agent_id,
+            }
+        )
 
         conn = self._get_connection()
         try:
             self.bind_tenant(conn, ctx.account_id)
             with conn.cursor() as cur:
-                cur.execute(
-                    """
-                    INSERT INTO session_archives
-                        (archive_id, session_id, account_id,
-                         abstract, overview, messages, metadata, created_at)
-                    VALUES (%s, %s, %s, %s, %s, %s, %s, %s)
-                    ON CONFLICT (account_id, session_id, archive_id) DO NOTHING
-                    """,
-                    (
-                        archive_id,
-                        session_id,
-                        ctx.account_id,
-                        abstract or "",
-                        overview or "",
-                        Json(messages),
-                        Json(archive_metadata),
-                        now,
-                    ),
+                params = (
+                    archive_id,
+                    session_id,
+                    ctx.account_id,
+                    abstract or "",
+                    overview or "",
+                    Json(messages),
+                    Json(archive_metadata),
+                    now,
+                    ctx.user_id,
+                    ctx.agent_id,
                 )
+                self.sql_dialect.insert_session_archive(cur, params)
             conn.commit()
             return ArchiveWriteResult(
                 archive_id=archive_id,
@@ -179,10 +167,9 @@ class SQLSessionArchiveStore(PoolAdapterMixin):
         finally:
             self._return_connection(conn)
 
-    def list_archives(
-        self, session_id: str, ctx: RequestContext
-    ) -> list[ArchiveEntry]:
+    def list_archives(self, session_id: str, ctx: RequestContext) -> list[ArchiveEntry]:
         """List all archives for a session, newest first."""
+        self.bind_context(ctx, session_id=session_id)
         conn = self._get_connection()
         try:
             self.bind_tenant(conn, ctx.account_id)
@@ -193,7 +180,9 @@ class SQLSessionArchiveStore(PoolAdapterMixin):
                            messages, metadata, created_at
                     FROM session_archives
                     WHERE account_id = %s AND session_id = %s
-                      AND UPPER(COALESCE(metadata->>'status', '')) <> 'MERGED'
+                      AND UPPER(COALESCE(
+                            metadata->>'archive_status', metadata->>'status', ''
+                          )) <> 'MERGED'
                     ORDER BY created_at DESC
                     """,
                     (ctx.account_id, session_id),
@@ -218,9 +207,7 @@ class SQLSessionArchiveStore(PoolAdapterMixin):
             ) = row
 
             meta = (
-                json.loads(metadata_raw)
-                if isinstance(metadata_raw, str)
-                else (metadata_raw or {})
+                json.loads(metadata_raw) if isinstance(metadata_raw, str) else (metadata_raw or {})
             )
             if _is_merged_metadata(meta):
                 continue
@@ -254,6 +241,7 @@ class SQLSessionArchiveStore(PoolAdapterMixin):
         Returns:
             List of ArchiveEntry with messages included, ordered by created_at DESC
         """
+        self.bind_context(ctx)
         conn = self._get_connection()
         try:
             self.bind_tenant(conn, ctx.account_id)
@@ -264,7 +252,9 @@ class SQLSessionArchiveStore(PoolAdapterMixin):
                            messages, metadata, created_at
                     FROM session_archives
                     WHERE account_id = %s AND created_at > %s
-                      AND UPPER(COALESCE(metadata->>'status', '')) <> 'MERGED'
+                      AND UPPER(COALESCE(
+                            metadata->>'archive_status', metadata->>'status', ''
+                          )) <> 'MERGED'
                     ORDER BY created_at DESC
                     LIMIT %s
                     """,
@@ -298,9 +288,7 @@ class SQLSessionArchiveStore(PoolAdapterMixin):
                 messages = []
 
             meta = (
-                json.loads(metadata_raw)
-                if isinstance(metadata_raw, str)
-                else (metadata_raw or {})
+                json.loads(metadata_raw) if isinstance(metadata_raw, str) else (metadata_raw or {})
             )
             if _is_merged_metadata(meta):
                 continue
@@ -325,6 +313,7 @@ class SQLSessionArchiveStore(PoolAdapterMixin):
         ctx: RequestContext,
     ) -> ArchiveEntry | None:
         """Read a full session archive including messages."""
+        self.bind_context(ctx, session_id=session_id)
         conn = self._get_connection()
         try:
             self.bind_tenant(conn, ctx.account_id)
@@ -366,11 +355,7 @@ class SQLSessionArchiveStore(PoolAdapterMixin):
         else:
             messages = []
 
-        meta = (
-            json.loads(metadata_raw)
-            if isinstance(metadata_raw, str)
-            else (metadata_raw or {})
-        )
+        meta = json.loads(metadata_raw) if isinstance(metadata_raw, str) else (metadata_raw or {})
 
         return ArchiveEntry(
             archive_id=aid,
@@ -389,6 +374,7 @@ class SQLSessionArchiveStore(PoolAdapterMixin):
         ctx: RequestContext,
     ) -> str | None:
         """Read only the abstract from an archive."""
+        self.bind_context(ctx, session_id=session_id)
         conn = self._get_connection()
         try:
             self.bind_tenant(conn, ctx.account_id)
@@ -418,6 +404,7 @@ class SQLSessionArchiveStore(PoolAdapterMixin):
         ctx: RequestContext,
     ) -> bool:
         """Delete a single archive row for the current account and session."""
+        self.bind_context(ctx, session_id=session_id)
         conn = self._get_connection()
         try:
             self.bind_tenant(conn, ctx.account_id)
@@ -440,6 +427,77 @@ class SQLSessionArchiveStore(PoolAdapterMixin):
         finally:
             self._return_connection(conn)
 
+    def delete_session_archives(self, session_id: str, ctx: RequestContext) -> int:
+        """Delete exact-owner rows plus ADMIN/ROOT-visible ownerless legacy rows."""
+        self.bind_context(ctx, session_id=session_id)
+        conn = self._get_connection()
+        try:
+            self.bind_tenant(conn, ctx.account_id)
+            with conn.cursor() as cur:
+                role = ctx.role if isinstance(ctx.role, Role) else Role(str(ctx.role).upper())
+                if role in (Role.ADMIN, Role.ROOT):
+                    cur.execute(
+                        """
+                        DELETE FROM session_archives
+                        WHERE account_id = %s AND session_id = %s
+                          AND (
+                            (owner_user_id = %s AND owner_agent_id = %s)
+                            OR (
+                              COALESCE(owner_user_id, '') = ''
+                              AND COALESCE(owner_agent_id, '') = ''
+                            )
+                          )
+                        """,
+                        (ctx.account_id, session_id, ctx.user_id, ctx.agent_id),
+                    )
+                else:
+                    cur.execute(
+                        """
+                        DELETE FROM session_archives
+                        WHERE account_id = %s AND session_id = %s
+                          AND owner_user_id = %s AND owner_agent_id = %s
+                        """,
+                        (ctx.account_id, session_id, ctx.user_id, ctx.agent_id),
+                    )
+                count = cur.rowcount
+            conn.commit()
+            return count
+        except Exception:
+            conn.rollback()
+            raise
+        finally:
+            self._return_connection(conn)
+
+    def get_session_owner(self, session_id: str, ctx: RequestContext) -> tuple[str, str] | None:
+        self.bind_context(ctx, session_id=session_id)
+        conn = self._get_connection()
+        try:
+            self.bind_tenant(conn, ctx.account_id)
+            with conn.cursor() as cur:
+                cur.execute(
+                    """
+                    SELECT DISTINCT COALESCE(owner_user_id, ''), COALESCE(owner_agent_id, '')
+                    FROM session_archives
+                    WHERE account_id = %s AND session_id = %s
+                    """,
+                    (ctx.account_id, session_id),
+                )
+                rows = cur.fetchall()
+            conn.rollback()
+        except Exception:
+            conn.rollback()
+            raise
+        finally:
+            self._return_connection(conn)
+        owners = {tuple(row) for row in rows}
+        owners.discard(("", ""))
+        if len(owners) > 1:
+            raise PermissionError("conflicting durable session owners")
+        owner = next(iter(owners)) if owners else None
+        if owner is not None and not all(owner):
+            raise PermissionError("invalid durable session owner metadata")
+        return owner
+
     def unmark_archive_merged(
         self,
         session_id: str,
@@ -448,6 +506,7 @@ class SQLSessionArchiveStore(PoolAdapterMixin):
         merged_into: str,
     ) -> bool:
         """Undo a merge marker when a merge operation rolls back."""
+        self.bind_context(ctx, session_id=session_id)
         conn = self._get_connection()
         try:
             self.bind_tenant(conn, ctx.account_id)
@@ -469,7 +528,9 @@ class SQLSessionArchiveStore(PoolAdapterMixin):
                     conn.rollback()
                     return False
 
-                metadata.pop("status", None)
+                metadata.pop("archive_status", None)
+                if str(metadata.get("status", "")).upper() == "MERGED":
+                    metadata.pop("status", None)
                 metadata.pop("merged_into", None)
                 metadata.pop("merged_at", None)
 
@@ -497,11 +558,12 @@ class SQLSessionArchiveStore(PoolAdapterMixin):
         merged_into: str,
     ) -> bool:
         """Mark an archive row as merged into another archive."""
+        self.bind_context(ctx, session_id=session_id)
         conn = self._get_connection()
         try:
             self.bind_tenant(conn, ctx.account_id)
             marker = {
-                "status": "MERGED",
+                "archive_status": "MERGED",
                 "merged_into": merged_into,
                 "merged_at": datetime.now(UTC).isoformat(),
             }

@@ -11,6 +11,10 @@ import {
   findPythonBin,
 } from "./process.js";
 import { appendTakeoverCompactionBoundary } from "./compaction-boundary.js";
+import {
+  isOpenClawHeartbeatMessage,
+  registerOpenClawTraceHooks,
+} from "./trace.js";
 
 export { appendTakeoverCompactionBoundary } from "./compaction-boundary.js";
 
@@ -36,8 +40,19 @@ function resolveInteger(value, fallback) {
   return Number.isFinite(parsed) && parsed > 0 ? parsed : fallback;
 }
 
+function resolveJsonObject(value, fallback = {}) {
+  if (value && typeof value === "object" && !Array.isArray(value)) return value;
+  if (typeof value === "string" && value.trim()) {
+    try {
+      const parsed = JSON.parse(value);
+      if (parsed && typeof parsed === "object" && !Array.isArray(parsed)) return parsed;
+    } catch {}
+  }
+  return fallback;
+}
+
 export function resolveConfig(pluginConfig = {}) {
-  return {
+  const resolved = {
     mode: pluginConfig.mode || process.env.OGMEM_MODE || "remote",
     // AGFS
     agfsServerDir:
@@ -61,7 +76,11 @@ export function resolveConfig(pluginConfig = {}) {
     authAccountId: pluginConfig.authAccountId || process.env.OG_AUTH_ACCOUNT_ID || "",
     // Timing
     startupTimeoutMs: pluginConfig.startupTimeoutMs || 60_000,
+    traceTimeoutMs: resolveInteger(pluginConfig.traceTimeoutMs, 3000),
+    traceCaptureContent: pluginConfig.traceCaptureContent !== false,
     commitTokenThreshold: pluginConfig.commitTokenThreshold ?? 0,
+    autoCapture: resolveBoolean(pluginConfig.autoCapture ?? process.env.OGMEM_AUTO_CAPTURE, true),
+    autoRecall: resolveBoolean(pluginConfig.autoRecall ?? process.env.OGMEM_AUTO_RECALL, true),
     prefetchEnabled: resolveBoolean(
       pluginConfig.prefetchEnabled ?? process.env.OGMEM_PREFETCH_ENABLED,
       false,
@@ -76,14 +95,39 @@ export function resolveConfig(pluginConfig = {}) {
     agentId: pluginConfig.agentId || "",
     // LLM (passed as env vars to CE server)
     llmProvider: pluginConfig.llmProvider || process.env.CONTEXTENGINE_PROVIDER || "mock",
-    llmApiKey: pluginConfig.llmApiKey || process.env.OPENAI_API_KEY || "",
-    llmBaseUrl: pluginConfig.llmBaseUrl || process.env.OPENAI_BASE_URL || "",
-    llmModel: pluginConfig.llmModel || process.env.OPENAI_LLM_MODEL || "gpt-4o-mini",
+    llmApiKey:
+      pluginConfig.llmApiKey || process.env.OGMEM_API_KEY || process.env.OPENAI_API_KEY || "",
+    llmBaseUrl:
+      pluginConfig.llmBaseUrl || process.env.OGMEM_BASE_URL || process.env.OPENAI_BASE_URL || "",
+    llmModel:
+      pluginConfig.llmModel || process.env.OGMEM_LLM_MODEL || process.env.OPENAI_LLM_MODEL || "gpt-4o-mini",
+    llmReasoningEffort:
+      pluginConfig.llmReasoningEffort || process.env.LLM_REASONING_EFFORT || "",
+    llmIsReasoningModel:
+      pluginConfig.llmIsReasoningModel ??
+      (process.env.LLM_IS_REASONING_MODEL === undefined
+        ? null
+        : resolveBoolean(process.env.LLM_IS_REASONING_MODEL, null)),
+    llmExtraBody: resolveJsonObject(
+      pluginConfig.llmExtraBody ?? process.env.LLM_EXTRA_BODY,
+    ),
     // Embedding (defaults to LLM settings if not specified)
     embeddingProvider: pluginConfig.embeddingProvider || process.env.EMBEDDING_PROVIDER || "",
-    embeddingApiKey: pluginConfig.embeddingApiKey || process.env.OPENAI_EMBEDDING_API_KEY || "",
-    embeddingBaseUrl: pluginConfig.embeddingBaseUrl || process.env.OPENAI_EMBEDDING_BASE_URL || "",
-    embeddingModel: pluginConfig.embeddingModel || process.env.OPENAI_EMBEDDING_MODEL || "text-embedding-ada-002",
+    embeddingApiKey:
+      pluginConfig.embeddingApiKey ||
+      process.env.OGMEM_EMBEDDING_API_KEY ||
+      process.env.OPENAI_EMBEDDING_API_KEY ||
+      "",
+    embeddingBaseUrl:
+      pluginConfig.embeddingBaseUrl ||
+      process.env.OGMEM_EMBEDDING_BASE_URL ||
+      process.env.OPENAI_EMBEDDING_BASE_URL ||
+      "",
+    embeddingModel:
+      pluginConfig.embeddingModel ||
+      process.env.OGMEM_EMBEDDING_MODEL ||
+      process.env.OPENAI_EMBEDDING_MODEL ||
+      "text-embedding-ada-002",
     compactTakeoverEnabled: resolveBoolean(
       pluginConfig.compactTakeoverEnabled ?? process.env.OGMEM_COMPACT_TAKEOVER_ENABLED,
       true,
@@ -98,6 +142,28 @@ export function resolveConfig(pluginConfig = {}) {
         ? process.env.OGMEM_SHORT_TERM_INDEX_MODE
         : "sync",
   };
+  resolved.modelConfigOverrides = Object.fromEntries(
+    [
+      "llmProvider",
+      "llmApiKey",
+      "llmBaseUrl",
+      "llmModel",
+      "llmReasoningEffort",
+      "llmIsReasoningModel",
+      "llmExtraBody",
+      "embeddingProvider",
+      "embeddingApiKey",
+      "embeddingBaseUrl",
+      "embeddingModel",
+    ]
+      .filter(
+        (key) =>
+          Object.prototype.hasOwnProperty.call(pluginConfig, key) &&
+          (key === "llmIsReasoningModel" ? typeof pluginConfig[key] === "boolean" : Boolean(pluginConfig[key])),
+      )
+      .map((key) => [key, pluginConfig[key]]),
+  );
+  return resolved;
 }
 
 // ---------------------------------------------------------------------------
@@ -145,13 +211,24 @@ export function spawnContextEngine(cfg, logger, deps = {}) {
       AGFS_PORT: String(cfg.agfsPort),
       AGFS_BASE_URL: `http://127.0.0.1:${cfg.agfsPort}`,
       OGMEM_CONFIG: join(cfg.projectRoot, "config", "ogmem.yaml"),
+      OGMEM_MODEL_CONFIG_OVERRIDES: JSON.stringify(cfg.modelConfigOverrides || {}),
       // LLM config
       CONTEXTENGINE_PROVIDER: cfg.llmProvider,
+      OGMEM_API_KEY: cfg.llmApiKey,
+      OGMEM_BASE_URL: cfg.llmBaseUrl,
+      OGMEM_LLM_MODEL: cfg.llmModel,
+      LLM_REASONING_EFFORT: cfg.llmReasoningEffort,
+      LLM_IS_REASONING_MODEL:
+        cfg.llmIsReasoningModel === null ? "" : String(cfg.llmIsReasoningModel),
+      LLM_EXTRA_BODY: JSON.stringify(cfg.llmExtraBody || {}),
       OPENAI_API_KEY: cfg.llmApiKey,
       OPENAI_BASE_URL: cfg.llmBaseUrl,
       OPENAI_LLM_MODEL: cfg.llmModel,
       // Embedding config (fallback to LLM settings)
       EMBEDDING_PROVIDER: cfg.embeddingProvider || cfg.llmProvider,
+      OGMEM_EMBEDDING_API_KEY: cfg.embeddingApiKey || cfg.llmApiKey,
+      OGMEM_EMBEDDING_BASE_URL: cfg.embeddingBaseUrl || cfg.llmBaseUrl,
+      OGMEM_EMBEDDING_MODEL: cfg.embeddingModel,
       OPENAI_EMBEDDING_API_KEY: cfg.embeddingApiKey || cfg.llmApiKey,
       OPENAI_EMBEDDING_BASE_URL: cfg.embeddingBaseUrl || cfg.llmBaseUrl,
       OPENAI_EMBEDDING_MODEL: cfg.embeddingModel,
@@ -205,6 +282,28 @@ async function callHttp(baseUrl, method, params, cfg = {}) {
     console.error(`[og-memory] HTTP ${method} error: ${err.message}`);
     return null;
   }
+}
+
+const DISPOSE_MAX_ATTEMPTS = 3;
+const DISPOSE_RETRY_DELAY_MS = 250;
+
+async function disposeWithRetry(call, params) {
+  for (let attempt = 1; attempt <= DISPOSE_MAX_ATTEMPTS; attempt += 1) {
+    const result = await call("dispose", params);
+    if (result?.disposed === true && result.reason !== "thread_unavailable") {
+      return result;
+    }
+
+    if (attempt < DISPOSE_MAX_ATTEMPTS) {
+      await new Promise((resolve) => {
+        setTimeout(resolve, DISPOSE_RETRY_DELAY_MS * attempt);
+      });
+    }
+  }
+
+  throw new Error(
+    `[og-memory] dispose failed after ${DISPOSE_MAX_ATTEMPTS} attempts`,
+  );
 }
 
 export async function loadRuntimeCompactionDelegate() {
@@ -529,13 +628,59 @@ export default {
       return null;
     }
 
+    function isHeartbeatContextRun(params) {
+      if (params?.isHeartbeat) return true;
+      return isOpenClawHeartbeatMessage(params?.message);
+    }
+
+    function withoutHeartbeatTurns(messages, prePromptMessageCount) {
+      const prefixCount = Number.isInteger(prePromptMessageCount)
+        ? Math.max(0, Math.min(prePromptMessageCount, messages.length))
+        : 0;
+      const filtered = messages.slice(0, prefixCount);
+      let skippingHeartbeatTurn = false;
+      for (let index = prefixCount; index < messages.length; index += 1) {
+        const message = messages[index];
+        if (message?.role === "user") {
+          skippingHeartbeatTurn = isOpenClawHeartbeatMessage(message);
+        }
+        if (!skippingHeartbeatTurn) filtered.push(message);
+      }
+      return { messages: filtered, prefixCount };
+    }
+
     // =======================================================================
     // Context engine registration
     // =======================================================================
 
-    api.registerContextEngine("og-memory-context-engine", () => {
-      let _instanceSessionId = null;
+    registerOpenClawTraceHooks(api, cfg);
 
+    const sessionIdentities = new Map();
+    api.on("session_end", async (event, ctx) => {
+      const sessionId = event?.sessionId || ctx?.sessionId || "";
+      if (!sessionId) return;
+
+      const identity = sessionIdentities.get(sessionId) || {
+        accountId: cfg.accountId,
+        userId: cfg.userId,
+        agentId: cfg.agentId,
+      };
+      console.log(
+        `[og-memory] session_end dispose called, sessionId=${sessionId}, reason=${event?.reason || "unknown"}`,
+      );
+      try {
+        const result = await disposeWithRetry(call, { sessionId, ...identity });
+        return result;
+      } catch (err) {
+        console.error(
+          `[og-memory] session_end dispose failed, sessionId=${sessionId}: ${err.message}`,
+        );
+      } finally {
+        sessionIdentities.delete(sessionId);
+      }
+    });
+
+    api.registerContextEngine("og-memory-context-engine", () => {
       return ({
       info: {
         id: "og-memory-context-engine",
@@ -545,11 +690,16 @@ export default {
       },
 
       async ingest(params) {
+        if (!cfg.autoCapture) return { ingested: false };
+        if (isHeartbeatContextRun(params)) return { ingested: false };
         return call("ingest", params);
       },
 
       async assemble(params) {
         const messages = params?.messages || [];
+        if (!cfg.autoRecall) {
+          return { messages, estimatedTokens: 0, systemPromptAddition: "" };
+        }
 
         const taggedUserId = extractUserIdFromMessages(messages);
         if (taggedUserId) {
@@ -666,25 +816,48 @@ export default {
       },
 
       async afterTurn(params) {
+        if (isHeartbeatContextRun(params)) return;
         const messages = params?.messages || [];
+        const filtered = withoutHeartbeatTurns(
+          messages,
+          params?.prePromptMessageCount,
+        );
+        if (
+          filtered.messages.length < messages.length
+          && filtered.messages.length <= filtered.prefixCount
+        ) return;
+        const lifecycleParams = filtered.messages.length === messages.length
+          ? params
+          : {
+              ...params,
+              messages: filtered.messages,
+              prePromptMessageCount: filtered.prefixCount,
+            };
+        // Session cleanup still needs the host identity when capture is disabled.
+        const identity = {
+          accountId: lifecycleParams?.accountId || cfg.accountId,
+          userId: lifecycleParams?.userId || cfg.userId,
+          agentId: lifecycleParams?.agentId || cfg.agentId,
+        };
+        if (lifecycleParams?.sessionId) {
+          sessionIdentities.set(lifecycleParams.sessionId, identity);
+        }
+        // Only capture work is skipped; local lifecycle bookkeeping remains active.
+        if (!cfg.autoCapture) return;
 
         // EXTRACT userId from tagged message
-        const taggedUserId = extractUserIdFromMessages(messages);
+        const taggedUserId = extractUserIdFromMessages(filtered.messages);
         if (taggedUserId) {
           console.log(`[og-memory] afterTurn: extracted userId from tag: ${taggedUserId}`);
         }
-
-        if (params?.sessionId) _instanceSessionId = params.sessionId;
 
         console.log(`[og-memory] afterTurn called, sessionId=${params?.sessionId || "unknown"}, messages=${messages.length}, userId=${taggedUserId || params?.userId || "(none)"}`);
 
         // Always route through server's after_turn endpoint
         // It handles: session buffer → memory extraction → write AGFS → index → archive
         const enhancedParams = {
-          ...params,
-          userId: taggedUserId || params?.userId || cfg.userId,
-          accountId: params?.accountId || cfg.accountId,
-          agentId: params?.agentId || cfg.agentId,
+          ...lifecycleParams,
+          ...identity,
           commitTokenThreshold: cfg.commitTokenThreshold,
         };
 
@@ -692,9 +865,7 @@ export default {
       },
 
       async dispose() {
-        const sid = _instanceSessionId || "";
-        if (sid) console.log(`[og-memory] dispose called, sessionId=${sid}`);
-        return call("dispose", { sessionId: sid });
+        return { disposed: true, flushed: false, reason: "run_cleanup" };
       },
     })});
   },

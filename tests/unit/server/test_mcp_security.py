@@ -43,7 +43,7 @@ class _FakeService:
         return RequestContext(
             account_id=account_id,
             user_id=user_id,
-            agent_id=params.get("agentId") or "agent-default",
+            agent_id=params.get("agentId") or ("" if identity else "agent-default"),
             session_id=params.get("sessionId") or "unknown",
             trace_id="trace",
             role=identity.role if identity else Role.ROOT,
@@ -96,6 +96,8 @@ def test_build_mcp_context_resolves_stdio_api_key_from_env(monkeypatch):
     assert auth.headers["X-API-Key"] == "member-key"
     assert ctx.account_id == "acct-auth"
     assert ctx.user_id == "user-auth"
+    assert ctx.agent_id == ""
+    assert service.params == {"sessionId": "s1"}
 
 
 def test_build_mcp_context_prefers_transport_headers_over_env(monkeypatch):
@@ -110,6 +112,57 @@ def test_build_mcp_context_prefers_transport_headers_over_env(monkeypatch):
     )
 
     assert auth.headers["X-API-Key"] == "header-key"
+
+
+def test_build_mcp_context_uses_transport_agent_header_as_default():
+    service = _FakeService(_FakeAuth(active=True))
+
+    ctx = build_mcp_context(
+        service,
+        {"session_id": "s1"},
+        transport_headers={"X-API-Key": "member-key", "X-Agent-ID": "shared-agent"},
+        allow_stdio_env_auth=False,
+    )
+
+    assert ctx.agent_id == "shared-agent"
+    assert service.params == {"sessionId": "s1", "agentId": "shared-agent"}
+
+
+def test_build_mcp_context_tool_agent_argument_overrides_transport_header():
+    service = _FakeService(_FakeAuth(active=True))
+
+    ctx = build_mcp_context(
+        service,
+        {"agent_id": "tool-agent"},
+        transport_headers={"X-API-Key": "member-key", "X-Agent-ID": "header-agent"},
+        allow_stdio_env_auth=False,
+    )
+
+    assert ctx.agent_id == "tool-agent"
+    assert service.params == {"agentId": "tool-agent"}
+
+
+def test_build_mcp_context_preserves_authenticated_user_scope_without_agent():
+    service = _FakeService(_FakeAuth(active=True))
+
+    ctx = build_mcp_context(
+        service,
+        {"session_id": "s1"},
+        transport_headers={"X-API-Key": "member-key"},
+        allow_stdio_env_auth=False,
+    )
+
+    assert ctx.agent_id == ""
+    assert service.params == {"sessionId": "s1"}
+
+
+def test_build_mcp_context_allows_service_to_apply_its_own_default():
+    service = _FakeService(_FakeAuth(active=False))
+
+    ctx = build_mcp_context(service, {"session_id": "s1"})
+
+    assert ctx.agent_id == "agent-default"
+    assert service.params == {"sessionId": "s1"}
 
 
 def test_build_mcp_context_constructs_root_context_without_service_visibility_lookup():
@@ -135,7 +188,7 @@ def test_build_mcp_context_constructs_root_context_without_service_visibility_lo
     assert ctx.role == Role.ROOT
 
 
-def test_build_mcp_context_scopes_root_mcp_requests_to_header_user_space():
+def test_build_mcp_context_scopes_root_to_user_without_explicit_agent():
     auth = _FakeAuth(active=True, role=Role.ROOT)
     service = _FakeService(auth)
 
@@ -217,6 +270,14 @@ def test_headers_from_mcp_context_extracts_http_headers():
     assert headers["authorization"] == "Bearer token"
     assert headers["x-api-key"] == "key"
     assert has_mcp_http_request(ctx) is True
+
+
+def test_headers_from_lowlevel_mcp_context_extracts_http_headers():
+    class _LowLevelContext:
+        request = _FakeRequest({"x-api-key": "key"})
+
+    assert headers_from_mcp_context(_LowLevelContext()) == {"x-api-key": "key"}
+    assert has_mcp_http_request(_LowLevelContext()) is True
 
 
 def test_identity_from_mcp_context_extracts_transport_identity():

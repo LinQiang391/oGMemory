@@ -13,6 +13,15 @@ from typing import Optional
 from core.models import RequestContext
 
 
+NOISY_THIRD_PARTY_LOGGERS = (
+    "httpx",
+    "httpcore",
+    "openai",
+    "pyagfs",
+    "urllib3",
+)
+
+
 class ContextFilter(logging.Filter):
     """Inject RequestContext into log records."""
 
@@ -107,9 +116,13 @@ def setup_logging(
     root_logger.setLevel(getattr(logging, level.upper()))
     root_logger.handlers = handlers
 
-    # Reduce noise from third-party libraries
-    logging.getLogger('pyagfs').setLevel(logging.WARNING)
-    logging.getLogger('urllib3').setLevel(logging.WARNING)
+    configure_third_party_loggers()
+
+
+def configure_third_party_loggers(level: int = logging.WARNING) -> None:
+    """Keep routine third-party client chatter out of INFO logs."""
+    for logger_name in NOISY_THIRD_PARTY_LOGGERS:
+        logging.getLogger(logger_name).setLevel(level)
 
 
 def get_logger(name: str) -> logging.Logger:

@@ -101,6 +101,66 @@ def test_run_once_wrapped_updates_metrics_on_success(monkeypatch):
     )
 
 
+def test_run_once_wrapped_logs_empty_poll_at_debug(monkeypatch):
+    monkeypatch.setattr(scheduler_module, "BackgroundScheduler", FakeBackgroundScheduler)
+    debug = Mock()
+    info = Mock()
+    warning = Mock()
+    monkeypatch.setattr(scheduler_module.logger, "debug", debug)
+    monkeypatch.setattr(scheduler_module.logger, "info", info)
+    monkeypatch.setattr(scheduler_module.logger, "warning", warning)
+    worker = Mock()
+    worker.run_once.return_value = {
+        "processed": 0,
+        "succeeded": 0,
+        "failed": 0,
+        "moved_to_dlq": 0,
+        "skipped": 0,
+    }
+    scheduler = scheduler_module.OutboxScheduler(
+        worker=worker,
+        outbox_store=Mock(),
+        get_account_ids=lambda: ["acct-1"],
+        worker_id="worker-1",
+    )
+
+    scheduler._run_once_wrapped()
+
+    debug.assert_called_once()
+    info.assert_not_called()
+    warning.assert_not_called()
+
+
+def test_run_once_wrapped_logs_failures_as_warning(monkeypatch):
+    monkeypatch.setattr(scheduler_module, "BackgroundScheduler", FakeBackgroundScheduler)
+    debug = Mock()
+    info = Mock()
+    warning = Mock()
+    monkeypatch.setattr(scheduler_module.logger, "debug", debug)
+    monkeypatch.setattr(scheduler_module.logger, "info", info)
+    monkeypatch.setattr(scheduler_module.logger, "warning", warning)
+    worker = Mock()
+    worker.run_once.return_value = {
+        "processed": 1,
+        "succeeded": 0,
+        "failed": 1,
+        "moved_to_dlq": 0,
+        "skipped": 0,
+    }
+    scheduler = scheduler_module.OutboxScheduler(
+        worker=worker,
+        outbox_store=Mock(),
+        get_account_ids=lambda: ["acct-1"],
+        worker_id="worker-1",
+    )
+
+    scheduler._run_once_wrapped()
+
+    warning.assert_called_once()
+    debug.assert_not_called()
+    info.assert_not_called()
+
+
 def test_run_once_wrapped_tracks_consecutive_errors(monkeypatch):
     monkeypatch.setattr(scheduler_module, "BackgroundScheduler", FakeBackgroundScheduler)
     worker = Mock()

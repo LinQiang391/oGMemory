@@ -10,34 +10,101 @@ Phase 1 implementation:
 - P1-W4: read_node/exists/list_children/delete_node
 """
 
+import time
 import json
 import logging
 import re
 import uuid
-from datetime import datetime, timezone
+from collections.abc import Iterator, Mapping
+from contextlib import ExitStack, contextmanager
+from contextvars import ContextVar
+from datetime import UTC, datetime, timedelta, timezone
 from pathlib import PurePosixPath
+from threading import Event, Thread
 from urllib.parse import unquote
-
-logger = logging.getLogger(__name__)
 
 from pyagfs import AGFSClient
 from pyagfs.exceptions import AGFSClientError
 
-from core.models import RequestContext, ContextNode, RelationEdge
-from core.interfaces import ContextFS
-from core.errors import AccessDeniedError, NodeNotFoundError, NodeBrokenError, ConcurrentModificationError
-from core.enums import NodeStatus
+from core.enums import EventType, NodeStatus
+from core.errors import (
+    AccessDeniedError,
+    ConcurrentModificationError,
+    NodeBrokenError,
+    NodeNotFoundError,
+)
+from core.memory_names import is_safe_memory_key
+from core.models import ContextNode, OutboxEvent, RelationEdge, RequestContext
 from fs.access_control import check_uri_access
+
+logger = logging.getLogger(__name__)
+
+_UPDATE_LOCK_STALE_AFTER = timedelta(minutes=1)
+_UPDATE_LOCK_RENEW_INTERVAL_SECONDS = 20
+_RESOURCE_MUTATION_LOCK_STALE_AFTER = timedelta(minutes=1)
+_RESOURCE_MUTATION_LOCK_RENEW_INTERVAL_SECONDS = 20
+_RESOURCE_MUTATION_LOCK_TIMEOUT_SECONDS = 10.0
+_MEMORY_IDENTITY_LOCK_TIMEOUT_SECONDS = 120.0
+_RESOURCE_MUTATION_LOCK_POLL_SECONDS = 0.05
+_SESSION_RECOVERY = ContextVar("agfs_session_recovery", default=None)
+
+
+class _ResourceMutationLease:
+    """Ownership token yielded by the cross-process RESOURCE mutation lock."""
+
+    post_commit_drain = False
+
+    def __init__(
+        self,
+        fs: "AGFSContextFS",
+        *,
+        uri: str,
+        node_path: str,
+        lock_path: str,
+        owner_token: str,
+        lost: Event,
+    ) -> None:
+        self._fs = fs
+        self.uri = uri
+        self.node_path = node_path
+        self.lock_path = lock_path
+        self.owner_token = owner_token
+        self._lost = lost
+
+    def ensure_owned(self) -> None:
+        """Fail closed once the lease or canonical lock ownership is lost."""
+
+        if self._lost.is_set() or not self._fs._owns_resource_mutation_lock(
+            self.lock_path,
+            self.owner_token,
+        ):
+            raise RuntimeError(
+                f"lost AGFS memory mutation lock for {self.uri}"
+            )
+
+
+def _is_not_found_error(exc: AGFSClientError) -> bool:
+    message = str(exc).lower()
+    return "no such file" in message or "not found" in message
+
+from core.interfaces import ContextFS
 
 
 # URI patterns for different memory types
 # Pattern 1: Skills (different path structure)
-# ctx://{account}/agents/{agent}/skills/{skill_name}
+# ctx://{account}/agents/{agent}/skills/{generated|imported}/{skill_name}
 _SKILL_URI_PATTERN = re.compile(
-    r'^ctx://(?P<account>[^/]+)/agents/(?P<owner_id>[^/]+)/skills/(?P<skill_name>[^/]+)$'
+    r'^ctx://(?P<account>[^/]+)/agents/(?P<owner_id>[^/]+)/'
+    r'(?P<skill_root>skills)/(?P<skill_source>generated|imported)/'
+    r'(?P<skill_name>[^/]+)$'
+)
+_LEGACY_SKILL_URI_PATTERN = re.compile(
+    r'^ctx://(?P<account>[^/]+)/agents/(?P<owner_id>[^/]+)/'
+    r'(?P<skill_root>skills)/(?P<skill_name>[^/]+)$'
 )
 _SKILLS_DIR_PATTERN = re.compile(
-    r'^ctx://(?P<account>[^/]+)/agents/(?P<owner_id>[^/]+)/skills/?$'
+    r'^ctx://(?P<account>[^/]+)/agents/(?P<owner_id>[^/]+)/'
+    r'(?P<skill_root>skills)(?:/(?P<skill_source>generated|imported))?/?$'
 )
 
 # Pattern 2: Profile (no slug)
@@ -115,7 +182,20 @@ def uri_to_path(uri: str) -> str:
         account = groups['account']
         owner_id = groups['owner_id']
         skill_name = unquote(groups['skill_name'])
-        path = PurePosixPath('/accounts') / account / 'agents' / owner_id / 'skills' / skill_name
+        path = (
+            PurePosixPath('/accounts') / account / 'agents' / owner_id
+            / groups['skill_root'] / groups['skill_source'] / skill_name
+        )
+        return str(path) + '/'
+
+    match = _LEGACY_SKILL_URI_PATTERN.match(uri)
+    if match:
+        groups = match.groupdict()
+        path = (
+            PurePosixPath('/accounts') / groups['account'] / 'agents'
+            / groups['owner_id'] / groups['skill_root']
+            / unquote(groups['skill_name'])
+        )
         return str(path) + '/'
 
     match = _SKILLS_DIR_PATTERN.match(uri.rstrip('/'))
@@ -123,7 +203,9 @@ def uri_to_path(uri: str) -> str:
         groups = match.groupdict()
         account = groups['account']
         owner_id = groups['owner_id']
-        path = PurePosixPath('/accounts') / account / 'agents' / owner_id / 'skills'
+        path = PurePosixPath('/accounts') / account / 'agents' / owner_id / groups['skill_root']
+        if groups.get('skill_source'):
+            path /= groups['skill_source']
         return str(path) + '/'
 
     # Try profile pattern (no slug)
@@ -144,6 +226,8 @@ def uri_to_path(uri: str) -> str:
         owner_id = groups['owner_id']
         category = groups['category']
         slug = unquote(groups['slug'])
+        if not is_safe_memory_key(slug):
+            raise ValueError(f"Invalid URI format: {uri}")
         path = PurePosixPath('/accounts') / account / owner_type / owner_id / 'memories' / category / slug
         return str(path) + '/'
 
@@ -208,7 +292,18 @@ def parse_uri(uri: str) -> dict:
             'account': groups['account'],
             'owner_type': 'agents',
             'owner_id': groups['owner_id'],
-            'category': 'skills',
+            'category': f"{groups['skill_root']}/{groups['skill_source']}",
+            'slug': unquote(groups['skill_name']),
+        }
+
+    match = _LEGACY_SKILL_URI_PATTERN.match(uri)
+    if match:
+        groups = match.groupdict()
+        return {
+            'account': groups['account'],
+            'owner_type': 'agents',
+            'owner_id': groups['owner_id'],
+            'category': groups['skill_root'],
             'slug': unquote(groups['skill_name']),
         }
 
@@ -219,7 +314,11 @@ def parse_uri(uri: str) -> dict:
             'account': groups['account'],
             'owner_type': 'agents',
             'owner_id': groups['owner_id'],
-            'category': 'skills',
+            'category': (
+                f"{groups['skill_root']}/{groups['skill_source']}"
+                if groups.get('skill_source')
+                else groups['skill_root']
+            ),
             'slug': '',
         }
 
@@ -335,8 +434,8 @@ def build_uri(
         owner_type = owner_type + 's'
 
     # Skills have a different path structure
-    if category == 'skills':
-        return f"ctx://{account}/{owner_type}/{owner_id}/skills/{slug}"
+    if category == 'skills' or category.startswith('skills/'):
+        return f"ctx://{account}/{owner_type}/{owner_id}/{category}/{slug}"
 
     # Profile has no slug component
     if category == 'profile':
@@ -380,6 +479,64 @@ class AGFSContextFS:
         self._client = client
         self._mount_prefix = mount_prefix.rstrip("/")
         self._ensure_mount_prefix()
+
+    def recovery_account_ids(self):
+        """List account directories owned by this configured storage mount."""
+        try:
+            entries = self._client.ls(f"{self._mount_prefix}/accounts/")
+        except AGFSClientError as exc:
+            if _is_not_found_error(exc):
+                return []
+            raise
+        return sorted(entry["name"] for entry in entries if entry.get("isDir")
+                      and isinstance(entry.get("name"), str) and entry["name"] not in {".", ".."}
+                      and "/" not in entry["name"] and "\\" not in entry["name"])
+
+    def scan_session_recovery(self, account_id, *, cursor=None, limit=32):
+        """Read one state page from a directory snapshot retained for this cycle."""
+        if (not isinstance(account_id, str) or not account_id or account_id in {".", ".."}
+                or "/" in account_id or "\\" in account_id):
+            raise ValueError("invalid recovery account")
+        limit = max(1, min(int(limit), 50))
+        root = f"{self._mount_prefix}/accounts/{account_id}/sessions/"
+        if cursor is None:
+            try:
+                entries = self._client.ls(root)
+            except AGFSClientError as exc:
+                if _is_not_found_error(exc):
+                    return [], None
+                raise
+            names = sorted(entry["name"] for entry in entries if entry.get("isDir")
+                           and isinstance(entry.get("name"), str)
+                           and entry["name"] not in {".", ".."}
+                           and "/" not in entry["name"] and "\\" not in entry["name"])
+            offset = 0
+        else:
+            names, offset = cursor
+        rows = []
+        for session_id in names[offset:offset + limit]:
+            for state_name in ("state.json", "state"):
+                try:
+                    meta = json.loads(self._read_file(root + session_id + "/" + state_name + "/" + self.FILE_META))
+                except NodeNotFoundError:
+                    continue
+                except (json.JSONDecodeError, UnicodeDecodeError):
+                    logger.warning("Invalid recovery metadata for account=%s session=%s", account_id, session_id)
+                    break
+                if not isinstance(meta, dict):
+                    break
+                if meta.get("status") == "ACTIVE" and meta.get("category") == "state":
+                    try:
+                        content = self._read_file(root + session_id + "/" + state_name + "/" + self.FILE_CONTENT)
+                    except (NodeNotFoundError, UnicodeDecodeError):
+                        logger.warning("Unreadable recovery state for account=%s session=%s", account_id, session_id)
+                        break
+                    rows.append({"uri": f"ctx://{account_id}/sessions/{session_id}/{state_name}",
+                                 "owner_space": meta.get("owner_space"), "metadata": meta, "content": content,
+                                 "version": meta.get("version"), "updated_at": meta.get("updated_at")})
+                break
+        offset += limit
+        return rows, (names, offset) if offset < len(names) else None
 
     def _ensure_mount_prefix(self) -> None:
         """Ensure the full mount_prefix directory exists in AGFS.
@@ -516,9 +673,316 @@ class AGFSContextFS:
             content = self._client.read(path)
             return content.decode('utf-8')
         except AGFSClientError as e:
-            if "no such file" in str(e).lower() or "not found" in str(e).lower():
+            if _is_not_found_error(e):
                 raise NodeNotFoundError(path)
             raise
+
+    @staticmethod
+    def _is_not_found_error(exc: Exception) -> bool:
+        message = str(exc).lower()
+        return "no such file" in message or "not found" in message
+
+    def _resource_mutation_lock_path(self, node_path: str) -> str:
+        final_path = PurePosixPath(node_path.rstrip("/"))
+        return str(final_path.parent) + f"/.{final_path.name}.resource-mutation-lock"
+
+    def _resource_mutation_publish_paths(
+        self,
+        node_path: str,
+        owner_token: str,
+    ) -> tuple[str, ...]:
+        final_path = PurePosixPath(node_path.rstrip("/"))
+        parent_path = str(final_path.parent) + "/"
+        return (
+            f"{parent_path}.{final_path.name}.resource-create-{owner_token}",
+            node_path + self.DIR_OUTBOX + f"/.mutation-{owner_token}.json",
+            node_path + f".meta.mutation-{owner_token}.json",
+            node_path + f".delete_tombstone.mutation-{owner_token}.json",
+        )
+
+    @contextmanager
+    def resource_mutation_lock(
+        self,
+        uri: str,
+        ctx: RequestContext,
+        *,
+        timeout_seconds: float = _RESOURCE_MUTATION_LOCK_TIMEOUT_SECONDS,
+    ) -> Iterator[_ResourceMutationLease]:
+        """Serialize memory writes and recovery across AGFS processes."""
+
+        self._ensure_accessible(uri, ctx)
+        node_path = self._uri_to_agfs_path(uri)
+        final_path = PurePosixPath(node_path.rstrip("/"))
+        parent_path = str(final_path.parent) + "/"
+        self._mkdir_p(parent_path)
+
+        owner_token = uuid.uuid4().hex
+        lock_path = self._resource_mutation_lock_path(node_path)
+        candidate_path = lock_path + "-" + owner_token
+        deadline = time.monotonic() + timeout_seconds
+        acquired = False
+        lease_stop = Event()
+        lease_lost = Event()
+        lease_thread = None
+
+        try:
+            self._client.mkdir(candidate_path)
+            self._write_resource_mutation_marker(
+                candidate_path,
+                uri=uri,
+                owner_token=owner_token,
+            )
+            self._write_resource_mutation_lease(candidate_path, owner_token)
+
+            while not acquired:
+                try:
+                    self._client.mv(candidate_path, lock_path)
+                    acquired = True
+                except Exception as exc:
+                    if self._owns_resource_mutation_lock(lock_path, owner_token):
+                        acquired = True
+                        break
+                    if self._recover_resource_mutation_lock(node_path, lock_path):
+                        continue
+                    if time.monotonic() >= deadline:
+                        raise TimeoutError(
+                            f"timed out acquiring AGFS memory mutation lock: {uri}"
+                        ) from exc
+                    time.sleep(_RESOURCE_MUTATION_LOCK_POLL_SECONDS)
+
+            lease_thread = Thread(
+                target=self._renew_resource_mutation_lease,
+                args=(lock_path, owner_token, lease_stop, lease_lost),
+                daemon=True,
+            )
+            lease_thread.start()
+            lease = _ResourceMutationLease(
+                self,
+                uri=uri,
+                node_path=node_path,
+                lock_path=lock_path,
+                owner_token=owner_token,
+                lost=lease_lost,
+            )
+            lease.ensure_owned()
+            yield lease
+            lease.ensure_owned()
+        finally:
+            lease_stop.set()
+            if lease_thread is not None:
+                lease_thread.join()
+            self._remove_tree_if_present(candidate_path)
+            if acquired:
+                try:
+                    if self._owns_resource_mutation_lock(lock_path, owner_token):
+                        self._client.rm(lock_path, recursive=True)
+                except Exception:
+                    logger.warning(
+                        "Failed to release AGFS memory mutation lock: %s",
+                        lock_path,
+                    )
+
+    @contextmanager
+    def session_recovery_lock(self, uri: str, ctx: RequestContext, *, timeout_seconds=1.0):
+        """Serialize session requests and recovery, including HTTP/MCP handoff."""
+        current = self.active_session_recovery()
+        if current is not None:
+            lease, owner = current
+            if (lease.uri != uri or owner != (ctx.account_id, ctx.user_id, ctx.agent_id, ctx.session_id)
+                    or lease._fs._uri_to_agfs_path(uri) != self._uri_to_agfs_path(uri)
+                    or lease._fs._client.api_base != self._client.api_base):
+                raise ValueError("nested AGFS recovery changed its session")
+            lease.ensure_owned()
+            yield lease
+            return
+        from fs.sql_adapter.session_mutation import SessionMutationBusyError
+        with ExitStack() as stack:
+            try:
+                lease = stack.enter_context(self.resource_mutation_lock(uri, ctx, timeout_seconds=timeout_seconds))
+            except TimeoutError as exc:
+                raise SessionMutationBusyError("AGFS session recovery is busy") from exc
+            token = _SESSION_RECOVERY.set((lease, (ctx.account_id, ctx.user_id, ctx.agent_id, ctx.session_id)))
+            try:
+                yield lease
+            finally:
+                _SESSION_RECOVERY.reset(token)
+
+    @staticmethod
+    def active_session_recovery():
+        return _SESSION_RECOVERY.get()
+
+    @contextmanager
+    def memory_identity_lock(self, directory: str, ctx: RequestContext):
+        with self.resource_mutation_lock(
+            directory, ctx, timeout_seconds=_MEMORY_IDENTITY_LOCK_TIMEOUT_SECONDS,
+        ):
+            yield
+
+    def _write_resource_mutation_marker(
+        self,
+        lock_path: str,
+        *,
+        uri: str,
+        owner_token: str,
+    ) -> None:
+        marker_path = lock_path + "/transaction.json"
+        temporary_path = lock_path + f"/.transaction-{owner_token}.json"
+        marker = {
+            "kind": "CODE_RESOURCE_MUTATION_LOCK",
+            "uri": uri,
+            "owner_token": owner_token,
+        }
+        self._write_file(temporary_path, json.dumps(marker))
+        self._client.mv(temporary_path, marker_path)
+
+    def _write_resource_mutation_lease(
+        self,
+        lock_path: str,
+        owner_token: str,
+    ) -> None:
+        lease_path = lock_path + f"/lease-{owner_token}.json"
+        temporary_path = lock_path + f"/.lease-{owner_token}.json"
+        lease = {
+            "owner_token": owner_token,
+            "lease_updated_at": datetime.now(UTC).isoformat(),
+        }
+        self._write_file(temporary_path, json.dumps(lease))
+        self._client.mv(temporary_path, lease_path)
+
+    def _renew_resource_mutation_lease(
+        self,
+        lock_path: str,
+        owner_token: str,
+        stop: Event,
+        lost: Event,
+    ) -> None:
+        while not stop.wait(_RESOURCE_MUTATION_LOCK_RENEW_INTERVAL_SECONDS):
+            try:
+                if not self._owns_resource_mutation_lock(lock_path, owner_token):
+                    lost.set()
+                    return
+                self._write_resource_mutation_lease(lock_path, owner_token)
+            except Exception:
+                lost.set()
+                return
+
+    def _read_resource_mutation_marker(self, marker_path: str) -> dict | None:
+        try:
+            raw = self._client.read(marker_path)
+        except Exception as exc:
+            if self._is_not_found_error(exc):
+                return None
+            raise
+        try:
+            if isinstance(raw, (bytes, bytearray)):
+                raw = raw.decode("utf-8")
+            marker = json.loads(raw)
+        except (TypeError, UnicodeDecodeError, json.JSONDecodeError) as exc:
+            raise RuntimeError("invalid AGFS memory mutation lock") from exc
+        if not isinstance(marker, dict):
+            raise RuntimeError("invalid AGFS memory mutation lock")
+        return marker
+
+    def _owns_resource_mutation_lock(
+        self,
+        lock_path: str,
+        owner_token: str,
+    ) -> bool:
+        marker = self._read_resource_mutation_marker(
+            lock_path + "/transaction.json"
+        )
+        return (
+            marker is not None
+            and marker.get("kind") == "CODE_RESOURCE_MUTATION_LOCK"
+            and marker.get("owner_token") == owner_token
+        )
+
+    def _read_resource_mutation_lease(
+        self,
+        lock_path: str,
+        owner_token: str,
+    ) -> datetime | None:
+        marker = self._read_resource_mutation_marker(
+            lock_path + f"/lease-{owner_token}.json"
+        )
+        if marker is None or marker.get("owner_token") != owner_token:
+            return None
+        try:
+            updated_at = datetime.fromisoformat(marker["lease_updated_at"])
+        except (KeyError, TypeError, ValueError):
+            return None
+        return updated_at if updated_at.tzinfo is not None else None
+
+    def _recover_resource_mutation_lock(
+        self,
+        node_path: str,
+        lock_path: str,
+    ) -> bool:
+        marker = self._read_resource_mutation_marker(
+            lock_path + "/transaction.json"
+        )
+        if marker is None:
+            return False
+        owner_token = marker.get("owner_token")
+        marker_uri = marker.get("uri")
+        if (
+            marker.get("kind") != "CODE_RESOURCE_MUTATION_LOCK"
+            or not isinstance(marker_uri, str)
+            or self._uri_to_agfs_path(marker_uri) != node_path
+            or not isinstance(owner_token, str)
+            or not owner_token
+        ):
+            raise RuntimeError("invalid AGFS memory mutation lock")
+
+        lease_updated_at = self._read_resource_mutation_lease(
+            lock_path,
+            owner_token,
+        )
+        if lease_updated_at is None or (
+            datetime.now(UTC) - lease_updated_at
+            <= _RESOURCE_MUTATION_LOCK_STALE_AFTER
+        ):
+            return False
+
+        confirmed = self._read_resource_mutation_marker(
+            lock_path + "/transaction.json"
+        )
+        confirmed_lease = self._read_resource_mutation_lease(
+            lock_path,
+            owner_token,
+        )
+        if (
+            confirmed is None
+            or confirmed.get("owner_token") != owner_token
+            or confirmed_lease is None
+            or datetime.now(UTC) - confirmed_lease
+            <= _RESOURCE_MUTATION_LOCK_STALE_AFTER
+        ):
+            return False
+
+        # Invalidate every source from which the retired writer could still
+        # publish after losing the lock.  The paths are token-derived so a
+        # successor never removes another owner's candidate.
+        for path in self._resource_mutation_publish_paths(node_path, owner_token):
+            try:
+                self._client.rm(path, recursive=path.endswith(owner_token))
+            except Exception as exc:
+                if not self._is_not_found_error(exc):
+                    return False
+
+        final_confirmation = self._read_resource_mutation_marker(
+            lock_path + "/transaction.json"
+        )
+        if final_confirmation is None or final_confirmation.get(
+            "owner_token"
+        ) != owner_token:
+            return False
+        try:
+            self._client.rm(lock_path, recursive=True)
+        except Exception as exc:
+            if not self._is_not_found_error(exc):
+                return False
+        return True
 
     def _relation_edge_to_dict(self, edge: RelationEdge) -> dict:
         """Convert RelationEdge to dict for JSON serialization."""
@@ -558,43 +1022,321 @@ class AGFSContextFS:
         """
         # Step 0: Access control check
         self._ensure_accessible(node.uri, ctx)
+        recovery = self.active_session_recovery()
+        if recovery is not None:
+            recovery[0].ensure_owned()
 
-        # Step 0.5: Optimistic locking check for merge operations
-        expected_version = node.metadata.get("expected_version")
-        if expected_version is not None:
-            # This is a merge operation - verify version hasn't changed
-            node_path = self._uri_to_agfs_path(node.uri)
-            meta_path = node_path + self.FILE_META
+        expected_version = node.metadata.get(
+            "_expected_version", node.metadata.get("expected_version")
+        )
+        final_node_path = self._uri_to_agfs_path(node.uri)
+        create_only = expected_version == 0
+        if expected_version is not None and not create_only:
+            self._replace_node(final_node_path, node, expected_version)
+            return
 
-            try:
-                meta_content = self._read_file(meta_path)
-                existing_meta = json.loads(meta_content)
-                actual_version = existing_meta.get("version", 0)
+        staging_path = None
+        if create_only:
+            final_path = PurePosixPath(final_node_path.rstrip("/"))
+            parent_path = str(final_path.parent) + "/"
+            self._mkdir_p(parent_path)
+            staging_path = (
+                f"{parent_path}.{final_path.name}.create-{uuid.uuid4().hex}/"
+            )
+            node_path = staging_path
+        else:
+            node_path = final_node_path
 
-                if actual_version != expected_version:
-                    raise ConcurrentModificationError(
-                        node.uri, expected_version, actual_version
+        try:
+            self._mkdir_p(node_path)
+            if recovery is not None and node.uri == recovery[0].uri and expected_version is None:
+                with self.session_recovery_lock(node.uri, ctx) as lease:
+                    self._write_node_files(node_path, node, expected_version, mutation_lease=lease)
+            else:
+                self._write_node_files(node_path, node, expected_version)
+            if create_only:
+                try:
+                    self._client.mv(
+                        node_path.rstrip("/"), final_node_path.rstrip("/")
                     )
-            except NodeNotFoundError:
-                # Node doesn't exist yet, proceed with create
-                pass
+                except AGFSClientError as exc:
+                    try:
+                        existing = json.loads(
+                            self._read_file(final_node_path + self.FILE_META)
+                        )
+                    except (NodeNotFoundError, json.JSONDecodeError):
+                        raise exc
+                    raise ConcurrentModificationError(
+                        node.uri, 0, existing.get("version", 1)
+                    ) from exc
+        finally:
+            if staging_path:
+                self._remove_tree_if_present(staging_path)
 
-        # Get the physical path for the node
-        node_path = self._uri_to_agfs_path(node.uri)
+    def _replace_node(
+        self,
+        final_node_path: str,
+        node: ContextNode,
+        expected_version: int,
+    ) -> None:
+        """Publish a version-checked replacement through an atomic metadata swap."""
 
-        # Create node directory
-        self._mkdir_p(node_path)
+        final_path = PurePosixPath(final_node_path.rstrip("/"))
+        parent_path = str(final_path.parent) + "/"
+        token = uuid.uuid4().hex
+        lock_path = f"{parent_path}.{final_path.name}.update-lock"
+        candidate_lock_path = f"{lock_path}-{token}"
+        marker_path = lock_path + "/transaction.json"
+        temporary_meta_path = final_node_path + f".meta.update-{token}.json"
+        marker = {
+            "owner_token": token,
+            "expected_version": expected_version,
+            "temporary_meta_path": temporary_meta_path,
+        }
+        lock_acquired = False
+        lease_stop = Event()
+        lease_lost = Event()
+        lease_thread = None
+
+        try:
+            self._client.mkdir(candidate_lock_path)
+            self._write_update_marker(candidate_lock_path, marker, token)
+            self._write_update_lease(candidate_lock_path, token)
+            try:
+                self._client.mv(candidate_lock_path, lock_path)
+                lock_acquired = True
+            except AGFSClientError as exc:
+                if "exist" not in str(exc).lower():
+                    raise
+                if not self._recover_update_lock(
+                    final_node_path, lock_path, marker_path
+                ):
+                    raise ConcurrentModificationError(
+                        node.uri, expected_version, expected_version + 1
+                    ) from exc
+                try:
+                    self._client.mv(candidate_lock_path, lock_path)
+                except AGFSClientError as retry_exc:
+                    raise ConcurrentModificationError(
+                        node.uri, expected_version, expected_version + 1
+                    ) from retry_exc
+                lock_acquired = True
+
+            lease_thread = Thread(
+                target=self._renew_update_lease,
+                args=(lock_path, token, lease_stop, lease_lost),
+                daemon=True,
+            )
+            lease_thread.start()
+
+            actual_version = self._read_node_version(final_node_path)
+            if actual_version != expected_version:
+                raise ConcurrentModificationError(
+                    node.uri, expected_version, actual_version
+                )
+
+            self._write_node_files(
+                final_node_path,
+                node,
+                expected_version,
+                meta_path=temporary_meta_path,
+            )
+            if lease_lost.is_set() or not self._owns_update_lock(lock_path, token):
+                raise ConcurrentModificationError(
+                    node.uri,
+                    expected_version,
+                    self._read_node_version(final_node_path),
+                )
+            self._client.mv(temporary_meta_path, final_node_path + self.FILE_META)
+        finally:
+            lease_stop.set()
+            if lease_thread is not None:
+                lease_thread.join()
+            self._remove_file_if_present(temporary_meta_path)
+            self._remove_tree_if_present(candidate_lock_path)
+            if lock_acquired and self._owns_update_lock(lock_path, token):
+                try:
+                    self._client.rm(lock_path, recursive=True)
+                except AGFSClientError:
+                    logger.warning("Failed to release AGFS update lock: %s", lock_path)
+
+    def _write_update_marker(
+        self,
+        lock_path: str,
+        marker: dict,
+        owner_token: str,
+    ) -> None:
+        marker_path = lock_path + "/transaction.json"
+        temporary_path = lock_path + f"/.transaction-{owner_token}.json"
+        self._write_file(temporary_path, json.dumps(marker))
+        self._client.mv(temporary_path, marker_path)
+
+    def _write_update_lease(self, lock_path: str, owner_token: str) -> None:
+        lease_path = lock_path + f"/lease-{owner_token}.json"
+        temporary_path = lock_path + f"/.lease-{owner_token}.json"
+        lease = {
+            "owner_token": owner_token,
+            "lease_updated_at": datetime.now(timezone.utc).isoformat(),
+        }
+        self._write_file(temporary_path, json.dumps(lease))
+        self._client.mv(temporary_path, lease_path)
+
+    def _renew_update_lease(
+        self,
+        lock_path: str,
+        owner_token: str,
+        stop: Event,
+        lost: Event,
+    ) -> None:
+        while not stop.wait(_UPDATE_LOCK_RENEW_INTERVAL_SECONDS):
+            try:
+                if not self._owns_update_lock(lock_path, owner_token):
+                    lost.set()
+                    return
+                self._write_update_lease(lock_path, owner_token)
+            except AGFSClientError:
+                lost.set()
+                return
+
+    def _read_update_marker(self, marker_path: str) -> dict | None:
+        try:
+            marker = json.loads(self._read_file(marker_path))
+        except (json.JSONDecodeError, NodeNotFoundError):
+            return None
+        return marker if isinstance(marker, dict) else None
+
+    def _owns_update_lock(self, lock_path: str, owner_token: str) -> bool:
+        marker = self._read_update_marker(lock_path + "/transaction.json")
+        return marker is not None and marker.get("owner_token") == owner_token
+
+    def _read_update_lease(
+        self, lock_path: str, owner_token: str
+    ) -> datetime | None:
+        lease = self._read_update_marker(
+            lock_path + f"/lease-{owner_token}.json"
+        )
+        if lease is None or lease.get("owner_token") != owner_token:
+            return None
+        try:
+            renewed_at = datetime.fromisoformat(lease["lease_updated_at"])
+        except (KeyError, TypeError, ValueError):
+            return None
+        return renewed_at if renewed_at.tzinfo is not None else None
+
+    def _read_node_version(self, node_path: str) -> int:
+        try:
+            metadata = json.loads(self._read_file(node_path + self.FILE_META))
+        except NodeNotFoundError:
+            return 0
+        return metadata.get("version", 0)
+
+    def _recover_update_lock(
+        self,
+        node_path: str,
+        lock_path: str,
+        marker_path: str,
+    ) -> bool:
+        marker = self._read_update_marker(marker_path)
+        if marker is None:
+            return False
+        try:
+            owner_token = marker["owner_token"]
+            expected_version = int(marker["expected_version"])
+        except (KeyError, TypeError, ValueError):
+            return False
+
+        if not isinstance(owner_token, str) or not owner_token:
+            return False
+        lease_updated_at = self._read_update_lease(lock_path, owner_token)
+        if lease_updated_at is None:
+            return False
+
+        published = self._read_node_version(node_path) > expected_version
+        stale = (
+            datetime.now(timezone.utc) - lease_updated_at
+            > _UPDATE_LOCK_STALE_AFTER
+        )
+        if not published and not stale:
+            return False
+
+        confirmed = self._read_update_marker(marker_path)
+        if confirmed is None or confirmed.get("owner_token") != owner_token:
+            return False
+        confirmed_lease = self._read_update_lease(lock_path, owner_token)
+        if confirmed_lease is None:
+            return False
+        if (
+            not published
+            and datetime.now(timezone.utc) - confirmed_lease
+            <= _UPDATE_LOCK_STALE_AFTER
+        ):
+            return False
+
+        temporary_meta_path = confirmed.get("temporary_meta_path")
+        temporary_prefix = node_path + ".meta.update-"
+        if (
+            isinstance(temporary_meta_path, str)
+            and temporary_meta_path.startswith(temporary_prefix)
+            and temporary_meta_path.endswith(".json")
+        ):
+            # Invalidate the retired writer before freeing the lock. Even if
+            # it passed its owner check, it cannot publish without this file.
+            try:
+                self._client.rm(temporary_meta_path)
+            except AGFSClientError as exc:
+                if not _is_not_found_error(exc):
+                    return False
+        self._remove_tree_if_present(lock_path)
+        return True
+
+    def _remove_tree_if_present(self, path: str) -> None:
+        try:
+            self._client.rm(path.rstrip("/"), recursive=True)
+        except AGFSClientError:
+            pass
+
+    def _remove_file_if_present(self, path: str) -> None:
+        try:
+            self._client.rm(path)
+        except AGFSClientError:
+            pass
+
+    def _write_node_files(
+        self,
+        node_path: str,
+        node: ContextNode,
+        expected_version: int | None,
+        *,
+        meta_path: str | None = None,
+        mutation_lease: _ResourceMutationLease | None = None,
+    ) -> None:
+        """Write a complete node into an already-created directory."""
+
+        def write_file(path: str, content: str) -> None:
+            if mutation_lease is None:
+                self._write_file(path, content)
+                return
+            # Reclaim removes the lease and its publication sources together.
+            temporary = (f"{mutation_lease.lock_path}/.publish-{mutation_lease.owner_token}-"
+                         f"{uuid.uuid4().hex}-{PurePosixPath(path).name}")
+            try:
+                self._write_file(temporary, content)
+                mutation_lease.ensure_owned()
+                self._client.mv(temporary, path)
+            except Exception:
+                self._remove_file_if_present(temporary)
+                raise
 
         # Prepare file paths
         content_path = node_path + self.FILE_CONTENT
         relations_path = node_path + self.FILE_RELATIONS
         abstract_path = node_path + self.FILE_ABSTRACT
         overview_path = node_path + self.FILE_OVERVIEW
-        meta_path = node_path + self.FILE_META
+        meta_path = meta_path or node_path + self.FILE_META
 
         # Step ①: Write content.md (largest file, do first)
         # If this fails, no .meta.json exists, node doesn't exist → skip in repair
-        self._write_file(content_path, node.content)
+        write_file(content_path, node.content)
 
         # Step ②: Write .relations.json
         # Get relations from node metadata if available
@@ -604,42 +1346,17 @@ class AGFSContextFS:
             ensure_ascii=False,
             indent=2
         )
-        self._write_file(relations_path, relations_json)
+        write_file(relations_path, relations_json)
 
         # Step ③: Write .abstract.md and .overview.md (parallel safe)
-        self._write_file(abstract_path, node.abstract)
-        self._write_file(overview_path, node.overview)
+        write_file(abstract_path, node.abstract)
+        write_file(overview_path, node.overview)
 
-        # Step ④: Write .meta.json with status=ACTIVE ★ COMMIT POINT
-        # After this step, the node is visible to retrieval
-        now = datetime.now(timezone.utc).isoformat()
-
-        # Determine version: increment for merge, default to 1 for create
-        if expected_version is not None:
-            # Merge operation: increment from expected version
-            new_version = expected_version + 1
-        else:
-            # Create operation: use existing version or default to 1
-            new_version = node.metadata.get("version", 1)
-
-        meta = {
-            "uri": node.uri,
-            "context_type": node.context_type,
-            "category": node.category,
-            "level": node.level,
-            "owner_space": node.owner_space,
-            "status": NodeStatus.ACTIVE.value,
-            "created_at": node.metadata.get("created_at", now),
-            "updated_at": now,
-            "version": new_version,
-        }
-
-        # Add any additional metadata (excluding internal _relations)
-        extra_meta = {k: v for k, v in node.metadata.items() if not k.startswith('_')}
-        meta.update(extra_meta)
-
+        # Step ④: Write status=ACTIVE metadata. Versioned updates pass a
+        # temporary path and publish it with one atomic file rename.
+        meta = self._build_node_metadata(node, expected_version)
         meta_json = json.dumps(meta, ensure_ascii=False, indent=2)
-        self._write_file(meta_path, meta_json)
+        write_file(meta_path, meta_json)
 
     def read_node(self, uri: str, ctx: RequestContext) -> ContextNode:
         """Read a node from AGFS.
@@ -683,8 +1400,16 @@ class AGFSContextFS:
         overview_path = node_path + self.FILE_OVERVIEW
         relations_path = node_path + self.FILE_RELATIONS
 
-        content = self._read_file(content_path)
-        abstract = self._read_file(abstract_path)
+        if meta.get("ogmemory_managed"):
+            content = meta.get("package_skill_md")
+            abstract = meta.get("package_description")
+            if content is None:
+                content = self._read_file(content_path)
+            if abstract is None:
+                abstract = self._read_file(abstract_path)
+        else:
+            content = self._read_file(content_path)
+            abstract = self._read_file(abstract_path)
         overview = self._read_file(overview_path)
 
         # Read relations
@@ -702,10 +1427,12 @@ class AGFSContextFS:
             "version": meta.get("version", 1),
             "_relations": relations,
         }
-        # Add any extra metadata from meta.json
-        for key in ["tags", "status"]:
-            if key in meta:
-                metadata[key] = meta[key]
+        # Preserve extension metadata such as complete managed Skill packages.
+        core_keys = {
+            "uri", "context_type", "category", "level", "owner_space",
+            "created_at", "updated_at", "version",
+        }
+        metadata.update({key: value for key, value in meta.items() if key not in core_keys})
 
         return ContextNode(
             uri=meta["uri"],
@@ -739,9 +1466,19 @@ class AGFSContextFS:
         if status != NodeStatus.ACTIVE.value:
             raise NodeNotFoundError(uri)
 
-        abstract = self._read_file(node_path + self.FILE_ABSTRACT) if level in {"abstract", "all"} else ""
+        if level in {"abstract", "all"}:
+            abstract = meta.get("package_description") if meta.get("ogmemory_managed") else None
+            if abstract is None:
+                abstract = self._read_file(node_path + self.FILE_ABSTRACT)
+        else:
+            abstract = ""
         overview = self._read_file(node_path + self.FILE_OVERVIEW) if level in {"overview", "all"} else ""
-        content = self._read_file(node_path + self.FILE_CONTENT) if level in {"content", "all"} else ""
+        if level in {"content", "all"}:
+            content = meta.get("package_skill_md") if meta.get("ogmemory_managed") else None
+            if content is None:
+                content = self._read_file(node_path + self.FILE_CONTENT)
+        else:
+            content = ""
 
         metadata = {
             "created_at": meta.get("created_at", ""),
@@ -749,9 +1486,11 @@ class AGFSContextFS:
             "version": meta.get("version", 1),
             "has_content": True,
         }
-        for key in ["tags", "status"]:
-            if key in meta:
-                metadata[key] = meta[key]
+        core_keys = {
+            "uri", "context_type", "category", "level", "owner_space",
+            "created_at", "updated_at", "version",
+        }
+        metadata.update({key: value for key, value in meta.items() if key not in core_keys})
 
         return ContextNode(
             uri=meta["uri"],
@@ -789,6 +1528,55 @@ class AGFSContextFS:
             return meta.get("status") == NodeStatus.ACTIVE.value
         except (ValueError, NodeNotFoundError, json.JSONDecodeError):
             return False
+
+    _STRUCTURAL_META_FIELDS = {
+        "uri",
+        "context_type",
+        "category",
+        "level",
+        "owner_space",
+        "expected_version",
+    }
+
+
+    _WRITE_RESERVED_META_FIELDS = _STRUCTURAL_META_FIELDS | {
+        "status", "created_at", "updated_at", "version",
+    }
+
+    @classmethod
+    def _context_metadata(cls, meta: dict, **extra) -> dict:
+        """Round-trip every non-structural .meta.json field to ContextNode."""
+        metadata = {
+            key: value
+            for key, value in meta.items()
+            if key not in cls._STRUCTURAL_META_FIELDS
+        }
+        metadata.update(extra)
+        return metadata
+
+
+    def read_node_metadata_including_inactive(
+        self,
+        uri: str,
+        ctx: RequestContext,
+    ) -> dict:
+        """Read raw committed metadata without applying ACTIVE visibility."""
+        self._ensure_accessible(uri, ctx)
+        meta_path = self._uri_to_agfs_path(uri) + self.FILE_META
+        try:
+            meta = json.loads(self._read_file(meta_path))
+        except NodeNotFoundError:
+            raise NodeNotFoundError(uri)
+        return self._context_metadata(meta)
+
+
+    def archived_node_version(self, uri: str, ctx: RequestContext) -> int | None:
+        self._ensure_accessible(uri, ctx)
+        try:
+            meta = json.loads(self._read_file(self._uri_to_agfs_path(uri) + self.FILE_META))
+        except (NodeNotFoundError, json.JSONDecodeError):
+            return None
+        return meta.get("version") if meta.get("status") == NodeStatus.ARCHIVED.value else None
 
     def list_children(self, uri: str, ctx: RequestContext) -> list[str]:
         """List child URIs under a given URI.
@@ -836,8 +1624,29 @@ class AGFSContextFS:
 
         return children
 
-    def list_node_summaries(self, uri: str, ctx: RequestContext, limit: int = 50) -> list[ContextNode]:
-        """List child node summaries without reading full content/overview."""
+    def list_node_summaries(self, uri: str, ctx: RequestContext,
+                            limit: int = 50) -> list[ContextNode]:
+        """List the first stable page of child node summaries."""
+        return self.list_node_summaries_page(
+            uri, ctx, limit=limit, after_uri=None,
+        )
+
+    @staticmethod
+    def list_node_order_key(uri: str) -> str:
+        """Match the physical directory order used by paged listing."""
+        parent, name = uri.rsplit("/", 1)
+        return f"{parent}/{unquote(name)}"
+
+    def list_node_summaries_page(
+        self,
+        uri: str,
+        ctx: RequestContext,
+        *,
+        limit: int,
+        after_uri: str | None = None,
+        skip_broken: bool = False,
+    ) -> list[ContextNode]:
+        """List one physical-path-ordered page without reading full content/overview."""
 
         self._ensure_accessible(uri, ctx)
         if limit <= 0:
@@ -850,7 +1659,7 @@ class AGFSContextFS:
             return []
 
         summaries: list[ContextNode] = []
-        for file_info in files:
+        for file_info in sorted(files, key=lambda item: str(item.get("name", ""))):
             if len(summaries) >= limit:
                 break
             if not file_info.get("isDir", False):
@@ -859,23 +1668,28 @@ class AGFSContextFS:
             if name.startswith("."):
                 continue
             child_uri = uri.rstrip("/") + "/" + name
+            if after_uri is not None and child_uri <= after_uri:
+                continue
             try:
                 node_path = self._uri_to_agfs_path(child_uri)
                 meta = json.loads(self._read_file(node_path + self.FILE_META))
                 status = meta.get("status")
                 if status == NodeStatus.BROKEN.value:
+                    if skip_broken:
+                        continue
                     raise NodeBrokenError(child_uri)
                 if status != NodeStatus.ACTIVE.value:
                     continue
-                abstract = self._read_file(node_path + self.FILE_ABSTRACT)
+                abstract = (
+                    meta.get("package_description")
+                    if meta.get("ogmemory_managed")
+                    else None
+                )
+                if abstract is None:
+                    abstract = self._read_file(node_path + self.FILE_ABSTRACT)
             except NodeNotFoundError:
                 continue
-            metadata = {
-                "created_at": meta.get("created_at", ""),
-                "updated_at": meta.get("updated_at", ""),
-                "version": meta.get("version", 1),
-                "has_content": True,
-            }
+            metadata = self._context_metadata(meta, has_content=True)
             summaries.append(
                 ContextNode(
                     uri=meta["uri"],
@@ -891,6 +1705,14 @@ class AGFSContextFS:
             )
 
         return summaries
+
+    def list_identity_node_summaries_page(
+        self, uri: str, ctx: RequestContext, *, limit: int, after_uri: str | None = None,
+    ) -> list[ContextNode]:
+        """Scan active identities while leaving broken-node reads strict."""
+        return self.list_node_summaries_page(
+            uri, ctx, limit=limit, after_uri=after_uri, skip_broken=True,
+        )
 
     def archive_node(self, uri: str, ctx: RequestContext) -> None:
         """Archive a node from AGFS by marking its metadata status ARCHIVED."""
@@ -933,7 +1755,7 @@ class AGFSContextFS:
         try:
             self._client.rm(node_path, recursive=True)
         except AGFSClientError as e:
-            if "no such file" in str(e).lower() or "not found" in str(e).lower():
+            if _is_not_found_error(e):
                 raise NodeNotFoundError(uri)
             raise
 
@@ -962,3 +1784,72 @@ class AGFSContextFS:
 
         # Move the directory
         self._client.mv(from_path, to_path)
+
+    def list_children_including_inactive(
+        self,
+        uri: str,
+        ctx: RequestContext,
+    ) -> list[str]:
+        """List physical child nodes for trusted lifecycle cleanup.
+
+        Unlike ``list_children``, this does not hide legacy nodes whose AGFS
+        node status was historically overwritten with an archive merge state.
+        """
+        self._ensure_accessible(uri, ctx)
+        try:
+            files = self._client.ls(self._uri_to_agfs_path(uri))
+        except AGFSClientError as exc:
+            if "not found" in str(exc).casefold() or "no such" in str(exc).casefold():
+                return []
+            raise
+        children = []
+        for file_info in files:
+            if not file_info.get("isDir", False):
+                continue
+            name = str(file_info.get("name", ""))
+            if not name or name.startswith("."):
+                continue
+            children.append(uri.rstrip("/") + "/" + name)
+        return children
+
+    def _build_node_metadata(
+        self,
+        node: ContextNode,
+        expected_version: int | None,
+        *,
+        created_at: object = None,
+        version: object = None,
+    ) -> dict:
+        """Build the committed metadata document for a node write."""
+
+        now = datetime.now(UTC).isoformat()
+        # Determine version: increment for merge, default to 1 for create
+        if expected_version is not None:
+            # Merge operation: increment from expected version
+            new_version = expected_version + 1
+        elif isinstance(version, int) and not isinstance(version, bool):
+            new_version = version
+        else:
+            # Create operation: use existing version or default to 1
+            new_version = node.metadata.get("version", 1)
+
+        meta = {
+            "uri": node.uri,
+            "context_type": node.context_type,
+            "category": node.category,
+            "level": node.level,
+            "owner_space": node.owner_space,
+            "status": NodeStatus.ACTIVE.value,
+            "created_at": created_at or node.metadata.get("created_at", now),
+            "updated_at": now,
+            "version": new_version,
+        }
+
+        # Add any additional metadata (excluding internal _relations)
+        extra_meta = {
+            key: value
+            for key, value in node.metadata.items()
+            if not key.startswith("_") and key not in self._WRITE_RESERVED_META_FIELDS
+        }
+        meta.update(extra_meta)
+        return meta

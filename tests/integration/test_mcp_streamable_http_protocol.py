@@ -1,20 +1,26 @@
 from __future__ import annotations
 
+import base64
+import io
 import json
 import os
 import socket
 import subprocess
 import sys
+import tempfile
 import time
+import zipfile
 from pathlib import Path
 from typing import Any
 
 import anyio
 import httpx
+import psycopg2
 import pytest
 from mcp import ClientSession
-from mcp.client.sse import sse_client
 from mcp.client.streamable_http import streamable_http_client
+
+from fs.sql_adapter.sql_trace_store import SQLTraceEventStore
 
 ROOT = Path(__file__).resolve().parents[2]
 _ENV_PASSTHROUGH = {
@@ -37,56 +43,6 @@ def test_mcp_streamable_http_protocol_exposes_tools_and_resources():
 
 
 @pytest.mark.integration
-def test_mcp_sse_protocol_exposes_tools_and_resources():
-    anyio.run(_run_sse_protocol_check)
-
-
-@pytest.mark.integration
-def test_mcp_sse_rejects_missing_auth_for_tools_and_resources():
-    anyio.run(_run_sse_auth_rejection_check)
-
-
-@pytest.mark.integration
-def test_mcp_sse_cli_path_overrides_config():
-    anyio.run(_run_sse_cli_path_override_check)
-
-
-@pytest.mark.integration
-def test_mcp_sse_rejects_oversized_post():
-    anyio.run(_run_sse_oversized_post_check)
-
-
-@pytest.mark.integration
-def test_mcp_sse_limits_and_releases_connections():
-    anyio.run(_run_sse_connection_limit_check)
-
-
-@pytest.mark.integration
-def test_mcp_sse_rejects_cross_identity_session_post():
-    anyio.run(_run_sse_cross_identity_check)
-
-
-@pytest.mark.integration
-def test_mcp_sse_rejects_chunked_get_body():
-    anyio.run(_run_sse_chunked_get_body_check)
-
-
-@pytest.mark.integration
-def test_mcp_sse_rejects_ambiguous_message_routes():
-    anyio.run(_run_sse_ambiguous_message_route_check)
-
-
-@pytest.mark.integration
-def test_mcp_sse_rejects_head_requests():
-    anyio.run(_run_sse_head_rejection_check)
-
-
-@pytest.mark.integration
-def test_mcp_sse_rejects_non_post_message_methods():
-    anyio.run(_run_sse_message_method_rejection_check)
-
-
-@pytest.mark.integration
 def test_mcp_streamable_http_protocol_exposes_all_tools_when_enabled():
     anyio.run(_run_streamable_http_all_tools_check)
 
@@ -98,34 +54,49 @@ def test_mcp_streamable_http_protocol_can_call_all_tools_when_enabled():
 
 async def _run_streamable_http_protocol_check() -> None:
     port = _free_port()
-    proc = _start_http_server(port)
+    sql_dsn = _required_sql_dsn()
+    account_id = "acct-protocol-http-read"
+    _seed_reviewed_skill(sql_dsn, account_id=account_id, agent_id="main")
+    proc = _start_http_server(port, sql_dsn=sql_dsn)
     try:
         _wait_for_port(port, proc)
         headers = {
             "X-API-Key": "root-key",
-            "X-Account-ID": "acct-1",
+            "X-Account-ID": account_id,
             "X-User-ID": "root",
+            "X-Agent-ID": "main",
         }
         async with httpx.AsyncClient(headers=headers, timeout=30) as http_client:
             async with streamable_http_client(
                 f"http://127.0.0.1:{port}/mcp",
                 http_client=http_client,
-            ) as (read_stream, write_stream, _get_session_id):
+            ) as (read_stream, write_stream):
                 async with ClientSession(read_stream, write_stream) as session:
                     init = await session.initialize()
-                    assert init.serverInfo.name == "oGMemory"
+                    assert init.server_info.name == "oGMemory"
 
                     tools = await session.list_tools()
                     tool_names = {tool.name for tool in tools.tools}
-                    assert tool_names == {"ogm_query_memory", "ogm_read_memory"}
-                    assert all("." not in name for name in tool_names)
-                    resources = await session.list_resources()
-                    assert "ogmemory://status" in {
-                        str(resource.uri) for resource in resources.resources
+                    assert tool_names == {
+                        "ogm_list_memories",
+                        "ogm_query_memory",
+                        "ogm_read_memory",
+                        "ogm_search_skills",
+                        "ogm_list_skills",
+                        "ogm_read_skill",
+                        "ogm_list_skill_candidates",
                     }
+                    resources = await session.list_resources()
+                    assert {
+                        "ogmemory://status", "ogmemory://skills",
+                        "ogmemory://skill-candidates",
+                    } <= {str(resource.uri) for resource in resources.resources}
                     templates = await session.list_resource_templates()
                     assert "ogmemory://memories/{memory_type}" in {
-                        template.uriTemplate for template in templates.resourceTemplates
+                        template.uri_template for template in templates.resource_templates
+                    }
+                    assert "ogmemory://skills/{name}" in {
+                        template.uri_template for template in templates.resource_templates
                     }
 
                     read_result = await session.call_tool(
@@ -134,331 +105,65 @@ async def _run_streamable_http_protocol_check() -> None:
                     )
                     assert "types" in _tool_json(read_result)
 
+                    listed = _tool_json(await session.call_tool("ogm_list_skills", {}))
+                    searched = _tool_json(await session.call_tool(
+                        "ogm_search_skills", {"query": "protocol review", "top_k": 1}
+                    ))
+                    skill = _tool_json(await session.call_tool(
+                        "ogm_read_skill", {"name": "protocol-review"}
+                    ))
+                    candidates = _tool_json(await session.call_tool(
+                        "ogm_list_skill_candidates", {}
+                    ))
+                    assert any(row["name"] == "protocol-review" for row in listed["skills"])
+                    assert searched["skills"][0]["name"] == "protocol-review"
+                    assert skill["content"].startswith("---\nname: protocol-review")
+                    assert (
+                        any(
+                            row["capability_key"] == "protocol-review-candidate"
+                            for row in candidates["candidates"]
+                        )
+                    )
+
                     status_payload = _resource_json(
                         await session.read_resource("ogmemory://status")
                     )
+                    skills_payload = _resource_json(
+                        await session.read_resource("ogmemory://skills")
+                    )
+                    skill_payload = _resource_json(
+                        await session.read_resource("ogmemory://skills/protocol-review")
+                    )
+                    candidate_payload = _resource_json(
+                        await session.read_resource("ogmemory://skill-candidates")
+                    )
                     assert status_payload["status"] == "ok"
-    finally:
-        _terminate(proc)
-
-
-async def _run_sse_protocol_check() -> None:
-    port = _free_port()
-    path = "/custom-sse"
-    proc = _start_http_server(port, transport="sse", env_path=path)
-    try:
-        _wait_for_port(port, proc)
-        headers = {
-            "X-API-Key": "root-key",
-            "X-Account-ID": "acct-1",
-            "X-User-ID": "root",
-        }
-        async with sse_client(
-            f"http://127.0.0.1:{port}{path}",
-            headers=headers,
-            timeout=30,
-        ) as (read_stream, write_stream):
-            async with ClientSession(read_stream, write_stream) as session:
-                init = await session.initialize()
-                assert init.serverInfo.name == "oGMemory"
-
-                tools = await session.list_tools()
-                tool_names = {tool.name for tool in tools.tools}
-                assert tool_names == {"ogm_query_memory", "ogm_read_memory"}
-                assert all("." not in name for name in tool_names)
-                resources = await session.list_resources()
-                assert "ogmemory://status" in {
-                    str(resource.uri) for resource in resources.resources
-                }
-
-                read_result = await session.call_tool(
-                    "ogm_read_memory",
-                    {"uri": "ogmemory://types"},
-                )
-                assert not read_result.isError
-                assert "types" in _tool_json(read_result)
-    finally:
-        _terminate(proc)
-
-
-async def _run_sse_auth_rejection_check() -> None:
-    port = _free_port()
-    proc = _start_http_server(port, transport="sse", env_path="/custom-sse")
-    try:
-        _wait_for_port(port, proc)
-        async with httpx.AsyncClient(timeout=30) as client:
-            async with client.stream(
-                "GET",
-                f"http://127.0.0.1:{port}/custom-sse",
-            ) as response:
-                assert response.status_code == 401
-                assert await response.aread() == b'{"error":"authentication_required"}'
-    finally:
-        _terminate(proc)
-
-
-async def _run_sse_cli_path_override_check() -> None:
-    port = _free_port()
-    proc = _start_http_server(
-        port,
-        transport="sse",
-        path="/cli-sse",
-        env_path="/configured-sse",
-    )
-    try:
-        _wait_for_port(port, proc)
-        headers = {
-            "X-API-Key": "root-key",
-            "X-Account-ID": "acct-1",
-            "X-User-ID": "root",
-        }
-        async with sse_client(
-            f"http://127.0.0.1:{port}/cli-sse",
-            headers=headers,
-            timeout=30,
-        ) as (read_stream, write_stream):
-            async with ClientSession(read_stream, write_stream) as session:
-                await session.initialize()
-                read_result = await session.call_tool(
-                    "ogm_read_memory",
-                    {"uri": "ogmemory://types"},
-                )
-                assert not read_result.isError
-                assert "types" in _tool_json(read_result)
-    finally:
-        _terminate(proc)
-
-
-async def _run_sse_oversized_post_check() -> None:
-    port = _free_port()
-    max_request_bytes = 4096
-    proc = _start_http_server(
-        port,
-        transport="sse",
-        env_path="/custom-sse",
-        max_request_bytes=max_request_bytes,
-    )
-    try:
-        _wait_for_port(port, proc)
-        headers = {
-            "X-API-Key": "root-key",
-            "X-Account-ID": "acct-1",
-            "X-User-ID": "root",
-        }
-        session_ids: list[str] = []
-        async with sse_client(
-            f"http://127.0.0.1:{port}/custom-sse",
-            headers=headers,
-            timeout=30,
-            on_session_created=session_ids.append,
-        ):
-            assert len(session_ids) == 1
-
-            async def chunked_body():
-                yield b"x" * (max_request_bytes + 1)
-
-            async with httpx.AsyncClient(headers=headers, timeout=5) as client:
-                response = await client.post(
-                    f"http://127.0.0.1:{port}/messages/",
-                    params={"session_id": session_ids[0]},
-                    content=chunked_body(),
-                )
-
-            assert response.status_code == 413
-            assert response.json() == {"error": "request_too_large"}
-    finally:
-        _terminate(proc)
-
-
-async def _run_sse_connection_limit_check() -> None:
-    port = _free_port()
-    path = "/custom-sse"
-    proc = _start_http_server(
-        port,
-        transport="sse",
-        env_path=path,
-        max_sse_connections=1,
-    )
-    headers = {
-        "X-API-Key": "root-key",
-        "X-Account-ID": "acct-1",
-        "X-User-ID": "root",
-    }
-    try:
-        _wait_for_port(port, proc)
-        async with sse_client(
-            f"http://127.0.0.1:{port}{path}",
-            headers=headers,
-            timeout=30,
-        ):
-            async with httpx.AsyncClient(headers=headers, timeout=30) as client:
-                async with client.stream("GET", f"http://127.0.0.1:{port}{path}") as response:
-                    assert response.status_code == 429
-                    assert await response.aread() == b'{"error":"too_many_sse_connections"}'
-
-        async with httpx.AsyncClient(headers=headers, timeout=30) as client:
-            async with client.stream("GET", f"http://127.0.0.1:{port}{path}") as response:
-                assert response.status_code == 200
-    finally:
-        _terminate(proc)
-
-
-async def _run_sse_cross_identity_check() -> None:
-    port = _free_port()
-    path = "/custom-sse"
-    proc = _start_http_server(port, transport="sse", env_path=path)
-    owner_headers = {
-        "X-API-Key": "root-key",
-        "X-Account-ID": "acct-1",
-        "X-User-ID": "owner",
-    }
-    other_headers = {
-        "X-API-Key": "root-key",
-        "X-Account-ID": "acct-1",
-        "X-User-ID": "other",
-    }
-    try:
-        _wait_for_port(port, proc)
-        session_ids: list[str] = []
-        async with sse_client(
-            f"http://127.0.0.1:{port}{path}",
-            headers=owner_headers,
-            timeout=30,
-            on_session_created=session_ids.append,
-        ) as (read_stream, write_stream):
-            async with ClientSession(read_stream, write_stream) as session:
-                await session.initialize()
-                assert len(session_ids) == 1
-                async with httpx.AsyncClient(headers=other_headers, timeout=30) as client:
-                    response = await client.post(
-                        f"http://127.0.0.1:{port}/messages/",
-                        params={"session_id": session_ids[0]},
-                        json={"jsonrpc": "2.0", "id": 99, "method": "ping"},
+                    protocol_skill = next(
+                        row for row in skills_payload["skills"]
+                        if row["name"] == "protocol-review"
                     )
-
-            assert response.status_code == 404
-            assert response.text == "Could not find session"
-    finally:
-        _terminate(proc)
-
-
-async def _run_sse_chunked_get_body_check() -> None:
-    port = _free_port()
-    path = "/custom-sse"
-    proc = _start_http_server(port, transport="sse", env_path=path)
-    headers = {
-        "X-API-Key": "root-key",
-        "X-Account-ID": "acct-1",
-        "X-User-ID": "root",
-    }
-
-    async def chunked_body():
-        yield b"unexpected"
-
-    try:
-        _wait_for_port(port, proc)
-        async with httpx.AsyncClient(headers=headers, timeout=30) as client:
-            async with client.stream(
-                "GET",
-                f"http://127.0.0.1:{port}{path}",
-                content=chunked_body(),
-            ) as response:
-                assert response.status_code == 400
-                assert await response.aread() == b'{"error":"request_body_not_allowed"}'
-    finally:
-        _terminate(proc)
-
-
-async def _run_sse_ambiguous_message_route_check() -> None:
-    port = _free_port()
-    path = "/custom-sse"
-    proc = _start_http_server(port, transport="sse", env_path=path)
-    headers = {
-        "X-API-Key": "root-key",
-        "X-Account-ID": "acct-1",
-        "X-User-ID": "owner",
-    }
-    try:
-        _wait_for_port(port, proc)
-        session_ids: list[str] = []
-        async with sse_client(
-            f"http://127.0.0.1:{port}{path}",
-            headers=headers,
-            timeout=30,
-            on_session_created=session_ids.append,
-        ) as (read_stream, write_stream):
-            async with ClientSession(read_stream, write_stream) as session:
-                await session.initialize()
-                assert len(session_ids) == 1
-                session_id = session_ids[0]
-                async with httpx.AsyncClient(headers=headers, timeout=30) as client:
-                    subpath_response = await client.post(
-                        f"http://127.0.0.1:{port}/messages/bypass",
-                        params={"session_id": session_id},
-                        json={"jsonrpc": "2.0", "id": 97, "method": "ping"},
+                    assert protocol_skill["uri"] == (
+                        "ogmemory://skills/generated/protocol-review"
                     )
-                    duplicate_response = await client.post(
-                        f"http://127.0.0.1:{port}/messages/",
-                        params=[("session_id", session_id), ("session_id", session_id)],
-                        json={"jsonrpc": "2.0", "id": 98, "method": "ping"},
+                    assert skill_payload["name"] == "protocol-review"
+                    assert skill_payload["content"].startswith(
+                        "---\nname: protocol-review"
                     )
-
-                assert subpath_response.status_code == 404
-                assert duplicate_response.status_code == 404
-    finally:
-        _terminate(proc)
-
-
-async def _run_sse_head_rejection_check() -> None:
-    port = _free_port()
-    path = "/custom-sse"
-    proc = _start_http_server(port, transport="sse", env_path=path)
-    headers = {
-        "X-API-Key": "root-key",
-        "X-Account-ID": "acct-1",
-        "X-User-ID": "root",
-    }
-    try:
-        _wait_for_port(port, proc)
-        async with httpx.AsyncClient(headers=headers, timeout=30) as client:
-            response = await client.request("HEAD", f"http://127.0.0.1:{port}{path}")
-
-        assert response.status_code == 405
-    finally:
-        _terminate(proc)
-
-
-async def _run_sse_message_method_rejection_check() -> None:
-    port = _free_port()
-    path = "/custom-sse"
-    proc = _start_http_server(port, transport="sse", env_path=path)
-    headers = {
-        "X-API-Key": "root-key",
-        "X-Account-ID": "acct-1",
-        "X-User-ID": "root",
-    }
-    try:
-        _wait_for_port(port, proc)
-        session_ids: list[str] = []
-        async with sse_client(
-            f"http://127.0.0.1:{port}{path}",
-            headers=headers,
-            timeout=30,
-            on_session_created=session_ids.append,
-        ) as (read_stream, write_stream):
-            async with ClientSession(read_stream, write_stream) as session:
-                await session.initialize()
-                assert len(session_ids) == 1
-                async with httpx.AsyncClient(headers=headers, timeout=30) as client:
-                    for method in ("GET", "PUT", "PATCH", "DELETE"):
-                        response = await client.request(
-                            method,
-                            f"http://127.0.0.1:{port}/messages/",
-                            params={"session_id": session_ids[0]},
-                            json={"jsonrpc": "2.0", "id": 99, "method": "ping"},
-                        )
-                        assert response.status_code == 405
-                        assert response.headers["Allow"] == "POST"
+                    protocol_candidate = next(
+                        row for row in candidate_payload["candidates"]
+                        if row["capability_key"] == "protocol-review-candidate"
+                    )
+                    assert protocol_candidate == {
+                        "capability_key": "protocol-review-candidate",
+                        "state": "accumulating",
+                        "evidence_count": 1,
+                        "distinct_session_count": 1,
+                        "summary": "Safe candidate summary.",
+                        "reason": "Awaiting more evidence.",
+                    }
+                    _assert_no_trace_provenance(
+                        skills_payload, skill_payload, candidate_payload
+                    )
     finally:
         _terminate(proc)
 
@@ -470,22 +175,30 @@ async def _run_streamable_http_all_tools_check() -> None:
         _wait_for_port(port, proc)
         headers = {
             "X-API-Key": "root-key",
-            "X-Account-ID": "acct-1",
+            "X-Account-ID": "acct-protocol-http-tools",
             "X-User-ID": "root",
         }
         async with httpx.AsyncClient(headers=headers, timeout=30) as http_client:
             async with streamable_http_client(
                 f"http://127.0.0.1:{port}/mcp",
                 http_client=http_client,
-            ) as (read_stream, write_stream, _get_session_id):
+            ) as (read_stream, write_stream):
                 async with ClientSession(read_stream, write_stream) as session:
                     await session.initialize()
 
                     tools = await session.list_tools()
                     tool_names = {tool.name for tool in tools.tools}
                     assert tool_names == {
+                        "ogm_list_memories",
                         "ogm_query_memory",
                         "ogm_read_memory",
+                        "ogm_search_skills",
+                        "ogm_list_skills",
+                        "ogm_read_skill",
+                        "ogm_list_skill_candidates",
+                        "ogm_install_skill",
+                        "ogm_update_skill",
+                        "ogm_delete_skill",
                         "ogm_write_memory",
                         "ogm_delete_memory",
                     }
@@ -507,19 +220,44 @@ async def _run_streamable_http_all_tools_check() -> None:
 
 async def _run_streamable_http_all_tools_call_check() -> None:
     port = _free_port()
-    proc = _start_http_server(port, default_toolset="all")
+    sql_dsn = _required_sql_dsn()
+    skill_source = tempfile.TemporaryDirectory(prefix="ogmemory-mcp-skill-")
+    skill_dir = Path(skill_source.name) / "protocol-managed-skill"
+    skill_dir.mkdir()
+    (skill_dir / "SKILL.md").write_text(
+        "---\nname: protocol-managed-skill\n"
+        "description: Exercise MCP Skill management\n---\n\n"
+        "# Protocol managed Skill\n\nUse the updated protocol workflow.\n",
+        encoding="utf-8",
+    )
+    scripts = skill_dir / "scripts"
+    scripts.mkdir()
+    (scripts / "check.py").write_text("print('updated')\n", encoding="utf-8")
+    archive = io.BytesIO()
+    with zipfile.ZipFile(archive, "w", zipfile.ZIP_DEFLATED) as package:
+        package.writestr(
+            "protocol-managed-skill/SKILL.md",
+            "---\nname: protocol-managed-skill\n"
+            "description: Exercise MCP Skill management\n---\n\n"
+            "# Protocol managed Skill\n\nUse the protocol workflow.\n",
+        )
+    proc = _start_http_server(
+        port,
+        default_toolset="all",
+        sql_dsn=sql_dsn,
+    )
     try:
         _wait_for_port(port, proc)
         headers = {
             "X-API-Key": "root-key",
-            "X-Account-ID": "acct-1",
+            "X-Account-ID": "acct-protocol-http-call",
             "X-User-ID": "root",
         }
         async with httpx.AsyncClient(headers=headers, timeout=30) as http_client:
             async with streamable_http_client(
                 f"http://127.0.0.1:{port}/mcp",
                 http_client=http_client,
-            ) as (read_stream, write_stream, _get_session_id):
+            ) as (read_stream, write_stream):
                 async with ClientSession(read_stream, write_stream) as session:
                     await session.initialize()
 
@@ -527,14 +265,19 @@ async def _run_streamable_http_all_tools_call_check() -> None:
                         "ogm_query_memory",
                         {"query": "nothing has been written for this account", "top_k": 1},
                     )
-                    assert not query_result.isError
+                    assert not query_result.is_error
                     assert _tool_json(query_result)["hits"] == []
+
+                    list_result = await session.call_tool("ogm_list_memories", {})
+                    assert not list_result.is_error
+                    list_payload = _tool_json(list_result)
+                    assert list_payload["count"] == len(list_payload["memories"])
 
                     read_result = await session.call_tool(
                         "ogm_read_memory",
                         {"uri": "ogmemory://types"},
                     )
-                    assert not read_result.isError
+                    assert not read_result.is_error
                     assert "types" in _tool_json(read_result)
 
                     write_result = await session.call_tool(
@@ -546,11 +289,48 @@ async def _run_streamable_http_all_tools_call_check() -> None:
                             "client_request_id": "mcp-e2e-write-1",
                         },
                     )
-                    assert not write_result.isError
+                    assert not write_result.is_error
                     write_payload = _tool_json(write_result)
                     assert write_payload["ok"] is True
                     assert write_payload["accepted_messages"] == 1
                     assert write_payload["client_request_id"] == "mcp-e2e-write-1"
+
+                    install_result = await session.call_tool(
+                        "ogm_install_skill",
+                        {
+                            "agent_id": "main",
+                            "archive_base64": base64.b64encode(
+                                archive.getvalue()
+                            ).decode("ascii"),
+                        },
+                    )
+                    assert not install_result.is_error
+                    assert _tool_json(install_result)["action"] == "create"
+
+                    update_result = await session.call_tool(
+                        "ogm_update_skill",
+                        {
+                            "name": "protocol-managed-skill",
+                            "agent_id": "main",
+                            "data": {"files": {
+                                "SKILL.md": (skill_dir / "SKILL.md").read_text(encoding="utf-8"),
+                                "scripts/check.py": (scripts / "check.py").read_text(encoding="utf-8"),
+                            }},
+                        },
+                    )
+                    assert not update_result.is_error
+                    assert _tool_json(update_result)["action"] == "update"
+
+                    delete_skill_result = await session.call_tool(
+                        "ogm_delete_skill",
+                        {
+                            "name": "protocol-managed-skill",
+                            "source": "imported",
+                            "agent_id": "main",
+                        },
+                    )
+                    assert not delete_skill_result.is_error
+                    assert _tool_json(delete_skill_result)["action"] == "delete"
 
                     delete_result = await session.call_tool(
                         "ogm_delete_memory",
@@ -560,10 +340,43 @@ async def _run_streamable_http_all_tools_call_check() -> None:
                             "client_request_id": "mcp-e2e-delete-1",
                         },
                     )
-                    assert delete_result.isError is True
+                    assert delete_result.is_error is True
                     assert "single ogmemory" in delete_result.content[0].text
+
+                    legacy_calls = (
+                        ("ogm.query_memory", {"query": "legacy alias must be rejected", "top_k": 1}),
+                        ("ogm.read_memory", {"uri": "ogmemory://types"}),
+                        (
+                            "ogm.write_memory",
+                            {
+                                "session_id": "legacy-name-rejection",
+                                "text": "legacy alias must be rejected",
+                                "wait": False,
+                                "client_request_id": "mcp-http-legacy-write-1",
+                            },
+                        ),
+                        (
+                            "ogm.delete_memory",
+                            {
+                                "uri": "ogmemory://memories/preference/legacy-name-rejection",
+                                "reason": "legacy alias must be rejected",
+                                "client_request_id": "mcp-http-legacy-delete-1",
+                            },
+                        ),
+                    )
+                    for tool_name, arguments in legacy_calls:
+                        legacy_result = await session.call_tool(tool_name, arguments)
+                        assert legacy_result.is_error is True
+                        error_text = "\n".join(
+                            content.text
+                            for content in legacy_result.content
+                            if getattr(content, "type", None) == "text"
+                        )
+                        assert "Unknown tool" in error_text
+                        assert tool_name in error_text
     finally:
         _terminate(proc)
+        skill_source.cleanup()
 
 
 @pytest.mark.integration
@@ -580,19 +393,10 @@ async def _run_streamable_http_auth_rejection_check() -> None:
             async with streamable_http_client(
                 f"http://127.0.0.1:{port}/mcp",
                 http_client=http_client,
-            ) as (read_stream, write_stream, _get_session_id):
+            ) as (read_stream, write_stream):
                 async with ClientSession(read_stream, write_stream) as session:
-                    await session.initialize()
-
-                    tool_result = await session.call_tool(
-                        "ogm_read_memory",
-                        {"uri": "ogmemory://types"},
-                    )
-                    assert tool_result.isError is True
-                    assert "Missing API Key" in tool_result.content[0].text
-
-                    with pytest.raises(Exception, match="Missing API Key"):
-                        await session.read_resource("ogmemory://memories/preference")
+                    with pytest.raises(Exception, match="Server returned an error response"):
+                        await session.initialize()
     finally:
         _terminate(proc)
 
@@ -600,14 +404,10 @@ async def _run_streamable_http_auth_rejection_check() -> None:
 def _start_http_server(
     port: int,
     *,
-    transport: str = "streamable-http",
-    path: str | None = None,
-    env_path: str | None = None,
-    max_request_bytes: int | None = None,
-    max_sse_connections: int | None = None,
     default_toolset: str = "read-only",
     enable_write_tools: bool | None = None,
     enable_delete_tools: bool | None = None,
+    sql_dsn: str | None = None,
 ) -> subprocess.Popen:
     env = _clean_subprocess_env()
     if enable_write_tools is None:
@@ -628,38 +428,53 @@ def _start_http_server(
             "OGMEM_CONFIG": str(ROOT / "__missing_mcp_test_config__.yaml"),
         }
     )
-    if env_path is not None:
-        env["OGMEM_MCP_PATH"] = env_path
-    if max_request_bytes is not None:
-        env["OGMEM_MCP_MAX_REQUEST_BYTES"] = str(max_request_bytes)
-    if max_sse_connections is not None:
-        env["OGMEM_MCP_MAX_SSE_CONNECTIONS"] = str(max_sse_connections)
-    args = [
-        sys.executable,
-        "-m",
-        "cli.main",
-        "mcp",
-        "--transport",
-        transport,
-        "--host",
-        "127.0.0.1",
-        "--port",
-        str(port),
-    ]
-    if path is not None:
-        args.extend(["--path", path])
-    return subprocess.Popen(
-        args,
+    if sql_dsn:
+        env.update({"STORAGE_BACKEND": "sql", "SQL_CONNECTION_STRING": sql_dsn})
+    log_file = tempfile.NamedTemporaryFile(
+        prefix="ogmemory-mcp-http-", suffix=".log", delete=False, mode="w", encoding="utf-8",
+    )
+    proc = subprocess.Popen(
+        [
+            sys.executable,
+            "-m",
+            "cli.main",
+            "mcp",
+            "--transport",
+            "streamable-http",
+            "--host",
+            "127.0.0.1",
+            "--port",
+            str(port),
+        ],
         cwd=str(ROOT),
         env=env,
-        stdout=subprocess.PIPE,
-        stderr=subprocess.PIPE,
+        # A file avoids blocking on unread Windows pipes while preserving
+        # bounded diagnostics when startup fails.
+        stdout=log_file,
+        stderr=subprocess.STDOUT,
         text=True,
     )
+    log_file.close()
+    proc._ogmemory_log_path = log_file.name
+    return proc
 
 
 def _clean_subprocess_env() -> dict[str, str]:
-    return {key: value for key, value in os.environ.items() if key.upper() in _ENV_PASSTHROUGH}
+    return {
+        key: value
+        for key, value in os.environ.items()
+        if key.upper() in _ENV_PASSTHROUGH
+    }
+
+
+def _required_sql_dsn() -> str:
+    dsn = os.environ.get("OGMEM_TEST_SQL_DSN")
+    if not dsn:
+        pytest.fail(
+            "OGMEM_TEST_SQL_DSN is required; protocol acceptance must exercise "
+            "the DB-backed skill tools and may not silently downgrade"
+        )
+    return dsn
 
 
 def _free_port() -> int:
@@ -672,16 +487,26 @@ def _wait_for_port(port: int, proc: subprocess.Popen, timeout: float = 15.0) -> 
     deadline = time.monotonic() + timeout
     while time.monotonic() < deadline:
         if proc.poll() is not None:
-            stdout, stderr = proc.communicate(timeout=1)
             raise AssertionError(
-                f"MCP HTTP server exited early with {proc.returncode}\nSTDOUT:\n{stdout}\nSTDERR:\n{stderr}"
+                f"MCP HTTP server exited early with {proc.returncode}: {_log_tail(proc)}"
             )
         with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
             sock.settimeout(0.2)
             if sock.connect_ex(("127.0.0.1", port)) == 0:
                 return
         time.sleep(0.1)
-    raise AssertionError(f"MCP HTTP server did not listen on port {port}")
+    raise AssertionError(f"MCP HTTP server did not listen on port {port}: {_log_tail(proc)}")
+
+
+def _log_tail(proc: subprocess.Popen, limit: int = 4000) -> str:
+    path = getattr(proc, "_ogmemory_log_path", None)
+    if not path:
+        return "<no log file>"
+    try:
+        text = Path(path).read_text(encoding="utf-8", errors="replace")
+    except OSError as exc:
+        return f"<unable to read log: {exc}>"
+    return text[-limit:] or "<empty log>"
 
 
 def _terminate(proc: subprocess.Popen) -> None:
@@ -693,10 +518,13 @@ def _terminate(proc: subprocess.Popen) -> None:
     except subprocess.TimeoutExpired:
         proc.kill()
         proc.wait(timeout=5)
+    log_path = getattr(proc, "_ogmemory_log_path", None)
+    if log_path:
+        Path(log_path).unlink(missing_ok=True)
 
 
 def _tool_json(result: Any) -> dict[str, Any]:
-    structured = getattr(result, "structuredContent", None)
+    structured = getattr(result, "structured_content", None)
     if isinstance(structured, dict):
         return structured
     content = result.content[0]
@@ -709,3 +537,95 @@ def _tool_json(result: Any) -> dict[str, Any]:
 def _resource_json(result: Any) -> dict[str, Any]:
     content = result.contents[0]
     return json.loads(content.text)
+
+
+def _assert_no_trace_provenance(*payloads: dict[str, Any]) -> None:
+    serialized = json.dumps(payloads, ensure_ascii=False).lower()
+    assert "raw_trace_secret" not in serialized
+    assert "secret-protocol-session" not in serialized
+    assert '"trace_id"' not in serialized
+    assert '"session_id"' not in serialized
+
+
+def _seed_reviewed_skill(dsn: str, *, account_id: str, agent_id: str) -> None:
+    SQLTraceEventStore(connection_string=dsn, pool_size=1)
+    uri = f"ctx://{account_id}/agents/{agent_id}/skills/protocol-review"
+    content = "---\nname: protocol-review\ndescription: Review protocol behavior.\n---\n# Protocol review\n"
+    conn = psycopg2.connect(dsn)
+    try:
+        with conn.cursor() as cur:
+            cur.execute("SET app.account_id = %s", (account_id,))
+            cur.execute(
+                "DELETE FROM trace_sessions WHERE account_id = %s AND turn_id = %s",
+                (account_id, "protocol-candidate-turn"),
+            )
+            cur.execute(
+                "DELETE FROM skill_candidates WHERE account_id = %s AND candidate_id = %s",
+                (account_id, "protocol-candidate"),
+            )
+            cur.execute("DELETE FROM context_nodes WHERE uri = %s", (uri,))
+            cur.execute(
+                """
+                INSERT INTO context_nodes
+                    (uri, account_id, owner_space, category, context_type, level,
+                     status, content, abstract, overview, relations, metadata, version)
+                VALUES (%s, %s, %s, 'skill', 'SKILL', 0, 'ACTIVE', %s, %s, %s,
+                        '[]'::jsonb, %s::jsonb, 1)
+                """,
+                (uri, account_id, f"agent:{agent_id}", content,
+                 "Review protocol behavior.", "Agent skill: protocol-review",
+                 json.dumps({"ogmemory_generated": True,
+                             "publication_status": "published", "review_score": .95})),
+            )
+            cur.execute(
+                """
+                INSERT INTO trace_sessions
+                    (turn_id, uri, account_id, owner_space, agent_id, session_id,
+                     started_at, ended_at, event_count, abstract, overview,
+                     content, metadata, status, stop_event_index)
+                VALUES
+                    ('protocol-candidate-turn', %s, %s, %s, %s,
+                     'secret-protocol-session', NOW() - INTERVAL '1 minute', NOW(),
+                     1, '', '', %s::jsonb, '{}'::jsonb, 'finalized', 1)
+                """,
+                (
+                    f"ctx://{account_id}/agents/{agent_id}/traces/protocol-candidate-turn",
+                    account_id,
+                    f"agent:{agent_id}",
+                    agent_id,
+                    json.dumps([{"event": "RAW_TRACE_SECRET"}]),
+                ),
+            )
+            cur.execute(
+                """
+                INSERT INTO skill_candidates
+                    (candidate_id, account_id, agent_id, capability_key,
+                     state, assessment)
+                VALUES ('protocol-candidate', %s, %s, 'protocol-review-candidate',
+                        'assessed', %s::jsonb)
+                """,
+                (
+                    account_id,
+                    agent_id,
+                    json.dumps(
+                        {
+                            "summary": "Safe candidate summary.",
+                            "reason": "Awaiting more evidence.",
+                        }
+                    ),
+                ),
+            )
+            cur.execute(
+                """
+                INSERT INTO skill_candidate_evidence
+                    (account_id, candidate_id, evidence_uri, evidence_type, session_id)
+                VALUES (%s, 'protocol-candidate', %s, 'trace', 'secret-protocol-session')
+                """,
+                (
+                    account_id,
+                    f"ctx://{account_id}/agents/{agent_id}/traces/protocol-candidate-turn",
+                ),
+            )
+        conn.commit()
+    finally:
+        conn.close()

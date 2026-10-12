@@ -9,6 +9,8 @@ import json
 import logging
 import os
 import re
+import threading
+from contextlib import contextmanager
 from typing import Any, Final
 
 try:
@@ -34,17 +36,61 @@ def _sanitize_json_text(raw: str) -> str:
     text = re.sub(r'"(?:[^"\\]|\\.)*"', _fix_string_contents, text)
     return text
 
+
+def _loads_lenient_json_text(raw: str) -> Any:
+    text = _sanitize_json_text(raw)
+    try:
+        return json.loads(text)
+    except json.JSONDecodeError:
+        pass
+
+    cleaned = []
+    in_string = False
+    escaped = False
+    for index, char in enumerate(text):
+        if in_string:
+            cleaned.append(char)
+            if escaped:
+                escaped = False
+            elif char == "\\":
+                escaped = True
+            elif char == '"':
+                in_string = False
+            continue
+        if char == '"':
+            in_string = True
+        elif char == ",":
+            next_index = index + 1
+            while next_index < len(text) and text[next_index].isspace():
+                next_index += 1
+            if next_index < len(text) and text[next_index] in "}]":
+                continue
+        cleaned.append(char)
+    return json.loads("".join(cleaned))
+
 try:
-    from openai import OpenAI, BadRequestError
+    from openai import (
+        APIConnectionError,
+        APIStatusError,
+        BadRequestError,
+        LengthFinishReasonError,
+        OpenAI,
+    )
 except ImportError:
     raise ImportError(
         "OpenAI package is required for OpenAILLM. "
         "Install it with: pip install openai"
     )
 
+from core.errors import (
+    LLMOutputTruncatedError,
+    LLMTransientError,
+    OperationDeadlineExceededError,
+    ToolCallProtocolError,
+)
 from core.interfaces import LLM
-from providers.token_tracker import TokenTracker
-
+from core.operation_deadline import check_deadline, remaining_seconds
+from providers.token_tracker import TokenTracker, UsagePersistenceError
 
 # Default models
 GPT_4O = "gpt-4o"
@@ -68,6 +114,9 @@ class OpenAILLM(LLM):
         temperature: float = 0.7,
         max_tokens: int = 4096,
         json_mode: bool = False,
+        reasoning_effort: str | None = None,
+        is_reasoning_model: bool | None = None,
+        extra_body: dict[str, Any] | None = None,
     ):
         api_key = api_key or os.environ.get("OPENAI_API_KEY")
         if not api_key:
@@ -80,28 +129,127 @@ class OpenAILLM(LLM):
         self._temperature = temperature
         self._max_tokens = max_tokens
         self._json_mode = json_mode
+        self._reasoning_effort = reasoning_effort
+        self._is_reasoning_model_override = is_reasoning_model
+        self._extra_body = dict(extra_body) if extra_body else None
         self._force_text_mode = False
         self._base_url = str(base_url or "")
+        self._required_tool_choice_capability = "unknown"
+        self._required_tool_choice_lock = threading.Lock()
 
         client_kwargs = {"api_key": api_key}
         if base_url:
             client_kwargs["base_url"] = base_url
 
         self._client = OpenAI(timeout=120.0, **client_kwargs)
-        self.token_tracker = TokenTracker()
+        self.token_tracker = TokenTracker(model=self._model)
+
+    def _create_completion(self, **kwargs):
+        remaining = remaining_seconds()
+        client = (self._client if remaining is None else
+                  self._client.with_options(timeout=min(120.0, remaining), max_retries=0))
+        if remaining is not None and "timeout" in kwargs:
+            # A per-call override takes precedence over client.with_options.
+            # Keep a tighter custom timeout while enforcing the operation limit.
+            import httpx
+            timeout = kwargs["timeout"]
+            if isinstance(timeout, httpx.Timeout):
+                kwargs["timeout"] = httpx.Timeout(**{
+                    name: min(value, remaining) if value is not None else remaining
+                    for name, value in timeout.as_dict().items()})
+            else:
+                kwargs["timeout"] = min(timeout, remaining) if isinstance(timeout, (int, float)) else remaining
+        attempted = False
+        try:
+            if (kwargs.get("extra_body") or {}).get("stream") is True:
+                body = dict(kwargs["extra_body"])
+                body.pop("stream")
+                kwargs["stream_options"] = {
+                    **(body.pop("stream_options", None) or {}),
+                    "include_usage": True,
+                }
+                kwargs["extra_body"] = body
+                try:
+                    check_deadline()
+                    attempted = True
+                    with client.beta.chat.completions.stream(**kwargs) as stream:
+                        if remaining is not None:
+                            for _event in stream:
+                                try:
+                                    check_deadline()
+                                except OperationDeadlineExceededError:
+                                    # A final usage chunk may arrive at the deadline.
+                                    # Let the caller record it before rejecting the result.
+                                    snapshot = stream.current_completion_snapshot
+                                    if snapshot.usage is not None:
+                                        return snapshot
+                                    raise
+                        return stream.get_final_completion()
+                except LengthFinishReasonError as exc:
+                    return exc.completion
+            check_deadline()
+            attempted = True
+            return client.chat.completions.create(**kwargs)
+        except Exception as exc:
+            if attempted:
+                self.token_tracker.record_failure('llm')
+            check_deadline()
+            if (isinstance(exc, APIConnectionError)
+                    or isinstance(exc, APIStatusError) and (exc.status_code == 429 or exc.status_code >= 500)):
+                raise LLMTransientError(f"OpenAI provider temporarily unavailable: {exc}") from exc
+            raise
+
+    @contextmanager
+    def _required_tool_lock(self):
+        remaining = remaining_seconds()
+        if remaining is None:
+            with self._required_tool_choice_lock:
+                yield
+            return
+        acquired = self._required_tool_choice_lock.acquire(timeout=min(remaining, threading.TIMEOUT_MAX))
+        if not acquired:
+            raise OperationDeadlineExceededError("Operation deadline exceeded waiting for tool capability")
+        try:
+            check_deadline()
+            yield
+        finally:
+            self._required_tool_choice_lock.release()
+
+    def _is_reasoning_model(self) -> bool:
+        if self._is_reasoning_model_override is not None:
+            return self._is_reasoning_model_override
+        model = self._model.lower().rsplit("/", 1)[-1]
+        return model.startswith(("gpt-5", "o1", "o3", "o4"))
+
+    def _completion_parameters(self, temperature: float) -> dict[str, Any]:
+        """Return parameters compatible with the configured model type."""
+        if self._is_reasoning_model():
+            parameters: dict[str, Any] = {"max_completion_tokens": self._max_tokens}
+        else:
+            parameters = {"temperature": temperature, "max_tokens": self._max_tokens}
+        if self._is_reasoning_model() and self._reasoning_effort:
+            parameters["reasoning_effort"] = self._reasoning_effort
+        if self._extra_body:
+            parameters["extra_body"] = self._extra_body
+        return parameters
 
     def _track_usage(self, response) -> dict:
         usage = getattr(response, "usage", None)
-        if not usage:
-            return {}
         inp = getattr(usage, "prompt_tokens", 0) or 0
         out = getattr(usage, "completion_tokens", 0) or 0
-        cache_read = 0
-        cache_write = 0
+        cache_read = getattr(usage, 'cache_read_input_tokens', 0) or 0
+        cache_write = getattr(usage, 'cache_creation_input_tokens', 0) or 0
         details = getattr(usage, "prompt_tokens_details", None)
         if details:
-            cache_read = getattr(details, "cached_tokens", 0) or 0
-        round_id = self.token_tracker.record_llm(inp, out, cache_read, cache_write)
+            cache_read = getattr(details, "cached_tokens", None) or cache_read
+        round_id = self.token_tracker.record_llm(
+            inp, out, cache_read, cache_write,
+            usage_known=(getattr(usage, 'prompt_tokens', None) is not None
+                         and getattr(usage, 'completion_tokens', None) is not None),
+            model=getattr(response, 'model', None) or self._model,
+        )
+        if usage is None:
+            return {}
         return {
             "round_id": round_id,
             "model": getattr(response, "model", self._model) or self._model,
@@ -110,6 +258,14 @@ class OpenAILLM(LLM):
             "cache_read": cache_read,
             "cache_write": cache_write,
         }
+
+    def _ensure_complete_response(self, response) -> None:
+        check_deadline()
+        if response.choices[0].finish_reason == "length":
+            raise LLMOutputTruncatedError(
+                "LLM output exceeded the configured token limit; "
+                f"model={self._model}, max_tokens={self._max_tokens}, finish_reason=length"
+            )
 
     def complete_json(self, prompt: str, schema: dict) -> dict:
         system_message = self._build_system_message(schema)
@@ -133,20 +289,23 @@ class OpenAILLM(LLM):
         return self._complete_json_text_fallback(system_message, prompt, schema)
 
     def _complete_json_structured(self, system_message: str, prompt: str, schema: dict) -> dict:
-        response = self._client.chat.completions.create(
+        response = self._create_completion(
             model=self._model,
             messages=[
                 {"role": "system", "content": system_message},
                 {"role": "user", "content": prompt},
             ],
             response_format={"type": "json_object"},
-            temperature=self._temperature,
-            max_tokens=self._max_tokens,
+            **self._completion_parameters(self._temperature),
         )
         self._track_usage(response)
+        self._ensure_complete_response(response)
         content = response.choices[0].message.content
-        result = json.loads(_sanitize_json_text(content))
-        return self._validate_result(result, schema)
+        try:
+            result = json.loads(_sanitize_json_text(content))
+            return self._validate_result(result, schema)
+        except (ValueError, TypeError) as exc:
+            raise ToolCallProtocolError(f"Invalid JSON response: {exc}") from exc
 
     def _complete_json_text_fallback(self, system_message: str, prompt: str, schema: dict) -> dict:
         enhanced_system = (
@@ -155,87 +314,140 @@ class OpenAILLM(LLM):
             "No markdown fences, no explanation, no text before or after the JSON."
         )
         try:
-            response = self._client.chat.completions.create(
+            response = self._create_completion(
                 model=self._model,
                 messages=[
                     {"role": "system", "content": enhanced_system},
                     {"role": "user", "content": prompt},
                 ],
-                temperature=self._temperature,
-                max_tokens=self._max_tokens,
+                **self._completion_parameters(self._temperature),
             )
             self._track_usage(response)
+            self._ensure_complete_response(response)
             content = response.choices[0].message.content or ""
-            result = self._extract_json_from_text(content)
-            return self._validate_result(result, schema)
-        except json.JSONDecodeError as e:
-            raise ValueError(f"Failed to parse LLM response as JSON: {e}")
-        except (ValueError, TypeError):
+        except (LLMOutputTruncatedError, LLMTransientError, OperationDeadlineExceededError, UsagePersistenceError):
             raise
-        except Exception as e:
-            raise RuntimeError(f"OpenAI API error: {e}") from e
+        except Exception as exc:
+            raise RuntimeError(f"OpenAI API error: {exc}") from exc
+        try:
+            values = self._extract_json_values_from_text(content)
+            if not values:
+                raise json.JSONDecodeError("No valid JSON found in LLM output", content, 0)
+
+            first_error = None
+            for result in values:
+                try:
+                    return self._validate_result(result, schema)
+                except (ValueError, TypeError) as exc:
+                    if first_error is None:
+                        first_error = exc
+            assert first_error is not None
+            raise first_error
+        except (ValueError, TypeError) as exc:
+            raise ToolCallProtocolError(f"Invalid JSON response: {exc}") from exc
 
     @staticmethod
-    def _extract_json_from_text(text: str) -> dict:
-        """Extract JSON object from LLM free-text output.
+    def _extract_json_from_text(text: str) -> Any:
+        """Extract JSON value from LLM free-text output.
 
         Multi-layer parsing chain:
         1. Direct json.loads on sanitized text
         2. Extract from ```json``` fenced code blocks
-        3. Regex-extract first balanced {…} block
-        4. Repair truncated JSON (close unclosed braces/brackets)
+        3. Repair the outer JSON value (close unclosed braces/brackets)
+        4. Extract balanced objects or arrays
         5. json_repair.loads as last resort
         """
+        values = OpenAILLM._extract_json_values_from_text(text)
+        if values:
+            return values[0]
+        raise json.JSONDecodeError("No valid JSON found in LLM output", text, 0)
+
+    @staticmethod
+    def _extract_json_values_from_text(text: str) -> list[Any]:
         stripped = text.strip()
         try:
-            return json.loads(_sanitize_json_text(stripped))
+            return [_loads_lenient_json_text(stripped)]
         except json.JSONDecodeError:
             pass
 
         fence_match = re.search(r"```(?:json)?\s*\n?(.*?)```", stripped, re.DOTALL)
         if fence_match:
             try:
-                return json.loads(_sanitize_json_text(fence_match.group(1).strip()))
+                return [_loads_lenient_json_text(fence_match.group(1).strip())]
             except json.JSONDecodeError:
                 pass
 
-        brace_start = stripped.find("{")
-        if brace_start >= 0:
-            depth = 0
-            for i in range(brace_start, len(stripped)):
-                if stripped[i] == "{":
-                    depth += 1
-                elif stripped[i] == "}":
-                    depth -= 1
-                    if depth == 0:
-                        candidate = stripped[brace_start:i + 1]
-                        try:
-                            return json.loads(_sanitize_json_text(candidate))
-                        except json.JSONDecodeError:
-                            pass
-                        break
+        value_start = OpenAILLM._first_json_value_start(stripped)
+        if value_start >= 0 and not OpenAILLM._balanced_json_value(stripped, value_start):
+            partial = stripped[value_start:]
+            closer = "}" if partial.startswith("{") else "]"
+            for repaired in (partial + closer, OpenAILLM._repair_truncated_json(partial)):
+                try:
+                    return [_loads_lenient_json_text(repaired)]
+                except json.JSONDecodeError:
+                    pass
 
-            partial = stripped[brace_start:]
+        values = []
+        search_start = 0
+        while search_start < len(stripped):
+            value_start = OpenAILLM._first_json_value_start(stripped, search_start)
+            if value_start < 0:
+                break
+            candidate = OpenAILLM._balanced_json_value(stripped, value_start)
+            if not candidate:
+                search_start = value_start + 1
+                continue
             try:
-                return json.loads(_sanitize_json_text(
-                    OpenAILLM._repair_truncated_json(partial)
-                ))
+                values.append(_loads_lenient_json_text(candidate))
             except json.JSONDecodeError:
                 pass
+            search_start = value_start + len(candidate)
+        if values:
+            return values
 
         if json_repair is not None:
             try:
                 result = json_repair.loads(stripped)
-                if isinstance(result, dict):
+                if isinstance(result, (dict, list)):
                     logger.info("json_repair recovered JSON from malformed LLM output")
-                    return result
-                if isinstance(result, list) and result:
-                    logger.info("json_repair recovered list; taking first element")
-                    return result[0] if isinstance(result[0], dict) else {"items": result}
+                    return [result]
             except Exception:
                 pass
 
-        raise json.JSONDecodeError("No valid JSON found in LLM output", text, 0)
+        return []
+
+    @staticmethod
+    def _first_json_value_start(text: str, start: int = 0) -> int:
+        starts = [pos for pos in (text.find("{", start), text.find("[", start)) if pos >= 0]
+        return min(starts) if starts else -1
+
+    @staticmethod
+    def _balanced_json_value(text: str, start: int) -> str | None:
+        opener = text[start]
+        closer = "}" if opener == "{" else "]"
+        depth = 0
+        in_string = False
+        escape = False
+        for index in range(start, len(text)):
+            ch = text[index]
+            if escape:
+                escape = False
+                continue
+            if ch == "\\":
+                escape = True
+                continue
+            if ch == '"':
+                in_string = not in_string
+                continue
+            if in_string:
+                continue
+            if ch == opener:
+                depth += 1
+            elif ch == closer:
+                depth -= 1
+                if depth == 0:
+                    return text[start : index + 1]
+        return None
 
     @staticmethod
     def _repair_truncated_json(text: str) -> str:
@@ -272,11 +484,15 @@ class OpenAILLM(LLM):
         if isinstance(args, dict):
             return args
         try:
-            return json.loads(args)
+            result = json.loads(args)
+            if isinstance(result, dict):
+                return result
         except (json.JSONDecodeError, TypeError):
             pass
         try:
-            return json.loads(_sanitize_json_text(args))
+            result = json.loads(_sanitize_json_text(args))
+            if isinstance(result, dict):
+                return result
         except (json.JSONDecodeError, TypeError):
             pass
         if json_repair is not None:
@@ -287,8 +503,7 @@ class OpenAILLM(LLM):
                     return result
             except Exception:
                 pass
-        logger.warning("Failed to parse tool call arguments, wrapping as raw: %.200s", args)
-        return {"raw": args}
+        raise ToolCallProtocolError("Tool call arguments must contain a JSON object")
 
     def complete_with_tools(
         self,
@@ -298,7 +513,6 @@ class OpenAILLM(LLM):
         temperature: float | None = None,
     ) -> list[dict]:
         import hashlib
-        import time
 
         _temp = temperature if temperature is not None else self._temperature
 
@@ -316,20 +530,66 @@ class OpenAILLM(LLM):
         prompt_sha = hashlib.sha256(prompt.encode("utf-8", errors="replace")).hexdigest()[:12]
         tool_names = [t.get("name", "") for t in tools]
 
-        max_retries = 3
-        last_exc: Exception | None = None
-        effective_tool_choice = tool_choice
-        for attempt in range(max_retries):
+        if (
+            tool_choice == "required"
+            and self._required_tool_choice_capability == "unknown"
+        ):
+            # Only the first unknown-capability request probes ``required``.
+            # Concurrent dual-run extraction waits for that result so providers
+            # that reject ``required`` are not probed twice.
+            with self._required_tool_lock():
+                if self._required_tool_choice_capability == "unknown":
+                    return self._complete_with_tools_impl(
+                        prompt=prompt,
+                        openai_tools=openai_tools,
+                        tool_names=tool_names,
+                        tool_choice=tool_choice,
+                        temperature=_temp,
+                        prompt_sha=prompt_sha,
+                    )
+
+        return self._complete_with_tools_impl(
+            prompt=prompt,
+            openai_tools=openai_tools,
+            tool_names=tool_names,
+            tool_choice=tool_choice,
+            temperature=_temp,
+            prompt_sha=prompt_sha,
+        )
+
+    def _complete_with_tools_impl(
+        self,
+        *,
+        prompt: str,
+        openai_tools: list[dict],
+        tool_names: list[str],
+        tool_choice: str,
+        temperature: float,
+        prompt_sha: str,
+    ) -> list[dict]:
+        import hashlib
+        import time
+
+        max_required_empty_attempts = 2
+        required_empty_attempts = 0
+        effective_tool_choice = (
+            "auto"
+            if tool_choice == "required"
+            and self._required_tool_choice_capability == "unsupported"
+            else tool_choice
+        )
+
+        while True:
             try:
-                response = self._client.chat.completions.create(
+                response = self._create_completion(
                     model=self._model,
                     messages=[{"role": "user", "content": prompt}],
                     tools=openai_tools,
                     tool_choice=effective_tool_choice,
-                    temperature=_temp,
-                    max_tokens=self._max_tokens,
+                    **self._completion_parameters(temperature),
                 )
                 usage = self._track_usage(response)
+                self._ensure_complete_response(response)
 
                 message = response.choices[0].message
                 raw_tool_calls = message.tool_calls
@@ -351,8 +611,8 @@ class OpenAILLM(LLM):
                         "tools=%s",
                         self._model,
                         self._base_url,
-                        attempt + 1,
-                        max_retries,
+                        required_empty_attempts + 1,
+                        max_required_empty_attempts,
                         tool_choice,
                         effective_tool_choice,
                         raw_choice.finish_reason,
@@ -367,24 +627,32 @@ class OpenAILLM(LLM):
                         tool_names,
                     )
                     if effective_tool_choice == "required":
-                        if attempt < max_retries - 1:
-                            delay = 0.5 * (attempt + 1)
+                        required_empty_attempts += 1
+                        if required_empty_attempts < max_required_empty_attempts:
+                            delay = 0.5 * required_empty_attempts
                             logger.warning(
                                 "complete_with_tools retrying empty required tool_calls: "
                                 "model=%s prompt_sha=%s next_attempt=%d/%d delay=%.1fs",
                                 self._model,
                                 prompt_sha,
-                                attempt + 2,
-                                max_retries,
+                                required_empty_attempts + 1,
+                                max_required_empty_attempts,
                                 delay,
                             )
-                            time.sleep(delay)
+                            remaining = remaining_seconds()
+                            time.sleep(delay if remaining is None else min(delay, remaining))
+                            check_deadline()
                             continue
-                        raise RuntimeError(
+                        raise ToolCallProtocolError(
                             "Required tool call returned no tool_calls after "
-                            f"{max_retries} attempts "
-                            f"(model={self._model}, prompt_sha={prompt_sha})"
+                            f"{max_required_empty_attempts} attempts; "
+                            f"model={self._model}, prompt_sha={prompt_sha}",
+                            tool_choice="required",
                         )
+                    return []
+
+                if effective_tool_choice == "required":
+                    self._required_tool_choice_capability = "supported"
                 parsed_tool_calls = [
                     {
                         "tool": call.function.name,
@@ -399,8 +667,63 @@ class OpenAILLM(LLM):
                 ]
                 return parsed_tool_calls
 
+            except (LLMOutputTruncatedError, LLMTransientError, OperationDeadlineExceededError,
+                    ToolCallProtocolError, UsagePersistenceError):
+                raise
+            except BadRequestError as e:
+                if (
+                    tool_choice == "required"
+                    and effective_tool_choice == "required"
+                    and self._is_required_tool_choice_unsupported(e)
+                ):
+                    self._required_tool_choice_capability = "unsupported"
+                    effective_tool_choice = "auto"
+                    logger.warning(
+                        "Model %s does not support tool_choice=required; "
+                        "using auto for this and subsequent calls",
+                        self._model,
+                    )
+                    continue
+                raise RuntimeError(f"OpenAI API error: {e}") from e
             except Exception as e:
                 raise RuntimeError(f"OpenAI API error: {e}") from e
+
+    @staticmethod
+    def _is_required_tool_choice_unsupported(exc: BadRequestError) -> bool:
+        """Conservatively recognize explicit rejection of ``required``.
+
+        Empty tool calls and unrelated HTTP 400 responses must not poison the
+        capability cache.
+        """
+        body = getattr(exc, "body", None)
+        try:
+            body_text = json.dumps(body, ensure_ascii=False) if body else ""
+        except (TypeError, ValueError):
+            body_text = str(body or "")
+        text = f"{exc} {body_text}".lower().replace("-", "_")
+        mentions_choice = "tool_choice" in text or "tool choice" in text
+        mentions_required = "required" in text
+        explicit_rejection = any(
+            marker in text
+            for marker in (
+                "not support",
+                "unsupported",
+                "doesn't support",
+                "does not allow",
+                "not allowed",
+                "only support",
+            )
+        )
+        enumerates_allowed_values = (
+            any(
+                marker in text
+                for marker in ("must be one of", "allowed values", "valid values")
+            )
+            and "auto" in text
+        )
+        return mentions_choice and mentions_required and (
+            explicit_rejection or enumerates_allowed_values
+        )
 
     def complete_with_tools_messages(
         self,
@@ -429,21 +752,17 @@ class OpenAILLM(LLM):
                 for t in tools
             ]
 
-        api_tool_choice = tool_choice
-        if tools is None:
-            # Don't pass tool_choice when tools is None (OpenAI API requirement)
-            api_tool_choice = None
+        tool_parameters = {"tools": openai_tools, "tool_choice": tool_choice} if openai_tools else {}
 
         try:
-            response = self._client.chat.completions.create(
+            response = self._create_completion(
                 model=self._model,
                 messages=prepared_messages,
-                tools=openai_tools,
-                tool_choice=api_tool_choice,
-                temperature=self._temperature,
-                max_tokens=self._max_tokens,
+                **tool_parameters,
+                **self._completion_parameters(self._temperature),
             )
             usage = self._track_usage(response)
+            self._ensure_complete_response(response)
 
             message = response.choices[0].message
 
@@ -463,6 +782,9 @@ class OpenAILLM(LLM):
 
             return tool_calls, content
 
+        except (LLMOutputTruncatedError, LLMTransientError, OperationDeadlineExceededError,
+                ToolCallProtocolError, UsagePersistenceError):
+            raise
         except Exception as e:
             raise RuntimeError(f"OpenAI API error: {e}") from e
 
@@ -563,9 +885,11 @@ class CachedOpenAILLM(OpenAILLM):
         ).hexdigest()
 
         # Check cache
-        if cache_key in self._cache:
+        cached = self._cache.get(cache_key)
+        if cached is not None:
+            self.token_tracker.record_cache_hit('llm')
             self._cache_hits += 1
-            return self._cache[cache_key]
+            return cached
 
         # Cache miss - call API
         self._cache_misses += 1

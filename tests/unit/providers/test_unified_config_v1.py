@@ -2,7 +2,66 @@
 
 from __future__ import annotations
 
+import json
+
+import pytest
+
 from providers.unified_config import OgMemConfig
+
+
+def test_explicit_model_overrides_take_priority_over_yaml(monkeypatch):
+    from providers import unified_config as uc
+
+    monkeypatch.setattr(
+        uc,
+        "_load_yaml",
+        lambda _path: {
+            "llm": {
+                "provider": "mock",
+                "api_key": "yaml-llm-key",
+                "base_url": "https://yaml-llm.example/v1",
+                "model": "yaml-llm-model",
+            },
+            "embedding": {
+                "provider": "st",
+                "api_key": "yaml-embedding-key",
+                "base_url": "https://yaml-embedding.example/v1",
+                "model": "yaml-embedding-model",
+            },
+        },
+    )
+    monkeypatch.setenv(
+        "OGMEM_MODEL_CONFIG_OVERRIDES",
+        json.dumps(
+            {
+                "llmProvider": "openai",
+                "llmApiKey": "plugin-llm-key",
+                "llmBaseUrl": "https://plugin-llm.example/v1",
+                "llmModel": "plugin-llm-model",
+                "llmReasoningEffort": "max",
+                "llmIsReasoningModel": True,
+                "llmExtraBody": {"thinking": {"type": "enabled"}},
+                "embeddingProvider": "openai",
+                "embeddingApiKey": "plugin-embedding-key",
+                "embeddingBaseUrl": "https://plugin-embedding.example/v1",
+                "embeddingModel": "plugin-embedding-model",
+            }
+        ),
+    )
+
+    cfg = OgMemConfig.load("ignored.yaml")
+
+    assert cfg.provider == "openai"
+    assert cfg.openai_api_key == "plugin-llm-key"
+    assert cfg.openai_base_url == "https://plugin-llm.example/v1"
+    assert cfg.openai_llm_model == "plugin-llm-model"
+    assert cfg.llm_reasoning_effort == "max"
+    assert cfg.llm_is_reasoning_model is True
+    assert cfg.llm_extra_body == {"thinking": {"type": "enabled"}}
+    assert cfg.embedding_provider == "openai"
+    assert cfg.openai_embedding_api_key == "plugin-embedding-key"
+    assert cfg.openai_embedding_base_url == "https://plugin-embedding.example/v1"
+    assert cfg.openai_embedding_model == "plugin-embedding-model"
 
 
 def test_load_reads_v1_auth_and_sharing_from_env(monkeypatch):
@@ -35,6 +94,214 @@ def test_load_uses_safe_defaults_for_v1_auth_and_sharing():
     assert cfg.agent_shared_list == []
     assert cfg.http_ip_allowlist == []
     assert cfg.http_ip_allowlist_trust_proxy is False
+    assert cfg.llm_reasoning_effort is None
+    assert cfg.llm_is_reasoning_model is None
+
+
+def test_load_reads_reasoning_configuration_from_yaml(monkeypatch):
+    from providers import unified_config as uc
+
+    monkeypatch.setattr(uc, "_load_yaml", lambda _path: {"llm": {
+        "reasoning_effort": "xhigh",
+        "extra_body": {"thinking": {"type": "enabled"}},
+    }})
+
+    cfg = OgMemConfig.load("ignored.yaml")
+
+    assert cfg.llm_reasoning_effort == "xhigh"
+    assert cfg.llm_extra_body == {"thinking": {"type": "enabled"}}
+
+
+def test_load_reads_reasoning_configuration_from_env(monkeypatch):
+    monkeypatch.setenv("LLM_REASONING_EFFORT", "max")
+    monkeypatch.setenv("LLM_IS_REASONING_MODEL", "true")
+    monkeypatch.setenv("LLM_EXTRA_BODY", '{"enable_thinking":true}')
+
+    cfg = OgMemConfig.load("/tmp/non-existent-ogmem.yaml")
+
+    assert cfg.llm_reasoning_effort == "max"
+    assert cfg.llm_is_reasoning_model is True
+    assert cfg.llm_extra_body == {"enable_thinking": True}
+
+
+def test_service_threads_supports_new_config_and_workers_fallback(monkeypatch):
+    from providers import unified_config as uc
+
+    monkeypatch.setattr(
+        uc,
+        "_load_yaml",
+        lambda _path: {"service": {"workers": 3}},
+    )
+    assert OgMemConfig.load("ignored.yaml").threads == 3
+
+    monkeypatch.setattr(
+        uc,
+        "_load_yaml",
+        lambda _path: {"service": {"workers": 1, "threads": 6}},
+    )
+    cfg = OgMemConfig.load("ignored.yaml")
+    assert cfg.workers == 1
+    assert cfg.threads == 6
+
+    monkeypatch.setenv("OGMEM_THREADS", "5")
+    monkeypatch.setattr(uc, "_load_yaml", lambda _path: {"service": {}})
+    assert OgMemConfig.load("ignored.yaml").threads == 5
+
+
+def test_trace_turn_limit_reads_storage_yaml_and_env(monkeypatch):
+    from providers import unified_config as uc
+
+    monkeypatch.setenv("OGMEM_TRACE_MAX_TURN_EVENTS", "64")
+    monkeypatch.setattr(
+        uc,
+        "_load_yaml",
+        lambda _path: {"storage": {"trace_max_turn_events": 256}},
+    )
+    assert OgMemConfig.load("ignored.yaml").trace_max_turn_events == 256
+
+    monkeypatch.setattr(uc, "_load_yaml", lambda _path: {"storage": {}})
+    assert OgMemConfig.load("ignored.yaml").trace_max_turn_events == 64
+
+
+def test_sql_dialect_reads_storage_yaml_and_env(monkeypatch):
+    from providers import unified_config as uc
+
+    monkeypatch.setenv("SQL_DIALECT", "opengauss")
+    monkeypatch.setattr(
+        uc,
+        "_load_yaml",
+        lambda _path: {"storage": {"dialect": "postgres"}},
+    )
+    assert OgMemConfig.load("ignored.yaml").sql_dialect == "postgresql"
+
+    monkeypatch.setattr(uc, "_load_yaml", lambda _path: {"storage": {}})
+    assert OgMemConfig.load("ignored.yaml").sql_dialect == "opengauss"
+
+
+def test_sql_dialect_rejects_unknown_value():
+    with pytest.raises(ValueError, match="postgresql or opengauss"):
+        OgMemConfig(sql_dialect="mysql")
+
+
+@pytest.mark.parametrize("invalid", [0, 1, 1025])
+def test_trace_turn_limit_rejects_invalid_bounds(invalid):
+    with pytest.raises(ValueError, match="between 2 and 1024"):
+        OgMemConfig(trace_max_turn_events=invalid)
+
+
+def test_skill_sedimentation_defaults_off_and_loads_nested_config(monkeypatch):
+    from providers import unified_config as uc
+
+    monkeypatch.setattr(
+        uc,
+        "_load_yaml",
+        lambda _path: {
+            "storage": {"backend": "sql", "connection_string": "postgresql://unused"},
+            "skills": {"sedimentation": {
+                "enabled": True, "min_evidence_turns": 7,
+                "min_distinct_sessions": 4, "semantic_update_threshold": .94,
+                "semantic_hold_threshold": .81, "candidate_limit": 25,
+                "catalog_scan_limit": 2500,
+            }},
+        },
+    )
+    cfg = OgMemConfig.load("ignored.yaml")
+    assert cfg.skill_sedimentation_enabled is True
+    assert cfg.skill_min_evidence_turns == 7
+    assert cfg.skill_min_distinct_sessions == 4
+    assert cfg.skill_semantic_update_threshold == .94
+    assert cfg.skill_candidate_limit == 25
+    assert cfg.skill_catalog_scan_limit == 2500
+    default_cfg = OgMemConfig()
+    assert default_cfg.skill_sedimentation_enabled is False
+    assert default_cfg.skill_min_evidence_turns == 1
+    assert default_cfg.skill_min_distinct_sessions == 1
+
+
+def test_skill_catalog_scan_limit_cannot_be_below_page_size():
+    with pytest.raises(ValueError, match="cannot be below"):
+        OgMemConfig(skill_candidate_limit=200, skill_catalog_scan_limit=100)
+
+
+def test_enabled_skill_sedimentation_accepts_agfs_backend():
+    cfg = OgMemConfig(
+        skill_sedimentation_enabled=True, storage_backend="agfs", workers=1,
+    )
+
+    assert cfg.storage_backend == "agfs"
+
+
+def test_enabled_skill_sedimentation_rejects_unknown_backend():
+    with pytest.raises(ValueError, match="storage.backend=agfs or sql"):
+        OgMemConfig(skill_sedimentation_enabled=True, storage_backend="agsf")
+
+
+def test_enabled_agfs_skill_sedimentation_requires_one_service_worker():
+    with pytest.raises(ValueError, match="service.workers=1"):
+        OgMemConfig(skill_sedimentation_enabled=True, storage_backend="agfs", workers=2)
+
+
+def test_enabled_skill_sedimentation_requires_sql_connection_string():
+    with pytest.raises(ValueError, match="storage.sql.connection_string"):
+        OgMemConfig(skill_sedimentation_enabled=True, storage_backend="sql")
+
+
+def test_hybrid_retrieval_requires_sql_canonical_storage():
+    with pytest.raises(ValueError, match="storage.backend=sql"):
+        OgMemConfig(retrieval_hybrid_enabled=True, storage_backend="agfs")
+
+
+def test_hybrid_retrieval_requires_sql_canonical_connection():
+    with pytest.raises(ValueError, match="storage.connection_string"):
+        OgMemConfig(retrieval_hybrid_enabled=True, storage_backend="sql")
+
+
+def test_dump_summary_redacts_nested_lexical_connection_string():
+    cfg = OgMemConfig(
+        retrieval_lexical_options={
+            "connection_string": "postgresql://lex:secret@db/lexical",
+            "table_name": "lexical_index",
+        }
+    )
+
+    summary = cfg.dump_summary()
+
+    assert summary["retrieval_lexical_options"]["connection_string"] == "<configured>"
+    assert "secret" not in repr(summary)
+
+
+def test_dump_summary_preserves_non_secret_token_limits():
+    cfg = OgMemConfig(llm_max_tokens=1234, compact_prepare_token_ttl=456)
+
+    summary = cfg.dump_summary()
+
+    assert summary["llm_max_tokens"] == 1234
+    assert summary["compact_prepare_token_ttl"] == 456
+
+
+def test_enabled_skill_sedimentation_rejects_lease_shorter_than_external_call_budget():
+    with pytest.raises(ValueError, match="at least 180"):
+        OgMemConfig(
+            skill_sedimentation_enabled=True,
+            storage_backend="sql",
+            sql_connection_string="postgresql://unused",
+            skill_lease_seconds=179,
+        )
+
+
+def test_enabled_skill_sedimentation_requires_room_for_pending_support():
+    with pytest.raises(ValueError, match="max_evidence_turns must be at least 2"):
+        OgMemConfig(
+            skill_sedimentation_enabled=True,
+            storage_backend="sql",
+            sql_connection_string="postgresql://unused",
+            skill_max_evidence_turns=1,
+        )
+
+
+def test_skill_max_trace_chars_matches_compactor_minimum():
+    with pytest.raises(ValueError, match="max_trace_chars must be at least 1024"):
+        OgMemConfig(skill_max_trace_chars=1023)
 
 
 def test_compact_prepare_token_ttl_defaults_to_300():
@@ -128,6 +395,10 @@ def test_compact_gap_completion_defaults():
     assert cfg.topic_detection_enabled is False
     assert cfg.compression_quality_enabled is False
     assert cfg.compression_quality_persist_metadata is False
+    assert cfg.retrieval_candidate_pool_enabled is False
+    assert cfg.retrieval_result_ranker_strategy == "semantic"
+    assert cfg.retrieval_global_result_rerank_enabled is False
+    assert cfg.retrieval_owner_scope_filter_enabled is False
 
 
 def test_compact_gap_completion_reads_yaml_and_env(monkeypatch):
@@ -173,3 +444,99 @@ def test_compact_gap_completion_reads_yaml_and_env(monkeypatch):
     assert cfg.topic_detection_enabled is False
     assert cfg.compression_quality_enabled is False
     assert cfg.compression_quality_persist_metadata is False
+
+
+def test_retrieval_config_reads_yaml_and_env(monkeypatch):
+    from providers import unified_config as uc
+
+    monkeypatch.setattr(
+        uc,
+        "_load_yaml",
+        lambda _path: {
+            "storage": {
+                "backend": "sql",
+                "connection_string": "postgresql://unused",
+            },
+            "retrieval": {
+                "max_top_k": 60,
+                "default_top_k": 15,
+                "global_search_topk": 45,
+                "candidate_pool_enabled": True,
+                "candidate_pool_multiplier": 4,
+                "min_candidate_pool_size": 20,
+                "result_ranker_strategy": "metadata_aware",
+                "global_result_rerank_enabled": True,
+                "owner_scope_filter_enabled": True,
+                "hybrid_enabled": True,
+                "vector_top_k": 120,
+                "lexical_top_k": 40,
+                "rrf_k": 55,
+                "semantic_weight": 1.5,
+                "lexical_weight": 0.5,
+                "lexical": {
+                    "provider": "opengauss_native",
+                    "options": {"table_name": "lexical_test"},
+                },
+            }
+        },
+    )
+    cfg = OgMemConfig.load("ignored.yaml")
+    assert cfg.retrieval_max_top_k == 60
+    assert cfg.retrieval_default_top_k == 15
+    assert cfg.retrieval_global_search_topk == 45
+    assert cfg.retrieval_candidate_pool_enabled is True
+    assert cfg.retrieval_candidate_pool_multiplier == 4
+    assert cfg.retrieval_min_candidate_pool_size == 20
+    assert cfg.retrieval_result_ranker_strategy == "metadata_aware"
+    assert cfg.retrieval_global_result_rerank_enabled is True
+    assert cfg.retrieval_owner_scope_filter_enabled is True
+    assert cfg.retrieval_hybrid_enabled is True
+    assert cfg.retrieval_vector_top_k == 120
+    assert cfg.retrieval_lexical_top_k == 40
+    assert cfg.retrieval_rrf_k == 55
+    assert cfg.retrieval_semantic_weight == 1.5
+    assert cfg.retrieval_lexical_weight == 0.5
+    assert cfg.retrieval_lexical_options == {"table_name": "lexical_test"}
+
+    monkeypatch.setenv("OGMEM_RETRIEVAL_CANDIDATE_POOL_ENABLED", "false")
+    monkeypatch.setenv("OGMEM_RETRIEVAL_RESULT_RANKER_STRATEGY", "semantic")
+    monkeypatch.setenv("OGMEM_RETRIEVAL_GLOBAL_RESULT_RERANK_ENABLED", "false")
+    monkeypatch.setenv("OGMEM_RETRIEVAL_OWNER_SCOPE_FILTER_ENABLED", "false")
+    monkeypatch.setattr(uc, "_load_yaml", lambda _path: {"retrieval": {}})
+    cfg = OgMemConfig.load("ignored.yaml")
+    assert cfg.retrieval_candidate_pool_enabled is False
+    assert cfg.retrieval_result_ranker_strategy == "semantic"
+    assert cfg.retrieval_global_result_rerank_enabled is False
+    assert cfg.retrieval_owner_scope_filter_enabled is False
+
+
+def test_hybrid_retrieval_accepts_custom_lexical_provider():
+    cfg = OgMemConfig(
+        storage_backend="sql",
+        sql_connection_string="postgresql://unused",
+        retrieval_hybrid_enabled=True,
+        retrieval_lexical_provider="custom",
+    )
+
+    assert cfg.retrieval_lexical_provider == "custom"
+
+
+@pytest.mark.parametrize(
+    "override",
+    [
+        {"retrieval_vector_top_k": 10_001},
+        {"retrieval_lexical_top_k": 201},
+        {"retrieval_lexical_top_k": 0},
+        {"retrieval_rrf_k": 0},
+        {"retrieval_semantic_weight": float("nan")},
+        {"retrieval_lexical_weight": float("inf")},
+        {"retrieval_semantic_weight": float("-inf")},
+        {"retrieval_lexical_weight": -0.1},
+        {"retrieval_semantic_weight": 0, "retrieval_lexical_weight": 0},
+        {"retrieval_backfill_page_size": 0},
+        {"retrieval_backfill_page_size": 10_001},
+    ],
+)
+def test_hybrid_retrieval_rejects_unbounded_or_non_finite_tuning(override):
+    with pytest.raises(ValueError):
+        OgMemConfig(**override)

@@ -106,6 +106,200 @@ def cleanup_session_archives(sql_dsn):
         conn.close()
 
 
+@pytest.fixture
+def cleanup_trace_tables(sql_dsn, tenant_a, tenant_b):
+    yield
+    conn = psycopg2.connect(sql_dsn)
+    try:
+        for tenant in (tenant_a, tenant_b):
+            with conn.cursor() as cur:
+                cur.execute("SET LOCAL app.account_id = %s", (tenant,))
+                cur.execute("DELETE FROM trace_sessions WHERE account_id = %s", (tenant,))
+                cur.execute("DELETE FROM trace_events WHERE account_id = %s", (tenant,))
+            conn.commit()
+    finally:
+        conn.close()
+
+
+# ---------------------------------------------------------------------------
+# lifecycle trace RLS and tenant-scoped idempotency
+# ---------------------------------------------------------------------------
+
+
+class TestTraceEventsRLS:
+    def test_same_event_id_is_independent_across_tenants(
+        self, sql_dsn, tenant_a, tenant_b, cleanup_trace_tables
+    ):
+        from fs.sql_adapter.sql_trace_store import SQLTraceEventStore
+
+        store = SQLTraceEventStore(connection_string=sql_dsn)
+        common = {
+            "event_id": "shared-id",
+            "owner_space": "user:alice",
+            "agent_id": "claude-code",
+            "session_id": "session-1",
+            "hook_type": "PreToolUse",
+            "content": {"event_type": "tool_start"},
+        }
+
+        first = store.insert(account_id=tenant_a, **common)
+        second = store.insert(account_id=tenant_b, **common)
+
+        assert first["inserted"] is True
+        assert second["inserted"] is True
+
+    def test_retry_and_stop_finalization_are_idempotent(
+        self, sql_dsn, tenant_a, cleanup_trace_tables
+    ):
+        from fs.sql_adapter.sql_trace_store import SQLTraceEventStore
+
+        store = SQLTraceEventStore(connection_string=sql_dsn)
+        common = {
+            "account_id": tenant_a,
+            "owner_space": "user:alice",
+            "agent_id": "claude-code",
+            "session_id": "session-1",
+        }
+        first = store.insert(
+            event_id="user-1",
+            hook_type="UserPromptSubmit",
+            content={"event_type": "user_message"},
+            **common,
+        )
+        duplicate = store.insert(
+            event_id="user-1",
+            hook_type="UserPromptSubmit",
+            content={"event_type": "user_message"},
+            **common,
+        )
+        stop = store.insert(
+            event_id="stop-1",
+            hook_type="Stop",
+            content={"event_type": "assistant_message"},
+            **common,
+        )
+        finalized = store.finalize_session(
+            stop_event_index=stop["event_index"], **common
+        )
+        replayed = store.finalize_session(
+            stop_event_index=stop["event_index"], **common
+        )
+
+        assert duplicate["inserted"] is False
+        assert duplicate["event_index"] == first["event_index"]
+        assert replayed["turn_id"] == finalized["turn_id"]
+        assert replayed["event_count"] == 2
+
+    def test_consecutive_turns_and_same_session_owners_stay_separate(
+        self, sql_dsn, tenant_a, cleanup_trace_tables
+    ):
+        from fs.sql_adapter.sql_trace_store import SQLTraceEventStore
+
+        store = SQLTraceEventStore(connection_string=sql_dsn)
+
+        def write_turn(owner, suffix):
+            common = {
+                "account_id": tenant_a,
+                "owner_space": owner,
+                "agent_id": "claude-code",
+                "session_id": "shared-session",
+            }
+            store.insert(
+                event_id=f"user-{suffix}",
+                hook_type="UserPromptSubmit",
+                content={"event_type": "user_message"},
+                **common,
+            )
+            stop = store.insert(
+                event_id=f"stop-{suffix}",
+                hook_type="Stop",
+                content={"event_type": "assistant_message"},
+                **common,
+            )
+            return store.finalize_session(
+                stop_event_index=stop["event_index"], **common
+            )
+
+        alice_first = write_turn("user:alice", "alice-1")
+        alice_second = write_turn("user:alice", "alice-2")
+        bob = write_turn("user:bob", "bob-1")
+
+        assert alice_second["prev_stop_event_index"] == alice_first["stop_event_index"]
+        assert alice_second["event_count"] == 2
+        assert bob["event_count"] == 2
+        assert len({alice_first["turn_id"], alice_second["turn_id"], bob["turn_id"]}) == 3
+
+    def test_trace_insert_does_not_write_memory_or_outbox_tables(
+        self, sql_dsn, tenant_a, cleanup_trace_tables
+    ):
+        from fs.sql_adapter.sql_trace_store import SQLTraceEventStore
+
+        def counts():
+            conn = psycopg2.connect(sql_dsn)
+            try:
+                with conn.cursor() as cur:
+                    cur.execute("SET LOCAL app.account_id = %s", (tenant_a,))
+                    cur.execute(
+                        "SELECT COUNT(*) FROM context_nodes WHERE account_id = %s",
+                        (tenant_a,),
+                    )
+                    nodes = cur.fetchone()[0]
+                    cur.execute(
+                        "SELECT COUNT(*) FROM outbox_events WHERE account_id = %s",
+                        (tenant_a,),
+                    )
+                    outbox = cur.fetchone()[0]
+                return nodes, outbox
+            finally:
+                conn.rollback()
+                conn.close()
+
+        before = counts()
+        store = SQLTraceEventStore(connection_string=sql_dsn)
+        store.insert(
+            event_id="isolated-trace",
+            account_id=tenant_a,
+            owner_space="user:alice",
+            agent_id="claude-code",
+            session_id="session-1",
+            hook_type="PreToolUse",
+            content={"event_type": "tool_start"},
+        )
+
+        assert counts() == before
+
+    def test_cross_tenant_select_returns_zero(
+        self, sql_dsn, tenant_a, tenant_b, cleanup_trace_tables
+    ):
+        from fs.sql_adapter.sql_trace_store import SQLTraceEventStore
+
+        store = SQLTraceEventStore(connection_string=sql_dsn)
+        store.insert(
+            event_id="tenant-a-event",
+            account_id=tenant_a,
+            owner_space="user:alice",
+            agent_id="claude-code",
+            session_id="session-1",
+            hook_type="PreToolUse",
+            content={"event_type": "tool_start"},
+        )
+
+        conn = psycopg2.connect(sql_dsn)
+        try:
+            with conn.cursor() as cur:
+                cur.execute("SET LOCAL app.account_id = %s", (tenant_b,))
+                cur.execute(
+                    "SELECT COUNT(*) FROM trace_events WHERE account_id = %s",
+                    (tenant_a,),
+                )
+                count = cur.fetchone()[0]
+        finally:
+            conn.rollback()
+            conn.close()
+
+        assert count == 0
+
+
 # ---------------------------------------------------------------------------
 # context_nodes RLS
 # ---------------------------------------------------------------------------

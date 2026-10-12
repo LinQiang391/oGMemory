@@ -6,25 +6,57 @@ Used by both:
 """
 
 from __future__ import annotations
+from typing import Any
 
+import importlib.metadata as _metadata
 import logging
 import os
 import re as _re
 import threading
+from collections.abc import Mapping
+from contextlib import ExitStack, contextmanager, nullcontext
+import hashlib
+import hmac
+import json
+import time
 from copy import deepcopy
+from dataclasses import replace
+from datetime import UTC
 from datetime import datetime as _dt
-from datetime import timezone as _timezone
+from functools import wraps
 from uuid import uuid4
 
-from core.models import ArchiveRef, ComposedContext, RequestContext, RetrievalConfig, SeedHit, TokenBudget, Role
-from session.models import ArchiveEntry, SessionMessage, SessionWindowState
-from session.session_manager import SessionManager
-from session.rolling_compressor import RollingCompressor
-from session.topic_buffer import SlotContent
+from commit.write_receipts import WriteOutcomeUnknownError
+from core.errors import (
+    AccessDeniedError,
+    ExtractionIncompleteError,
+    LLMTransientError,
+    MemoryCardFormatError,
+    OperationDeadlineExceededError,
+    ToolCallProtocolError,
+    ValidationError,
+)
+from core.models import (
+    ArchiveRef,
+    ComposedContext,
+    ContextNode,
+    RequestContext,
+    RetrievalConfig,
+    Role,
+    SeedHit,
+    TokenBudget,
+)
+from core.operation_deadline import check_deadline, operation_deadline
+
+# Chunking support
+from extraction.chunking import ConversationChunker
+from fs.sql_adapter.session_mutation import SessionMutationBusyError
 from providers.config import ProviderConfig
 from providers.llm import get_openai_llm
+from providers.token_tracker import request_usage_scope
 from providers.unified_config import OgMemConfig, get_config
 from retrieval.context_reader import ContextReader
+from retrieval.evidence_selector import canonical_uri, hydrate_evidence, select_evidence
 from retrieval.hierarchical_searcher import HierarchicalSearcher
 from retrieval.pipeline import RetrievalPipeline
 from retrieval.query_planner import QueryPlanner, sanitize_query
@@ -36,15 +68,30 @@ from server.auth import AuthorizationError, AuthService, ResolvedIdentity
 from server.control_plane_store import ControlPlaneStore
 from server.internal_tool_usage import InternalToolUsageStore, InternalToolUsageTracker
 from server.tenant_admin import TenantAdminService
-
-# Chunking support
-from extraction.chunking import ConversationChunker
+from service.extraction_checkpoint import (
+    EXTENSION_KEY,
+    ExtractionBatchJournal,
+    RecoveryNeedsConfirmationError,
+    RecoveryPersistenceError,
+    recovery_owner,
+    request_message_id,
+)
+from service.extraction_retry import (
+    ExtractionRetryWorker,
+    is_frozen_source_retry,
+    retry_failed_source,
+)
+from service.lifecycle_checkpoint import LifecycleBatchJournal, lifecycle_kind
+from session.models import ArchiveEntry, SessionMessage, SessionWindowState
+from session.rolling_compressor import RollingCompressor
+from session.session_manager import SessionManager, SessionOperationInProgress
+from session.topic_buffer import SlotContent
 
 try:
     from pyagfs import AGFSClient
 
     from commit.outbox_store import OutboxStore
-    from fs.agfs_adapter import AGFSContextFS
+    from fs.agfs_adapter import AGFSContextFS, AGFSTraceEventStore
     from providers.relation_store.agfs_relation_store import AGFSRelationStore
     from service.api import MemoryWriteAPI, ReadAPI
     _HAS_AGFS = True
@@ -61,6 +108,86 @@ except ImportError:
 
 logger = logging.getLogger("ogmem.service")
 
+
+def _ambiguous_pending_replay(pending, messages, client_request_id):
+    if not pending or client_request_id:
+        return False
+    source = {(value["role"], value["content"]) for value in pending["snapshot"]}
+    return any(
+        isinstance(message, dict) and not message.get("id")
+        and (message.get("role", "user"),
+             extract_content_and_tool_calls(message.get("content", "")).get("text", "")) in source
+        for message in messages
+    )
+
+
+def _after_turn_deadline(function):
+    """An explicit budget belongs to a synchronous caller, never a background job."""
+    @wraps(function)
+    def bounded(self, params):
+        params = params or {}
+        if "timeoutSeconds" not in params:
+            return function(self, params)
+        timeout = params["timeoutSeconds"]
+        if timeout is None:
+            raise ValueError("timeoutSeconds must be a positive finite number")
+        synchronous = bool(str(params.get("clientRequestId") or params.get("client_request_id") or "").strip())
+        if not synchronous and not self._param_bool(params, "wait", "wait", default=False):
+            raise ValueError("timeoutSeconds requires wait=true or clientRequestId")
+        try:
+            with operation_deadline(timeout):
+                return function(self, params)
+        except OperationDeadlineExceededError as exc:
+            return {"ok": False, "status": "failed", "retryable": True, "error": str(exc)}
+    return bounded
+
+
+def _guard_session_mutation(function):
+    """Acquire ownership before reading or changing the cached session source."""
+    @wraps(function)
+    def guarded(self, params):
+        params = params or {}
+        if not params.get("sessionId") and params.get("session_id"):
+            params = {**params, "sessionId": params["session_id"]}
+        if function.__name__ in ("after_turn", "ingest") and not params.get("messages") and not params.get("message"):
+            return function(self, params)
+        if function.__name__ == "dispose" and not (params.get("sessionId") or params.get("session_id")):
+            return function(self, params)
+        from service.api import MemoryWriteAPI
+        fs = self._write_api._fs if isinstance(self._write_api, MemoryWriteAPI) else None
+        if not self._use_sql and self._write_api is None:
+            manager = self.get_session_manager()
+            fs = manager._get_context_fs() if callable(manager._get_context_fs) else self._get_context_fs()
+            if fs is None:
+                return function(self, params)
+            manager._get_context_fs = lambda: fs
+        if (not self._use_sql and not callable(getattr(type(fs), "session_mutation_lock", None))
+                and not callable(getattr(type(fs), "session_recovery_lock", None))):
+            return function(self, params)
+        from fs.sql_adapter.session_mutation import SessionMutationLostError
+        ctx = params.get("_ctx") or self.build_context(params)
+        try:
+            with self._session_mutation_scope(ctx, refresh=function.__name__ != "delete_session") as guard:
+                if guard is not None and function.__name__ == "commit_session_buffer":
+                    params = {**params, "wait": True}
+                result = function(self, {**params, "_ctx": ctx})
+                if guard is not None:
+                    guard.ensure_owned()
+                    if (function.__name__ not in ("dispose", "delete_session")
+                            and result.get("ok", True)
+                            and not self.get_session_manager().save_session_state(ctx.session_id, ctx)):
+                        raise RecoveryNeedsConfirmationError("session source checkpoint was not acknowledged")
+            if guard is not None and guard.post_commit_drain:
+                drain = self.drain_outbox_sync(account_id=ctx.account_id)
+                if "drain" in result:
+                    result["drain"] = drain
+            return result
+        except SessionMutationBusyError:
+            return {"ok": False, "status": "processing", "retryable": True}
+        except (SessionMutationLostError, RecoveryNeedsConfirmationError) as exc:
+            return {"ok": False, "status": "needs_confirmation", "retryable": False, "error": str(exc)}
+    return guarded
+
 # Fallback archive-trim safety margin used only when incoming messages cannot
 # be aligned with the session buffer.  It preserves a likely in-flight
 # user/assistant turn that has not reached after_turn yet.
@@ -70,6 +197,63 @@ _ARCHIVE_TRIM_UNMATCHED_TAIL_MARGIN = 2
 # ---------------------------------------------------------------------------
 # Helpers (stateless, reusable)
 # ---------------------------------------------------------------------------
+
+def _serialize_lazy_initialization(attribute: str):
+    """Protect only the first initialization of a process-wide resource."""
+    def _decorate(method):
+        @wraps(method)
+        def _wrapped(self, *args, **kwargs):
+            if getattr(self, attribute) is not None:
+                return method(self, *args, **kwargs)
+            with self._init_lock:
+                return method(self, *args, **kwargs)
+
+        return _wrapped
+
+    return _decorate
+
+
+def _attribute_request_usage(method):
+    """Attribute synchronous provider calls to the request tenant owner."""
+    @wraps(method)
+    def _wrapped(self, params=None, *args, **kwargs):
+        ctx = params.get("_ctx") if isinstance(params, dict) else None
+        if not isinstance(ctx, RequestContext):
+            return method(self, params, *args, **kwargs)
+        with request_usage_scope(ctx):
+            return method(self, params, *args, **kwargs)
+
+    return _wrapped
+
+
+def _run_with_usage_scope(ctx: RequestContext, target, *args):
+    with request_usage_scope(ctx):
+        return target(*args)
+
+
+class _DisposeOperationLease:
+    """Release only this dispose call's operation and flag, exactly once."""
+
+    def __init__(self, buffer):
+        self.buffer = buffer
+        self.worker_owned = False
+        self._owns_dispose = False
+        self._released = False
+
+    def claim_dispose(self):
+        with self.buffer.extraction_lock:
+            self.buffer.dispose_in_progress = True
+            self._owns_dispose = True
+
+    def release(self, *, local=False):
+        with self.buffer.extraction_lock:
+            if self._released or (local and self.worker_owned):
+                return
+            self._released = True
+            if self._owns_dispose:
+                self.buffer.dispose_in_progress = False
+            self.buffer.end_operation()
+
 
 def extract_content_text(content) -> str:
     """Extract text from message content (string or structured blocks)."""
@@ -88,7 +272,6 @@ def extract_content_text(content) -> str:
 
 def _message_diag(messages) -> list[dict]:
     """Return compact message fingerprints for extraction diagnostics."""
-    import hashlib
 
     diag = []
     for idx, msg in enumerate(messages):
@@ -410,11 +593,21 @@ class MemoryService:
         self._archive_store = None
         self._archive_store_failed = False
         self._sql_pool = None  # Shared pool for all SQL stores
+        self._trace_event_store = None
+        self._skill_sedimentation_service = None
+        self._skill_sedimentation_worker = None
+        self._skill_sedimentation_thread: threading.Thread | None = None
 
         # Shared vector index + embedder (used by both read API and outbox worker)
         self._vector_index = None
+        self._projection_index = None
+        self._lexical_index = None
+        self._lexical_backfill = None
         self._embedder = None
+        self._model_usage_store = None
         self._outbox_thread: threading.Thread | None = None
+        self._extraction_retry = ExtractionRetryWorker(self)
+        self._extraction_discovery = None
         self._outbox_listener = None
         self._control_store = None
         self._key_manager = None
@@ -430,18 +623,25 @@ class MemoryService:
         self._internal_tool_usage_store = None
         self._pending_tool_usage_snapshots: dict[str, dict] = {}
         self._pending_tool_usage_lock = threading.Lock()
+        self._retrieval_monitoring: dict[tuple[str, str], dict[str, Any]] = {}
+        self._retrieval_monitoring_lock = threading.Lock()
+        self._init_lock = threading.RLock()
+        if self._cfg.skill_sedimentation_enabled:
+            self._start_skill_sedimentation_worker()
 
     @property
     def _use_sql(self) -> bool:
         return self._cfg.storage_backend == "sql" and _HAS_SQL and self._cfg.sql_connection_string
 
+    @_serialize_lazy_initialization("_sql_pool")
     def _get_shared_sql_pool(self):
         """Create (once) and return the shared connection pool for all SQL stores."""
-        if self._sql_pool is None and self._use_sql:
+        if self._sql_pool is None and _HAS_SQL and self._cfg.sql_connection_string:
             from fs.sql_adapter.pool import SharedConnectionPool
             self._sql_pool = SharedConnectionPool(
                 connection_string=self._cfg.sql_connection_string,
                 pool_size=self._cfg.sql_pool_size,
+                dialect=self._cfg.sql_dialect,
             )
         return self._sql_pool
 
@@ -453,6 +653,19 @@ class MemoryService:
             client = AGFSClient(api_base_url=self._agfs_base_url)
             return AGFSContextFS(client=client, mount_prefix=self._mount_prefix)
         return None
+
+    @_serialize_lazy_initialization("_model_usage_store")
+    def _get_model_usage_store(self):
+        if self._model_usage_store is None and self._cfg.sql_connection_string:
+            from fs.sql_adapter.model_usage_store import SQLModelUsageStore
+            self._model_usage_store = SQLModelUsageStore(self._get_shared_sql_pool())
+        return self._model_usage_store
+
+    def _bind_model_usage(self, provider):
+        tracker = getattr(provider, 'token_tracker', None)
+        if tracker is not None:
+            tracker.set_usage_store(self._get_model_usage_store())
+        return provider
 
     def _get_outbox_store(self, fs):
         """Create the appropriate OutboxStore implementation based on config."""
@@ -474,6 +687,604 @@ class MemoryService:
             client = AGFSClient(api_base_url=self._agfs_base_url)
             return AGFSRelationStore(client=client, mount_prefix=self._mount_prefix)
         return None
+
+    @_serialize_lazy_initialization("_trace_event_store")
+    def _get_trace_event_store(self):
+        """Return the lifecycle-trace store for the configured backend."""
+        if self._trace_event_store is None and self._use_sql:
+            try:
+                from fs.sql_adapter.sql_trace_store import SQLTraceEventStore
+
+                self._trace_event_store = SQLTraceEventStore(
+                    pool=self._get_shared_sql_pool(),
+                    max_turn_events=self._cfg.trace_max_turn_events,
+                )
+            except Exception as exc:
+                logger.warning("SQLTraceEventStore initialization failed: %s", exc)
+                return None
+        elif self._trace_event_store is None and self._cfg.storage_backend == "agfs" and _HAS_AGFS:
+            try:
+                self._trace_event_store = AGFSTraceEventStore(
+                    client=AGFSClient(api_base_url=self._agfs_base_url),
+                    mount_prefix=self._mount_prefix,
+                    max_turn_events=self._cfg.trace_max_turn_events,
+                )
+            except Exception as exc:
+                logger.warning("AGFSTraceEventStore initialization failed: %s", exc)
+                return None
+        return self._trace_event_store
+
+    def _get_skill_sedimentation_service(self):
+        if not self._cfg.skill_sedimentation_enabled:
+            return None
+        if self._skill_sedimentation_service is None:
+            from skills.sedimentation import SedimentationSettings, SkillSedimentationService
+
+            trace_store = self._get_trace_event_store()
+            context_fs = self._get_context_fs()
+            if trace_store is None or context_fs is None:
+                raise RuntimeError("skill sedimentation stores are unavailable")
+            assessor_cfg = replace(self._provider_cfg, llm_temperature=0.0)
+            reviewer_cfg = replace(
+                self._provider_cfg,
+                provider=self._cfg.skill_reviewer_provider or self._provider_cfg.provider,
+                openai_llm_model=(
+                    self._cfg.skill_reviewer_model or self._provider_cfg.openai_llm_model
+                ),
+                llm_temperature=0.0,
+            )
+            try:
+                embedder = self._get_shared_embedder()
+            except Exception as exc:
+                raise RuntimeError(
+                    "skill sedimentation requires semantic embeddings for safe deduplication"
+                ) from exc
+            self._skill_sedimentation_service = SkillSedimentationService(
+                trace_store=trace_store,
+                context_fs=context_fs,
+                assessor_llm=self._bind_model_usage(assessor_cfg.create_llm()),
+                reviewer_llm=self._bind_model_usage(reviewer_cfg.create_llm()),
+                settings=SedimentationSettings.from_config(self._cfg),
+                embedder=embedder,
+            )
+        return self._skill_sedimentation_service
+
+    def _start_skill_sedimentation_worker(self) -> None:
+        if self._skill_sedimentation_thread is not None:
+            if self._skill_sedimentation_thread.is_alive():
+                return
+            self._skill_sedimentation_thread = None
+            self._skill_sedimentation_worker = None
+        from skills.sedimentation import SkillSedimentationWorker
+
+        skill_service = self._get_skill_sedimentation_service()
+        if skill_service is None:
+            return
+        self._skill_sedimentation_worker = SkillSedimentationWorker(
+            skill_service,
+            self._skill_account_ids,
+            interval_seconds=self._cfg.skill_scan_interval_seconds,
+            worker_id=f"skill-{uuid4().hex[:16]}",
+            batch_size=self._cfg.skill_batch_size,
+            account_workers=self._cfg.skill_account_workers,
+        )
+        self._skill_sedimentation_thread = threading.Thread(
+            target=self._skill_sedimentation_worker.run,
+            daemon=True,
+            name="ogmemory-skill-sedimentation",
+        )
+        self._skill_sedimentation_thread.start()
+
+    def _skill_account_ids(self) -> list[str]:
+        try:
+            trace_store = self._get_trace_event_store()
+            if trace_store is None:
+                return []
+            return trace_store.list_pending_skill_accounts(
+                limit=max(1, self._cfg.skill_account_workers * 2)
+            )
+        except Exception:
+            logger.warning("Unable to discover accounts with pending skill work", exc_info=True)
+            raise
+
+    def wake_skill_sedimentation(self) -> None:
+        """Wake the asynchronous worker; never run generation on the request thread."""
+
+        if self._skill_sedimentation_worker is not None:
+            self._skill_sedimentation_worker.wake()
+
+    def stop_skill_sedimentation(self, timeout: float = 5.0) -> bool:
+        if self._skill_sedimentation_worker is not None:
+            self._skill_sedimentation_worker.stop()
+        if self._skill_sedimentation_thread is not None:
+            self._skill_sedimentation_thread.join(timeout=timeout)
+            if self._skill_sedimentation_thread.is_alive():
+                logger.warning("Skill sedimentation worker did not stop within %.1fs", timeout)
+                return False
+        self._skill_sedimentation_worker = None
+        self._skill_sedimentation_thread = None
+        return True
+
+    def list_skill_candidates(
+        self,
+        ctx: RequestContext,
+        *,
+        state: str | None = None,
+        limit: int = 50,
+    ) -> list[dict]:
+        if not ctx.agent_id:
+            raise ValueError("agent_id is required to list skill candidates")
+        store = self._get_trace_event_store()
+        if store is None:
+            raise RuntimeError("trace store unavailable")
+        return store.list_skill_candidates(
+            account_id=ctx.account_id,
+            agent_id=ctx.agent_id,
+            state=state,
+            limit=limit,
+        )
+
+    def list_published_skills(
+        self,
+        ctx: RequestContext,
+        *,
+        limit: int = 50,
+        cursor: str | None = None,
+        source: str | None = None,
+    ) -> dict:
+        """Return one stable page from generated and managed Skill stores."""
+
+        from skills.artifact import is_governed_skill, is_managed_skill, validate_skill_name
+        from skills.management import validate_managed_skill_name
+
+        if not ctx.agent_id:
+            raise ValueError("agent_id is required to list skills")
+        if limit < 1 or limit > 100:
+            raise ValueError("limit must be between 1 and 100")
+        if source not in {None, "generated", "imported"}:
+            raise ValueError("source must be generated or imported")
+        cursor_name = None
+        cursor_source = None
+        if cursor:
+            if "|" in cursor:
+                cursor_name, cursor_source = cursor.rsplit("|", 1)
+                if cursor_source == "imported":
+                    validate_managed_skill_name(cursor_name)
+                elif cursor_source == "generated":
+                    validate_skill_name(cursor_name)
+                else:
+                    raise ValueError("invalid skill cursor")
+            else:
+                cursor_name, cursor_source = validate_skill_name(cursor), "generated"
+        context_fs = self._get_context_fs()
+        rows: list[dict] = []
+        seen_keys: set[tuple[str, str]] = set()
+        roots = (
+            (
+                "generated",
+                f"ctx://{ctx.account_id}/agents/{ctx.agent_id}/skills/generated",
+                is_governed_skill,
+            ),
+            (
+                "imported",
+                f"ctx://{ctx.account_id}/agents/{ctx.agent_id}/skills/imported",
+                is_managed_skill,
+            ),
+            (
+                "generated",
+                f"ctx://{ctx.account_id}/agents/{ctx.agent_id}/skills",
+                is_governed_skill,
+            ),
+        )
+        for row_source, base_uri, published in roots:
+            if source and row_source != source:
+                continue
+            root_rows: list[dict] = []
+            target = limit + 1
+
+            def append_node(node) -> None:
+                if not published(node) or len(root_rows) >= target:
+                    return
+                name = node.uri.rsplit("/", 1)[-1]
+                row_key = (name, row_source)
+                if row_key in seen_keys or (
+                    cursor_name and row_key <= (cursor_name, cursor_source)
+                ):
+                    return
+                seen_keys.add(row_key)
+                root_rows.append({
+                    "name": name,
+                    "description": node.metadata.get(
+                        "package_description", node.abstract
+                    ),
+                    "source": row_source,
+                    "updated_at": node.metadata.get("updated_at", ""),
+                })
+
+            after_uri = f"{base_uri}/{cursor_name}" if cursor_name else None
+            if cursor_name and row_source == "imported" and cursor_source == "generated":
+                same_name_uri = f"{base_uri}/{cursor_name}"
+                if context_fs.exists(same_name_uri, ctx):
+                    append_node(context_fs.read_node(same_name_uri, ctx))
+
+            if hasattr(context_fs, "list_node_summaries_page"):
+                while len(root_rows) < target:
+                    batch_size = target - len(root_rows)
+                    nodes = context_fs.list_node_summaries_page(
+                        base_uri, ctx, limit=batch_size, after_uri=after_uri,
+                    )
+                    if not nodes:
+                        break
+                    for node in nodes:
+                        append_node(node)
+                    after_uri = nodes[-1].uri
+                    if len(nodes) < batch_size:
+                        break
+            else:
+                uris = sorted(context_fs.list_children(base_uri, ctx))
+                for uri in uris:
+                    if after_uri and uri <= after_uri:
+                        continue
+                    append_node(context_fs.read_node(uri, ctx))
+                    if len(root_rows) >= target:
+                        break
+            rows.extend(root_rows)
+        rows.sort(key=lambda row: (row["name"], row["source"]))
+        page = rows[:limit]
+        truncated = len(rows) > limit
+        payload = {"skills": page, "truncated": truncated}
+        if truncated and page:
+            payload["next_cursor"] = f"{page[-1]['name']}|{page[-1]['source']}"
+        return payload
+
+    @property
+    def default_agent_id(self) -> str:
+        return self._cfg.agent_id
+
+    @property
+    def skill_search_scan_limit(self) -> int:
+        return int(self._cfg.skill_search_scan_limit)
+
+    def read_published_skill(
+        self, ctx: RequestContext, name: str, source: str | None = None
+    ):
+        """Read one published Skill selected by name and optional source."""
+
+        from core.errors import NodeNotFoundError
+        from skills.artifact import (
+            internal_managed_skill_uri,
+            internal_skill_uri,
+            is_governed_skill,
+            is_managed_skill,
+            legacy_internal_skill_uri,
+        )
+
+        if source not in {None, "generated", "imported"}:
+            raise ValueError("source must be generated or imported")
+        candidates = []
+        if source in {None, "generated"}:
+            try:
+                generated_uris = (
+                    internal_skill_uri(ctx.account_id, ctx.agent_id, name),
+                    legacy_internal_skill_uri(ctx.account_id, ctx.agent_id, name),
+                )
+                candidates.extend(
+                    ("generated", uri, is_governed_skill) for uri in generated_uris
+                )
+            except ValueError:
+                if source == "generated":
+                    raise
+        if source in {None, "imported"}:
+            candidates.append((
+                "imported",
+                internal_managed_skill_uri(ctx.account_id, ctx.agent_id, name),
+                is_managed_skill,
+            ))
+        found = []
+        found_sources = set()
+        context_fs = self._get_context_fs()
+        for candidate_source, uri, published in candidates:
+            try:
+                node = context_fs.read_node(uri, ctx)
+            except (FileNotFoundError, NodeNotFoundError):
+                continue
+            if published(node) and candidate_source not in found_sources:
+                if candidate_source == "imported":
+                    node.content = node.metadata.get("package_skill_md", node.content)
+                    node.abstract = node.metadata.get("package_description", node.abstract)
+                found.append(node)
+                found_sources.add(candidate_source)
+        if not found:
+            raise FileNotFoundError("published skill not found")
+        if len(found) > 1:
+            raise ValueError("skill name is ambiguous; source is required")
+        return found[0]
+
+    def validate_managed_skill(
+        self,
+        data,
+        *,
+        expected_name: str | None = None,
+        strict: bool = False,
+        skill_dir_name: str | None = None,
+        source_path: str | None = None,
+    ) -> dict:
+        """Validate supported skill input without writing it."""
+
+        from skills.management import (
+            package_file_manifest,
+            parse_managed_skill,
+            validate_skill_format,
+        )
+
+        result = validate_skill_format(
+            data,
+            strict=strict,
+            skill_dir_name=skill_dir_name,
+            source_path=source_path,
+        )
+        if expected_name is not None and result.get("name") != expected_name:
+            raise ValueError("skill content name must match the requested name")
+        if not result["valid"]:
+            return result
+        try:
+            skill = parse_managed_skill(data)
+        except ValueError as exc:
+            result["valid"] = False
+            result["errors"].append({
+                "rule": "installable",
+                "message": str(exc),
+                "field": "data",
+            })
+            return result
+        result.update({
+            "content_bytes": len(skill.content.encode("utf-8")),
+            "package_bytes": skill.total_bytes,
+            "auxiliary_files": skill.auxiliary_files,
+            "files": package_file_manifest(skill, source="imported"),
+        })
+        return result
+
+    def add_managed_skill(
+        self,
+        ctx: RequestContext,
+        data=None,
+        *,
+        archive_base64: str | None = None,
+        path: str | None = None,
+    ) -> dict:
+        """Install one explicit complete Skill package."""
+
+        from core.errors import ConcurrentModificationError
+        from skills.artifact import artifact_body_hash, internal_managed_skill_uri
+        from skills.management import parse_managed_skill
+
+        self._require_skill_management_role(ctx)
+        data = self._managed_skill_input(data, archive_base64, path)
+        skill = parse_managed_skill(data)
+        uri = internal_managed_skill_uri(ctx.account_id, ctx.agent_id, skill.name)
+        fs = self._require_skill_fs()
+        now = _dt.now(UTC).isoformat()
+        node = ContextNode(
+            uri=uri,
+            context_type="SKILL",
+            category="skill",
+            level=0,
+            owner_space=ctx.agent_space_name(),
+            abstract=skill.description[:200],
+            overview=f"Agent skill: {skill.name}",
+            content=skill.content,
+            metadata={
+                "ogmemory_managed": True,
+                "publication_status": "published",
+                "content_hash": artifact_body_hash(skill.content),
+                "package_skill_md": skill.content,
+                "package_description": skill.description,
+                "package_files": skill.serialized_files(),
+                "package_bytes": skill.total_bytes,
+                "created_at": now,
+                "updated_at": now,
+                "_expected_version": 0,
+            },
+        )
+        try:
+            fs.write_node(node, ctx)
+        except ConcurrentModificationError as exc:
+            raise FileExistsError(f"skill already exists: {skill.name}") from exc
+        return self._managed_skill_result(node, action="create", version=1)
+
+    def update_managed_skill(
+        self,
+        ctx: RequestContext,
+        name: str,
+        data=None,
+        *,
+        archive_base64: str | None = None,
+        path: str | None = None,
+    ) -> dict:
+        """Replace one imported Skill package without touching generated skills."""
+
+        from skills.artifact import artifact_body_hash
+        from skills.management import parse_managed_skill, validate_managed_skill_name
+
+        self._require_skill_management_role(ctx)
+        data = self._managed_skill_input(data, archive_base64, path)
+        name = validate_managed_skill_name(name)
+        skill = parse_managed_skill(data)
+        if skill.name != name:
+            raise ValueError("skill content name must match the requested name")
+
+        existing = self.read_published_skill(ctx, name, source="imported")
+        version = existing.metadata.get("version")
+        if not isinstance(version, int) or version < 1:
+            raise ValueError("imported skill has an invalid version")
+
+        now = _dt.now(UTC).isoformat()
+        node = ContextNode(
+            uri=existing.uri,
+            context_type="SKILL",
+            category="skill",
+            level=0,
+            owner_space=ctx.agent_space_name(),
+            abstract=skill.description[:200],
+            overview=f"Agent skill: {skill.name}",
+            content=skill.content,
+            metadata={
+                "ogmemory_managed": True,
+                "publication_status": "published",
+                "content_hash": artifact_body_hash(skill.content),
+                "package_skill_md": skill.content,
+                "package_description": skill.description,
+                "package_files": skill.serialized_files(),
+                "package_bytes": skill.total_bytes,
+                "created_at": existing.metadata.get("created_at", now),
+                "updated_at": now,
+                "_expected_version": version,
+            },
+        )
+        self._require_skill_fs().write_node(node, ctx)
+        return self._managed_skill_result(
+            node, action="update", version=version + 1
+        )
+
+    def delete_published_skill(
+        self, ctx: RequestContext, name: str, source: str | None
+    ) -> dict:
+        """Delete one published Skill from the selected source."""
+
+        from core.errors import NodeNotFoundError
+        from skills.artifact import (
+            canonical_skill_uri,
+            internal_skill_uri,
+            is_governed_skill,
+            legacy_internal_skill_uri,
+        )
+
+        if source not in {"generated", "imported"}:
+            raise ValueError("source is required and must be generated or imported")
+        self._require_skill_management_role(ctx)
+        node = self.read_published_skill(ctx, name, source=source)
+        fs = self._require_skill_fs()
+        nodes = [node]
+        if source == "generated":
+            for uri in (
+                internal_skill_uri(ctx.account_id, ctx.agent_id, name),
+                legacy_internal_skill_uri(ctx.account_id, ctx.agent_id, name),
+            ):
+                if uri == node.uri:
+                    continue
+                try:
+                    candidate = fs.read_node(uri, ctx)
+                except (FileNotFoundError, NodeNotFoundError):
+                    continue
+                if is_governed_skill(candidate):
+                    nodes.append(candidate)
+
+        deleted = False
+        for candidate in nodes:
+            try:
+                fs.delete_node(candidate.uri, ctx)
+                deleted = True
+            except (FileNotFoundError, NodeNotFoundError):
+                continue
+        if not deleted:
+            raise FileNotFoundError("published skill not found")
+        return {
+            "name": name,
+            "uri": canonical_skill_uri(name, source),
+            "source": source,
+            "action": "delete",
+        }
+
+    def read_managed_skill_file(
+        self, ctx: RequestContext, name: str, path: str
+    ) -> dict:
+        """Read one sanitized file from an installed managed Skill package."""
+
+        import base64
+
+        from skills.management import (
+            PackageFile,
+            deserialize_package_file,
+            package_file_uri,
+        )
+
+        node = self.read_published_skill(ctx, name, source="imported")
+        if path == "SKILL.md":
+            item = PackageFile("SKILL.md", node.content.encode("utf-8"), "text/markdown")
+        else:
+            item = None
+            for record in node.metadata.get("package_files") or []:
+                candidate = deserialize_package_file(record)
+                if candidate.path == path:
+                    item = candidate
+                    break
+            if item is None:
+                raise FileNotFoundError(f"skill package file not found: {path}")
+        result = {
+            "name": item.path.rsplit("/", 1)[-1],
+            "path": item.path,
+            "uri": package_file_uri(name, item.path),
+            "source": "imported",
+            "media_type": item.media_type,
+            "size": len(item.data),
+            "sha256": item.sha256,
+        }
+        if b"\x00" not in item.data:
+            try:
+                result["content"] = item.data.decode("utf-8")
+                result["encoding"] = "utf-8"
+                return result
+            except UnicodeDecodeError:
+                pass
+        result["content_base64"] = base64.b64encode(item.data).decode("ascii")
+        result["encoding"] = "base64"
+        return result
+
+    def _require_skill_fs(self):
+        fs = self._get_context_fs()
+        if fs is None:
+            raise RuntimeError("ContextFS unavailable for skill management")
+        return fs
+
+    def _require_skill_management_role(self, ctx: RequestContext) -> None:
+        if not ctx.agent_id:
+            raise ValueError("agent_id is required to manage skills")
+        self.get_auth_service().require_role(ctx, Role.ADMIN, Role.ROOT)
+
+    @staticmethod
+    def _managed_skill_input(data, archive_base64: str | None, path: str | None):
+        sources = sum(value is not None for value in (data, archive_base64, path))
+        if sources != 1:
+            raise ValueError("exactly one of data, archive_base64, or path is required")
+        if archive_base64 is not None:
+            from skills.management import decode_skill_archive_base64
+
+            return decode_skill_archive_base64(archive_base64)
+        if path is not None:
+            from skills.management import load_managed_skill_path
+
+            return load_managed_skill_path(path)
+        return data
+
+    @staticmethod
+    def _managed_skill_result(node: ContextNode, *, action: str, version: int) -> dict:
+        name = node.uri.rsplit("/", 1)[-1]
+        uri = f"ogmemory://skills/imported/{name}"
+        return {
+            "status": "success",
+            "name": name,
+            "description": node.metadata.get("package_description", node.abstract),
+            "root_uri": uri,
+            "uri": uri,
+            "source": "imported",
+            "action": action,
+            "version": version,
+            "auxiliary_files": len(node.metadata.get("package_files") or []),
+            "package_bytes": node.metadata.get(
+                "package_bytes", len(node.content.encode("utf-8"))
+            ),
+        }
 
     def _get_chunker(self) -> ConversationChunker | None:
         """Create a ConversationChunker if chunking is enabled.
@@ -498,9 +1309,17 @@ class MemoryService:
         ctx,
         session_id: str,
         write_api,
+        candidate_checkpoint=None,
     ) -> None:
         """Generate L0 structured summary for a session and write to storage."""
+        check_deadline()
         try:
+            if candidate_checkpoint is not None and candidate_checkpoint.load() is not None:
+                accepted = candidate_checkpoint.load()[0]
+                plans = write_api._write_checkpointed_candidates(accepted, ctx, candidate_checkpoint)
+                if accepted and not plans:
+                    raise RuntimeError("summary rejected before writing")
+                return
             from extraction.summary_generator import SessionSummaryGenerator
 
             # Format messages into text
@@ -521,12 +1340,17 @@ class MemoryService:
 
             messages_text = "\n".join(lines)
             if not messages_text.strip():
+                if candidate_checkpoint is not None:
+                    candidate_checkpoint.accept([], 0, 0)
                 return
 
             participants_str = ", ".join(participants) if participants else ""
             gen = SessionSummaryGenerator(llm=self.get_llm())
             summary = gen.generate(messages_text, session_time, participants_str)
+            check_deadline()
             if not summary:
+                if candidate_checkpoint is not None:
+                    candidate_checkpoint.accept([], 0, 0)
                 return
 
             formatted = gen.format_summary(summary)
@@ -537,12 +1361,23 @@ class MemoryService:
                 participants=participants_str,
                 session_id=session_id,
             )
-            write_api.write_memory(candidate, ctx)
+            if candidate_checkpoint is not None:
+                check_deadline()
+                accepted = candidate_checkpoint.accept([candidate], 1, 0)
+                plans = write_api._write_checkpointed_candidates(accepted, ctx, candidate_checkpoint)
+                if not plans:
+                    raise RuntimeError("summary rejected before writing")
+            else:
+                write_api.write_memory(candidate, ctx)
             logger.info(
                 "L0 summary written: session=%s len=%d",
                 session_id[:8], len(formatted),
             )
+        except OperationDeadlineExceededError:
+            raise
         except Exception as exc:
+            if candidate_checkpoint is not None:
+                raise
             logger.warning("L0 summary generation failed: %s", exc, exc_info=True)
 
     def _chunk_and_extract(
@@ -556,6 +1391,7 @@ class MemoryService:
         extraction_run_id: str,
         session_id: str,
         archive_id: str | None = None,
+        extraction_journal=None,
     ) -> dict:
         """Extract memories from messages, optionally chunking first.
 
@@ -566,6 +1402,13 @@ class MemoryService:
         When chunking is disabled (or produces a single chunk), falls back
         to a single commit_session() call — identical to the original path.
         """
+        from fs.sql_adapter.session_mutation import active_session_guard
+        check_deadline()
+        guard = active_session_guard()
+        if guard is not None:
+            guard.ensure_owned()
+        if extraction_journal is not None:
+            return self._chunk_and_extract_recoverable(write_api, ctx, session_id, extraction_journal)
         # Step 0: Generate L0 summary for the whole session
         self._generate_and_write_summary(
             messages, session_time, ctx, session_id, write_api,
@@ -654,6 +1497,7 @@ class MemoryService:
         }
 
         for idx, chunk in enumerate(chunking_result.chunks):
+            check_deadline()
             logger.info(
                 "chunk_and_extract: processing chunk %d/%d, run=%s session=%s msgs=%d",
                 idx + 1, len(chunking_result.chunks),
@@ -687,6 +1531,8 @@ class MemoryService:
                     )
                 except Exception as raw_exc:
                     logger.debug("raw chunk write failed (chunk %d): %s", idx, raw_exc)
+            except OperationDeadlineExceededError:
+                raise
             except Exception as exc:
                 logger.warning(
                     "chunk_and_extract: chunk %d/%d failed, run=%s session=%s: %s",
@@ -706,15 +1552,99 @@ class MemoryService:
         )
         return aggregated
 
+    def _chunk_and_extract_recoverable(self, write_api, ctx, session_id, journal):
+        batch = journal.batch
+        messages = batch["messages"]
+        session_time = _parse_session_time(batch.get("session_time"))
+
+        def make_chunks():
+            chunker = self._get_chunker()
+            return chunker.chunk_messages(messages, flush=True).chunks if chunker else [messages]
+
+        chunks = journal.chunks(make_chunks)
+        for index, chunk in enumerate(chunks):
+            write_api.write_raw_chunk(messages=chunk, ctx=ctx, chunk_index=index,
+                                     session_id=session_id, session_time=session_time,
+                                     candidate_checkpoint=journal.checkpoint(f"raw:{index}"))
+        aggregated = {"candidates_extracted": 0, "candidates_filtered": 0,
+                      "writes_completed": 0, "writes_skipped": 0, "writes_failed": 0, "plans": []}
+        from service.extraction_retry import source_only_reason
+        reason = source_only_reason()
+        if reason:
+            for slot in list(journal.batch["slots"]):
+                if slot.startswith("raw:"):
+                    continue
+                checkpoint = journal.checkpoint(slot)
+                candidates, extracted, filtered = checkpoint.load()
+                plans = write_api._write_checkpointed_candidates(candidates, ctx, checkpoint, source_only=True)
+                aggregated["candidates_extracted"] += extracted
+                aggregated["candidates_filtered"] += filtered
+                aggregated["writes_completed"] += sum(plan.action != "skip" for plan in plans)
+                aggregated["writes_skipped"] += sum(plan.action == "skip" for plan in plans)
+                aggregated["plans"].extend({"action": plan.action, "target_uri": plan.target_uri,
+                                             "merged_fields": plan.merged_fields} for plan in plans)
+            logger.warning("Extraction completed from preserved source session=%s archive=%s reason=%s",
+                           session_id, batch["archive_id"], reason)
+            return {**aggregated, "degraded": True, "recovery_mode": "source_only", "reason": reason}
+        self._generate_and_write_summary(messages, session_time, ctx, session_id, write_api,
+                                         candidate_checkpoint=journal.checkpoint("summary"))
+        for index, chunk in enumerate(chunks):
+            check_deadline()
+            result = write_api.commit_session(
+                messages=chunk, ctx=ctx, confidence_threshold=.5, wait=True,
+                session_time=session_time, session_summary=batch["session_summary"],
+                tool_stats_text=batch["tool_stats_text"], archive_id=batch["archive_id"],
+                candidate_checkpoint=journal.checkpoint(f"chunk:{index}"))
+            for key in ("candidates_extracted", "candidates_filtered", "writes_completed",
+                        "writes_skipped", "writes_failed"):
+                aggregated[key] += result.get(key, 0)
+            aggregated["plans"].extend(result.get("plans", []))
+        return aggregated
+
+    def _complete_extraction_source(self, ctx, archive_id, reason):
+        from service.extraction_retry import source_only_recovery
+        journal = self._extraction_retry._journal(ctx, archive_id)
+        if journal is None:
+            return {"ok": True, "status": "completed"}
+        batch = journal.batch
+        with source_only_recovery(ctx, archive_id, reason):
+            result = self.after_turn({
+                "_ctx": ctx, "sessionId": ctx.session_id, "wait": True,
+                "forceExtract": True, "timeoutSeconds": 1200,
+                "clientRequestId": batch["client_request_id"],
+                "messages": deepcopy(batch["request_messages"]),
+            })
+        if result.get("status") == "failed":
+            result.setdefault("retryable", True)
+        return result
+
+    def start_extraction_recovery(self):
+        from service.extraction_recovery_discovery import ExtractionRecoveryDiscovery
+        with self._init_lock:
+            if self._extraction_discovery is None:
+                self._extraction_discovery = ExtractionRecoveryDiscovery(
+                    self._get_context_fs, self._extraction_recovery_account_ids)
+                self._extraction_retry.start_discovery(self._extraction_discovery)
+
+    def _extraction_recovery_account_ids(self):
+        accounts = [self._default_account_id]
+        if self._cfg.role_control_enabled:
+            accounts.extend(item["account_id"] for item in self.get_key_manager().get_accounts()
+                            if item.get("account_id"))
+        else:
+            fs = self._get_context_fs()
+            enumerate_accounts = getattr(type(fs), "recovery_account_ids", None)
+            if enumerate_accounts is not None:
+                accounts.extend(enumerate_accounts(fs))
+        return accounts
+
     @staticmethod
     def _supports_batch_claim(outbox_store) -> bool:
         """Safely detect SQL outbox implementations with batch-claim support."""
-        class_flag = getattr(type(outbox_store), "supports_batch_claim", False) is True
-        instance_flag = (
-            getattr(outbox_store, "__dict__", {}).get("supports_batch_claim", False)
-            is True
-        )
-        return class_flag or instance_flag
+        instance_values = getattr(outbox_store, "__dict__", {})
+        if "supports_batch_claim" in instance_values:
+            return instance_values["supports_batch_claim"] is True
+        return getattr(type(outbox_store), "supports_batch_claim", False) is True
 
     # -- RequestContext factory ------------------------------------------------
 
@@ -727,7 +1657,7 @@ class MemoryService:
 
         Empty strings from the plugin are treated as absent, so defaults apply.
         """
-        session_id = params.get("sessionId") or "unknown"
+        session_id = params.get("sessionId") or params.get("session_id") or "unknown"
         explicit_agent_id = params.get("agentId")
         user_id = params.get("userId") or params.get("user_id")
         if not user_id:
@@ -788,6 +1718,7 @@ class MemoryService:
             visible_owner_spaces=(),
         )
 
+    @_serialize_lazy_initialization("_control_store")
     def get_control_plane_store(self) -> ControlPlaneStore:
         if self._control_store is None:
             if self._use_sql:
@@ -808,26 +1739,31 @@ class MemoryService:
                 )
         return self._control_store
 
+    @_serialize_lazy_initialization("_internal_tool_usage_store")
     def get_internal_tool_usage_store(self) -> InternalToolUsageStore:
         if self._internal_tool_usage_store is None:
             self._internal_tool_usage_store = InternalToolUsageStore(self.get_control_plane_store())
         return self._internal_tool_usage_store
 
+    @_serialize_lazy_initialization("_key_manager")
     def get_key_manager(self) -> APIKeyManager:
         if self._key_manager is None:
             self._key_manager = APIKeyManager(self.get_control_plane_store())
         return self._key_manager
 
+    @_serialize_lazy_initialization("_auth")
     def get_auth_service(self) -> AuthService:
         if self._auth is None:
             self._auth = AuthService(self._cfg, self.get_key_manager())
         return self._auth
 
+    @_serialize_lazy_initialization("_audit")
     def get_audit_service(self) -> AuditService:
         if self._audit is None:
             self._audit = AuditService(self.get_control_plane_store())
         return self._audit
 
+    @_serialize_lazy_initialization("_tenant_admin")
     def get_tenant_admin_service(self) -> TenantAdminService:
         if self._tenant_admin is None:
             self._tenant_admin = TenantAdminService(
@@ -912,20 +1848,22 @@ class MemoryService:
             read_api = self.get_read_api()
 
             # Round 1: structured nodes (all categories)
-            result = read_api.search_memory(
-                query=query, ctx=ctx, top_k=15,
-                fill_content_for_top_k=5, mode="QUICK",
-            )
+            if self._cfg.skill_sedimentation_enabled:
+                result = self._search_without_generated_skills(
+                    read_api, query=query, ctx=ctx, top_k=15,
+                    fill_content_for_top_k=0,
+                )
+            else:
+                result = read_api.search_memory(
+                    query=query, ctx=ctx, top_k=15,
+                    fill_content_for_top_k=0, mode="QUICK",
+                )
             if result and result.hits:
-                if result.trace and hasattr(result.trace, "stages"):
-                    for stage in result.trace.stages:
-                        if stage.stage == "seed_retrieval":
-                            stats["seed_output"] = stage.output_count
-                            break
-                if result.trace and hasattr(result.trace, "level_histogram"):
-                    stats["level_histogram"] = result.trace.level_histogram
-                stats["hit_count"] = len(result.hits)
-                stats["hit_categories"] = list({h.category for h in result.hits if h.category})
+                ordinary_hits = list(result.hits)
+                stats["hit_count"] = len(ordinary_hits)
+                stats["hit_categories"] = list(
+                    {h.category for h in ordinary_hits if h.category}
+                )
 
                 items = [
                     {
@@ -935,8 +1873,9 @@ class MemoryService:
                         "content": h.content_excerpt or "",
                         "score": h.score,
                         "category": h.category,
+                        "metadata": dict(h.metadata or {}),
                     }
-                    for h in result.hits
+                    for h in ordinary_hits
                 ]
                 items = self._truncate_by_score_gap(items)
 
@@ -967,11 +1906,59 @@ class MemoryService:
                     )
             except Exception as exc:
                 logger.debug("L0 summary search failed: %s", exc)
-
-            return items, summary_items, stats
         except Exception as exc:
             logger.warning("Working set search failed: %s", exc)
-        return [], [], {}
+            return [], [], {}
+        return items, summary_items, stats
+
+    def _search_without_generated_skills(
+        self,
+        read_api,
+        *,
+        query: str,
+        ctx: RequestContext,
+        top_k: int,
+        fill_content_for_top_k: int,
+    ):
+        """Search ordinary memories and legacy skills before applying top-k.
+
+        Generated skills are consumed through the explicit skill catalog. Legacy
+        or user-authored skill memories retain their pre-feature compose behavior.
+        """
+
+        search_top_k = min(
+            int(getattr(self._cfg, "retrieval_max_top_k", top_k)),
+            max(
+                top_k,
+                top_k * int(getattr(self._cfg, "retrieval_candidate_pool_multiplier", 3)),
+                int(getattr(self._cfg, "retrieval_min_candidate_pool_size", top_k)),
+            ),
+        )
+        result = read_api.search_memory(
+            query=query,
+            ctx=ctx,
+            top_k=search_top_k,
+            fill_content_for_top_k=fill_content_for_top_k,
+            mode="QUICK",
+        )
+        if result is None:
+            return None
+        candidates = [
+            hit
+            for hit in (getattr(result, "hits", []) or [])
+            if (getattr(hit, "metadata", {}) or {}).get("ogmemory_generated") is not True
+        ]
+        deduped = {hit.uri: hit for hit in candidates}
+        result.hits = sorted(
+            deduped.values(),
+            key=lambda hit: float(
+                getattr(hit, "ranking_score", None)
+                if getattr(hit, "ranking_score", None) is not None
+                else getattr(hit, "score", 0.0)
+            ),
+            reverse=True,
+        )[:top_k]
+        return result
 
     @staticmethod
     def _truncate_by_score_gap(items: list[dict], min_keep: int = 3, gap_ratio: float = 0.15) -> list[dict]:
@@ -1055,7 +2042,10 @@ class MemoryService:
             text = text[:max_chars]
         return text
 
-    def _format_working_set(self, working_set: list[dict], budget: dict[str, int]) -> str:
+    def _format_working_set(
+        self, working_set: list[dict], budget: dict[str, int], *,
+        query: str = "", delivery_stats: dict | None = None,
+    ) -> str:
         """Build DYNAMIC working set as user message content.
 
         This goes into memoryUserMessage and changes every turn.
@@ -1074,26 +2064,21 @@ class MemoryService:
             "Use them to answer the user's question. If the answer is found in these memories, respond based on them.",
             "",
         ]
-        for item in working_set:
-            cat = item.get("category", "memory")
-            abstract = item.get("abstract", "")
-            overview = item.get("overview", "")
-            content = item.get("content", "")
-            text_to_show = overview or content or abstract
-
-            # Add temporal context if available
-            when = (item.get("metadata") or {}).get("when")
-            if when:
-                text_to_show = f"[{when}] {text_to_show}"
-
-            ws_lines.append(f"- [{cat}] {text_to_show}")
-        ws_text = "\n".join(ws_lines)
-        ws_tokens = len(ws_text) // 4
-
         working_set_budget = budget.get("working_set", 20000)
-
-        if ws_tokens > working_set_budget and working_set_budget > 100:
-            ws_text = ws_text[: working_set_budget * 4]
+        max_chars = max(0, working_set_budget * 4)
+        remaining = max(0, max_chars - len("\n".join(ws_lines)) - 1)
+        evidence, selection_stats = select_evidence(
+            working_set, query, remaining,
+            embedder_factory=self._get_shared_embedder,
+        )
+        if delivery_stats is not None:
+            delivery_stats.update(selection_stats)
+        if not evidence:
+            return ""
+        ws_lines.append(evidence)
+        ws_text = "\n".join(ws_lines)
+        if len(ws_text) > max_chars and working_set_budget > 100:
+            ws_text = ws_text[:max_chars]
         return ws_text
 
     def _get_session_state(
@@ -1104,9 +2089,10 @@ class MemoryService:
         """Get or compress session window state (Layer 2)."""
         mgr = self.get_session_manager()
         buf = mgr.get_or_create(session_id, ctx=ctx)
+
         mgr.load_session_state(session_id, ctx)
         window_state = buf.window_state
-        window_state.last_accessed_at = _dt.now(_timezone.utc).isoformat()
+        window_state.last_accessed_at = _dt.now(UTC).isoformat()
         self._sync_session_state_bridge_if_due(session_id, buf, window_state)
         mgr.update_window_state(session_id, window_state)
 
@@ -1259,21 +2245,89 @@ class MemoryService:
 
     # -- Lazy resource getters ------------------------------------------------
 
+    @_serialize_lazy_initialization("_vector_index")
     def _get_shared_vector_index(self):
         """Lazy-init shared vector index (same instance for read + outbox worker)."""
         if self._vector_index is None:
-            self._vector_index = self._provider_cfg.create_vector_index()
+            vector_index = self._provider_cfg.create_vector_index()
+            projection_index = vector_index
+            lexical_index = None
+            if getattr(self._cfg, "retrieval_hybrid_enabled", False):
+                try:
+                    from core.lexical import HybridLexicalIndex
+                    from providers.composite_index import CompositeProjectionWriter
+                    from providers.lexical_index import create_lexical_index
+
+                    lexical_index = create_lexical_index(self._cfg)
+                    if not isinstance(lexical_index, HybridLexicalIndex):
+                        raise TypeError(
+                            "hybrid lexical provider lacks durable checkpoint capabilities"
+                        )
+                    projection_index = CompositeProjectionWriter(
+                        vector_index,
+                        lexical_index,
+                    )
+                    from core.lexical import lexical_scopes_from_index_records
+
+                    projection_index.set_failure_callbacks(
+                        records_failed=lambda records: lexical_index.mark_scopes_dirty(
+                            lexical_scopes_from_index_records(records)
+                        ),
+                        scope_unknown_failed=lexical_index.mark_all_scopes_dirty,
+                    )
+                except Exception:
+                    for resource in (lexical_index, vector_index):
+                        close = getattr(resource, "close", None)
+                        if callable(close):
+                            try:
+                                close()
+                            except Exception:
+                                logger.warning(
+                                    "Resource cleanup failed after lexical initialization error",
+                                    exc_info=True,
+                                )
+                    raise
+            # Publish the resource tree only after required lexical
+            # initialization succeeds, so transient failures remain retryable.
+            self._vector_index = vector_index
+            self._projection_index = projection_index
+            self._lexical_index = lexical_index
             logger.info("Shared vector_index ready: %s", type(self._vector_index).__name__)
         return self._vector_index
 
+    def _get_shared_projection_index(self):
+        """Return the outbox sink that keeps vector and lexical projections aligned."""
+        self._get_shared_vector_index()
+        return self._projection_index
+
+    @_serialize_lazy_initialization("_lexical_backfill")
+    def _get_lexical_backfill(self):
+        """Return the lifecycle-owned lexical backfill coordinator."""
+        if not getattr(self._cfg, "retrieval_hybrid_enabled", False):
+            return None
+        if self._lexical_backfill is None:
+            self._get_shared_vector_index()
+            if self._lexical_index is None:
+                raise RuntimeError("hybrid retrieval requires a lexical index")
+            from fs.sql_adapter.node_scanner import SQLCanonicalNodeScanner
+            from providers.lexical_backfill import LexicalBackfill
+
+            self._lexical_backfill = LexicalBackfill(
+                SQLCanonicalNodeScanner(self._get_shared_sql_pool()),
+                self._lexical_index,
+                page_size=getattr(self._cfg, "retrieval_backfill_page_size", 500),
+            )
+        return self._lexical_backfill
+
+    @_serialize_lazy_initialization("_embedder")
     def _get_shared_embedder(self):
         """Lazy-init shared embedder (same instance for read + outbox worker)."""
         if self._embedder is None:
-            self._embedder = self._provider_cfg.create_embedder()
+            self._embedder = self._bind_model_usage(self._provider_cfg.create_embedder())
             logger.info("Shared embedder ready: %s", type(self._embedder).__name__)
         return self._embedder
 
-
+    @_serialize_lazy_initialization("_outbox_thread")
     def _start_outbox_worker(self):
         """Start OutboxWorker background thread (once, idempotent)."""
         if self._outbox_thread is not None:
@@ -1284,7 +2338,7 @@ class MemoryService:
         try:
             from index.outbox_worker import OutboxWorker
 
-            vector_index = self._get_shared_vector_index()
+            vector_index = self._get_shared_projection_index()
             embedder = self._get_shared_embedder()
 
             fs = self._get_context_fs()
@@ -1377,9 +2431,18 @@ class MemoryService:
         if not _HAS_AGFS and not _HAS_SQL:
             return {"processed": 0, "succeeded": 0, "failed": 0, "skipped": 0}
         try:
+            from fs.sql_adapter.session_mutation import active_session_guard
+            guard = active_session_guard()
+            if guard is not None:
+                guard.ensure_owned()
+                if account_id is not None and account_id != guard.ctx.account_id:
+                    guard.poison("projection request changed its mutation account")
+                    guard.check_active()
+                guard.post_commit_drain = True
+                return {"processed": 0, "succeeded": 0, "failed": 0, "deferred": True}
             from index.outbox_worker import OutboxWorker
 
-            vector_index = self._get_shared_vector_index()
+            vector_index = self._get_shared_projection_index()
             embedder = self._get_shared_embedder()
 
             fs = self._get_context_fs()
@@ -1414,6 +2477,8 @@ class MemoryService:
 
     def shutdown(self, join_timeout: float = 1.0) -> None:
         """Best-effort shutdown for background SQL listener threads."""
+        self._extraction_retry.close(join_timeout)
+        self.stop_skill_sedimentation(timeout=join_timeout)
         if self._outbox_listener is not None:
             try:
                 self._outbox_listener.stop()
@@ -1425,16 +2490,36 @@ class MemoryService:
             thread is not None
             and hasattr(thread, "is_alive")
             and thread.is_alive()
-            and thread is not threading.current_thread()
         ):
-            try:
-                thread.join(timeout=join_timeout)
-            except Exception as exc:
-                logger.warning("Failed to join outbox thread: %s", exc)
+            if thread is not threading.current_thread():
+                try:
+                    thread.join(timeout=join_timeout)
+                except Exception as exc:
+                    logger.warning("Failed to join outbox thread: %s", exc)
+            if thread.is_alive():
+                logger.warning("Outbox worker did not stop before shutdown deadline")
+                return
 
         self._outbox_listener = None
         self._outbox_thread = None
+        if self._lexical_backfill is not None:
+            if not self._lexical_backfill.close(timeout=join_timeout):
+                logger.warning("Lexical backfill did not stop before shutdown deadline")
+                return
+        if self._lexical_index is not None and self._projection_index is not None:
+            try:
+                if not self._projection_index.close(timeout=join_timeout):
+                    logger.warning("Hybrid retrieval indexes did not close before deadline")
+                    return
+            except Exception as exc:
+                logger.warning("Failed to close hybrid retrieval indexes: %s", exc)
+                return
+            self._projection_index = None
+            self._lexical_index = None
+            self._lexical_backfill = None
+            self._vector_index = None
 
+    @_serialize_lazy_initialization("_llm")
     def get_llm(self):
         if self._llm is None:
             cfg = self._provider_cfg
@@ -1446,20 +2531,32 @@ class MemoryService:
                     openai_llm_model=cfg.openai_llm_model,
                     llm_temperature=cfg.llm_temperature,
                     llm_max_tokens=cfg.llm_max_tokens,
+                    llm_json_mode=cfg.llm_json_mode,
+                    llm_reasoning_effort=cfg.llm_reasoning_effort,
+                    llm_is_reasoning_model=cfg.llm_is_reasoning_model,
+                    llm_extra_body=dict(cfg.llm_extra_body),
                 )
             if cfg.provider == "mock":
                 from providers.llm import MockLLM
-                self._llm = MockLLM()
+                llm = MockLLM()
             else:
                 openai_llm_cls, _ = get_openai_llm()
-                self._llm = openai_llm_cls(
+                llm = openai_llm_cls(
                     api_key=cfg.effective_openai_api_key(),
                     base_url=cfg.openai_base_url,
                     model=cfg.openai_llm_model,
+                    temperature=cfg.llm_temperature,
+                    max_tokens=cfg.llm_max_tokens,
+                    json_mode=cfg.llm_json_mode,
+                    reasoning_effort=cfg.llm_reasoning_effort,
+                    is_reasoning_model=cfg.llm_is_reasoning_model,
+                    extra_body=cfg.llm_extra_body,
                 )
+            self._llm = self._bind_model_usage(llm)
             logger.info("LLM ready: %s", type(self._llm).__name__)
         return self._llm
 
+    @_serialize_lazy_initialization("_write_api")
     def get_write_api(self):
         if self._write_api is None:
             fs = self._get_context_fs()
@@ -1473,6 +2570,8 @@ class MemoryService:
             try:
                 from extraction.schemas.registry import SchemaRegistry
                 schema_registry = SchemaRegistry()
+                if self._cfg.skill_sedimentation_enabled:
+                    schema_registry.unregister("skill")
                 logger.info("SchemaRegistry initialized for dynamic tool generation")
             except Exception as exc:
                 logger.warning("SchemaRegistry initialization failed; write API unavailable: %s", exc)
@@ -1502,6 +2601,11 @@ class MemoryService:
                 uri_resolver=uri_resolver,
 internal_tool_usage_tracker=self._internal_tool_usage,
                 extraction_mode=self._cfg.extraction_mode,
+                source_occurrence_reconciliation_enabled=self._cfg.source_occurrence_reconciliation_enabled,
+                card_format_enabled=self._cfg.card_format_enabled,
+                dual_pass_enabled=self._cfg.dual_pass_enabled,
+                node_processing_enabled=self._cfg.node_processing_enabled,
+                directory_summary_enabled=self._cfg.directory_summary_enabled,
             )
             logger.info("WriteAPI ready (backend=%s, extraction_mode=%s)", self._cfg.storage_backend, self._cfg.extraction_mode)
             # Start outbox worker so written memories get indexed
@@ -1524,22 +2628,23 @@ internal_tool_usage_tracker=self._internal_tool_usage,
             raise RuntimeError("ContextFS unavailable for forget_memory")
 
         node = fs.read_node(uri, ctx)
-        if node.category == "profile" or uri.rstrip("/").endswith("/memories/profile"):
+        stored_uri = node.uri
+        if node.category == "profile" or stored_uri.rstrip("/").endswith("/memories/profile"):
             raise AuthorizationError("profile memory cannot be forgotten via MCP")
 
         role = ctx.role if isinstance(ctx.role, Role) else Role(ctx.role)
-        agent_scoped = node.owner_space == ctx.agent_space_name() or "/agents/" in uri
+        agent_scoped = node.owner_space == ctx.agent_space_name() or "/agents/" in stored_uri
         if agent_scoped and role not in (Role.ADMIN, Role.ROOT):
             raise AuthorizationError("agent-scoped memory forget requires ADMIN or ROOT")
 
         original_node = deepcopy(node)
-        fs.archive_node(uri, ctx)
+        fs.archive_node(stored_uri, ctx)
 
         outbox_event_id = None
         outbox = self._get_outbox_store(fs)
         if outbox is not None:
             try:
-                event = outbox.register_archive(uri, ctx)
+                event = outbox.register_archive(stored_uri, ctx)
                 outbox_event_id = getattr(event, "event_id", None)
             except Exception:
                 try:
@@ -1547,7 +2652,7 @@ internal_tool_usage_tracker=self._internal_tool_usage,
                 except Exception as rollback_exc:
                     logger.error(
                         "forget_memory rollback failed after outbox registration error uri=%s: %s",
-                        uri,
+                        stored_uri,
                         rollback_exc,
                         exc_info=True,
                     )
@@ -1556,13 +2661,13 @@ internal_tool_usage_tracker=self._internal_tool_usage,
         self.get_audit_service().record(
             ctx.account_id,
             actor=ctx.user_id,
-            target=external_uri or uri,
+            target=external_uri or stored_uri,
             action="mcp.delete_memory",
             result="success",
             trace_id=ctx.trace_id,
             details={
                 "mode": "archive",
-                "internal_uri": uri,
+                "internal_uri": stored_uri,
                 "external_uri": external_uri,
                 "category": node.category,
                 "owner_space": node.owner_space,
@@ -1584,12 +2689,33 @@ internal_tool_usage_tracker=self._internal_tool_usage,
             "outbox_event_id": outbox_event_id,
         }
 
-    def get_read_api(self):
+    @_serialize_lazy_initialization("_read_api")
+    def get_read_api(self, *, start_outbox_worker: bool = True):
+        """Return the shared read API and optionally start index synchronization."""
         if self._read_api is None:
             embedder = self._get_shared_embedder()
             vector_index = self._get_shared_vector_index()
 
-            cfg = RetrievalConfig()
+            cfg = RetrievalConfig(
+                expand_hierarchy=getattr(self._cfg, "retrieval_expand_hierarchy", True),
+                max_top_k=getattr(self._cfg, "retrieval_max_top_k", 50),
+                default_top_k=getattr(self._cfg, "retrieval_default_top_k", 10),
+                global_search_topk=getattr(self._cfg, "retrieval_global_search_topk", 30),
+                candidate_pool_enabled=getattr(self._cfg, "retrieval_candidate_pool_enabled", False),
+                candidate_pool_multiplier=getattr(self._cfg, "retrieval_candidate_pool_multiplier", 3),
+                min_candidate_pool_size=getattr(self._cfg, "retrieval_min_candidate_pool_size", 15),
+                result_ranker_strategy=getattr(self._cfg, "retrieval_result_ranker_strategy", "semantic"),
+                global_result_rerank_enabled=getattr(
+                    self._cfg, "retrieval_global_result_rerank_enabled", False,
+                ),
+                owner_scope_filter_enabled=getattr(self._cfg, "retrieval_owner_scope_filter_enabled", False),
+                hybrid_enabled=getattr(self._cfg, "retrieval_hybrid_enabled", False),
+                vector_top_k=getattr(self._cfg, "retrieval_vector_top_k", 100),
+                lexical_top_k=getattr(self._cfg, "retrieval_lexical_top_k", 50),
+                rrf_k=getattr(self._cfg, "retrieval_rrf_k", 60),
+                semantic_weight=getattr(self._cfg, "retrieval_semantic_weight", 1.0),
+                lexical_weight=getattr(self._cfg, "retrieval_lexical_weight", 1.0),
+            )
 
             # Create relation_store
             relation_store = None
@@ -1600,6 +2726,7 @@ internal_tool_usage_tracker=self._internal_tool_usage,
 
             # Create context_reader for content filling (shared by pipeline and read_service)
             context_reader = None
+            fs = None
             try:
                 fs = self._get_context_fs()
                 if fs is not None:
@@ -1607,9 +2734,23 @@ internal_tool_usage_tracker=self._internal_tool_usage,
             except Exception as exc:
                 logger.warning("ContextFS unavailable for read_memory: %s", exc)
 
+            lexical_backfill = None
+            if cfg.hybrid_enabled:
+                if fs is None or self._lexical_index is None:
+                    raise RuntimeError(
+                        "hybrid retrieval requires canonical storage and lexical index"
+                    )
+                lexical_backfill = self._get_lexical_backfill()
+
             pipeline = RetrievalPipeline(
                 planner=QueryPlanner(cfg),
-                seed_retriever=SeedRetriever(vector_index, embedder, cfg),
+                seed_retriever=SeedRetriever(
+                    vector_index,
+                    embedder,
+                    cfg,
+                    self._lexical_index,
+                    lexical_backfill,
+                ),
                 hierarchical_searcher=HierarchicalSearcher(vector_index, cfg),
                 assembly=ResultRanker(cfg, relation_store=relation_store),
                 config=cfg,
@@ -1627,18 +2768,26 @@ internal_tool_usage_tracker=self._internal_tool_usage,
                 type(vector_index).__name__,
                 self._cfg.storage_backend,
             )
-            # Start outbox worker so pending events from ingest get indexed
+        if start_outbox_worker:
             self._start_outbox_worker()
         return self._read_api
 
     # -- Lifecycle handlers ---------------------------------------------------
 
+    @_serialize_lazy_initialization("_session_mgr")
     def get_session_manager(self) -> SessionManager:
         """Lazy-init SessionManager with current service dependencies."""
         if self._session_mgr is None:
+            from service.api import MemoryWriteAPI as _CheckpointWriteAPI
+            checkpoint_fs = (self._write_api._fs
+                             if isinstance(self._write_api, _CheckpointWriteAPI) else None)
+            durable_runtime_state_enabled = bool(
+                getattr(self._cfg, "session_state_bridge_enabled", True)
+                or checkpoint_fs is not None
+            )
             session_state_context_fs = (
-                self._get_context_fs
-                if getattr(self._cfg, "session_state_bridge_enabled", True)
+                (lambda: checkpoint_fs) if checkpoint_fs is not None else self._get_context_fs
+                if durable_runtime_state_enabled
                 else None
             )
             self._session_mgr = SessionManager(
@@ -1652,9 +2801,15 @@ internal_tool_usage_tracker=self._internal_tool_usage,
                 archive_merge_threshold=self._cfg.archive_merge_threshold,
                 compression_quality_enabled=self._cfg.compression_quality_enabled,
                 compression_quality_persist_metadata=self._cfg.compression_quality_persist_metadata,
+                session_state_bridge_enabled=getattr(
+                    self._cfg,
+                    "session_state_bridge_enabled",
+                    True,
+                ),
             )
             logger.info("SessionManager ready")
         return self._session_mgr
+
 
     def _get_archive_store(self):
         """Return an archive store instance.
@@ -1705,6 +2860,7 @@ internal_tool_usage_tracker=self._internal_tool_usage,
             return
         auth.require_role(ctx, Role.ROOT, Role.ADMIN)
 
+    @_attribute_request_usage
     def prefetch(self, params: dict) -> dict:
         """Best-effort pre-compose retrieval staged into the session topic buffer."""
         if not getattr(self._cfg, "prefetch_enabled", False):
@@ -1722,16 +2878,24 @@ internal_tool_usage_tracker=self._internal_tool_usage,
                 params.get("prefetchTopK", getattr(self._cfg, "prefetch_top_k", 5)),
                 5,
             )
-            result = self.get_read_api().search_memory(
-                query=query,
-                ctx=ctx,
-                top_k=top_k,
-                fill_content_for_top_k=0,
-                mode="QUICK",
-            )
+            read_api = self.get_read_api()
+            if self._cfg.skill_sedimentation_enabled:
+                result = self._search_without_generated_skills(
+                    read_api, query=query, ctx=ctx, top_k=top_k,
+                    fill_content_for_top_k=0,
+                )
+            else:
+                result = read_api.search_memory(
+                    query=query,
+                    ctx=ctx,
+                    top_k=top_k,
+                    fill_content_for_top_k=0,
+                    mode="QUICK",
+                )
+            ordinary_hits = list(getattr(result, "hits", []) or [])
             hits = [
                 _retrieved_block_to_seed_hit(hit)
-                for hit in (getattr(result, "hits", []) or [])[:top_k]
+                for hit in ordinary_hits[:top_k]
                 if getattr(hit, "uri", "")
             ]
             topic_buffer = self.get_session_manager().get_topic_buffer(session_id)
@@ -1759,6 +2923,30 @@ internal_tool_usage_tracker=self._internal_tool_usage,
         )
         return {"ok": True, "evicted": evicted}
 
+    @_guard_session_mutation
+    def add_session_message(self, params: dict) -> dict:
+        session_id = params.get("sessionId", "unknown")
+        ctx = params.get("_ctx") or self.build_context(params)
+        return self.get_session_manager().add_message(
+            session_id,
+            params.get("role", "user"),
+            params.get("content", ""),
+            ctx,
+            created_at=params.get("created_at"),
+        )
+
+    @_guard_session_mutation
+    def commit_session_buffer(self, params: dict) -> dict:
+        session_id = params.get("sessionId", "unknown")
+        ctx = params.get("_ctx") or self.build_context(params)
+        return self.get_session_manager().commit(
+            session_id,
+            ctx,
+            wait=params.get("wait", False),
+        )
+
+    @_attribute_request_usage
+    @_guard_session_mutation
     def compose(self, params: dict) -> dict:
         """Assemble memory context for the current turn.
 
@@ -1926,26 +3114,31 @@ internal_tool_usage_tracker=self._internal_tool_usage,
         except Exception as exc:
             logger.warning("assemble working set search failed: %s", exc)
 
+        injection_snapshot = None
         try:
             if topic_buffer is not None:
-                pending_hits = topic_buffer.get_pending_injection() or []
+                injection_snapshot = topic_buffer.injection_snapshot()
+                pending_hits = injection_snapshot[0] or []
                 if pending_hits:
                     existing_uris = {
-                        item.get("uri") for item in working_set
+                        canonical_uri(item["uri"]) for item in working_set
                         if isinstance(item, dict) and item.get("uri")
                     }
-                    injected_uris: list[str] = []
                     for hit in pending_hits:
-                        if not hit.uri or hit.uri in existing_uris or topic_buffer.was_injected(hit.uri):
+                        uri = canonical_uri(hit.uri)
+                        if not uri or uri in existing_uris or topic_buffer.was_injected(uri):
                             continue
                         working_set.append(_seed_hit_to_working_set_item(hit))
-                        existing_uris.add(hit.uri)
-                        injected_uris.append(hit.uri)
-                    if injected_uris:
-                        topic_buffer.mark_injected(injected_uris)
-                    topic_buffer.clear_pending_injection()
+                        existing_uris.add(uri)
         except Exception as exc:
             logger.warning("assemble pending injection merge failed: %s", exc)
+
+        delivery_stats = {}
+        if any(item.get("category") != "code" for item in working_set):
+            working_set, delivery_stats = hydrate_evidence(
+                working_set, lambda uri, read_ctx: self.get_read_api().read_memory(uri, read_ctx), ctx,
+            )
+            search_stats["evidence_delivery"] = delivery_stats
 
         # Each step degrades independently — a failure in one doesn't kill the rest
 
@@ -1995,7 +3188,9 @@ internal_tool_usage_tracker=self._internal_tool_usage,
         # Step 5c: Build dynamic working set → user message (preserves KV cache)
         working_set_msg = ""
         try:
-            working_set_msg = self._format_working_set(working_set, budget_allocation)
+            working_set_msg = self._format_working_set(
+                working_set, budget_allocation, query=query, delivery_stats=delivery_stats,
+            )
         except Exception as exc:
             logger.warning("assemble working_set_msg build failed: %s", exc)
 
@@ -2252,7 +3447,12 @@ internal_tool_usage_tracker=self._internal_tool_usage,
                 system_prompt_suffix=system_prompt_suffix,
             )
 
-            return self._to_response(result)
+            response = self._to_response(result)
+            if topic_buffer is not None and injection_snapshot is not None:
+                topic_buffer.consume_injection(
+                    injection_snapshot, delivery_stats.get("delivered_uris", []) if working_set_msg else [],
+                )
+            return response
         except Exception as exc:
             logger.warning("assemble final result construction failed: %s", exc, exc_info=True)
             result = ComposedContext(
@@ -2312,7 +3512,330 @@ internal_tool_usage_tracker=self._internal_tool_usage,
             "budgetUsedBySlot": result.budget_used_by_slot,
         }
 
+    def add_session_trace(self, params: dict) -> dict:
+        """Persist one bounded agent event directly to SQL."""
+        ctx = params.get("_ctx")
+        if ctx is None:
+            return {"ok": False, "error": "missing context", "retryable": False}
+
+        event = params.get("event")
+        if not isinstance(event, dict) or not event:
+            return {
+                "ok": False,
+                "error": "missing event payload",
+                "retryable": False,
+            }
+
+        event_id = str(params.get("eventId") or "").strip()
+        session_id = str(params.get("sessionId") or "").strip()
+        hook_type = str(params.get("hookType") or event.get("hook_type") or "unknown")
+        if not event_id:
+            return {"ok": False, "error": "missing event_id", "retryable": False}
+        if len(event_id) > 64:
+            return {
+                "ok": False,
+                "error": "event_id exceeds 64 characters",
+                "retryable": False,
+            }
+        if not session_id or session_id == "unknown":
+            return {"ok": False, "error": "missing session_id", "retryable": False}
+        if len(session_id) > 128:
+            return {
+                "ok": False,
+                "error": "session_id exceeds 128 characters",
+                "retryable": False,
+            }
+        if len(hook_type) > 64:
+            return {
+                "ok": False,
+                "error": "hook_type exceeds 64 characters",
+                "retryable": False,
+            }
+
+        event_time = params.get("eventTime")
+        if isinstance(event_time, str):
+            try:
+                event_time = _dt.fromisoformat(event_time.replace("Z", "+00:00"))
+            except ValueError:
+                return {
+                    "ok": False,
+                    "error": "invalid event_time",
+                    "retryable": False,
+                }
+        if event_time is not None and not isinstance(event_time, _dt):
+            return {
+                "ok": False,
+                "error": "invalid event_time",
+                "retryable": False,
+            }
+        if isinstance(event_time, _dt) and event_time.tzinfo is None:
+            event_time = event_time.replace(tzinfo=UTC)
+
+        store = self._get_trace_event_store()
+        if store is None:
+            return {
+                "ok": False,
+                "error": "trace store unavailable",
+                "retryable": True,
+            }
+
+        try:
+            return store.insert(
+                event_id=event_id,
+                account_id=ctx.account_id,
+                owner_space=ctx.user_space_name(),
+                agent_id=ctx.agent_id,
+                session_id=session_id,
+                hook_type=hook_type,
+                content=event,
+                event_time=event_time,
+            )
+        except Exception as exc:
+            logger.warning(
+                "add_session_trace failed session=%s: %s",
+                session_id[:8],
+                exc,
+            )
+            return {
+                "ok": False,
+                "error": "trace persistence unavailable",
+                "error_code": "trace_persistence_unavailable",
+                "retryable": True,
+            }
+
+    def finalize_session_trace(self, params: dict) -> dict:
+        """Finalize the turn-end-bounded turn containing ``stopEventIndex``."""
+        ctx = params.get("_ctx")
+        if ctx is None:
+            return {"ok": False, "error": "missing context", "retryable": False}
+        session_id = str(params.get("sessionId") or "").strip()
+        try:
+            stop_event_index = int(params.get("stopEventIndex") or 0)
+        except (TypeError, ValueError):
+            return {
+                "ok": False,
+                "error": "invalid stop_event_index",
+                "retryable": False,
+            }
+        if not session_id or session_id == "unknown":
+            return {"ok": False, "error": "missing session_id", "retryable": False}
+        if stop_event_index <= 0:
+            return {
+                "ok": False,
+                "error": "invalid stop_event_index",
+                "retryable": False,
+            }
+
+        store = self._get_trace_event_store()
+        if store is None:
+            return {
+                "ok": False,
+                "error": "trace store unavailable",
+                "retryable": True,
+            }
+        try:
+            finalized = store.finalize_session(
+                account_id=ctx.account_id,
+                owner_space=ctx.user_space_name(),
+                agent_id=ctx.agent_id,
+                session_id=session_id,
+                stop_event_index=stop_event_index,
+            )
+            if self._cfg.skill_sedimentation_enabled:
+                queued = store.enqueue_skill_candidate_from_trace(
+                    account_id=ctx.account_id,
+                    agent_id=ctx.agent_id,
+                    session_id=session_id,
+                    turn_id=str(finalized["turn_id"]),
+                    trace_uri=str(finalized["uri"]),
+                )
+                finalized["skill_candidate_id"] = queued["candidate_id"]
+            return finalized
+        except ValueError as exc:
+            logger.warning(
+                "finalize_session_trace failed session=%s: %s",
+                session_id[:8],
+                exc,
+            )
+            return {
+                "ok": False,
+                "error": "invalid trace boundary",
+                "error_code": "invalid_trace_boundary",
+                "retryable": False,
+            }
+        except Exception as exc:
+            logger.warning(
+                "finalize_session_trace failed session=%s: %s",
+                session_id[:8],
+                exc,
+            )
+            return {
+                "ok": False,
+                "error": "trace finalization unavailable",
+                "error_code": "trace_finalization_unavailable",
+                "retryable": True,
+            }
+
+    @contextmanager
+    def _session_mutation_scope(self, ctx, *, refresh=True):
+        from fs.sql_adapter.session_mutation import active_session_guard
+        from service.api import MemoryWriteAPI
+        nested = active_session_guard() is not None
+        if self._write_api is None and self._use_sql:
+            with SQLContextFS.configured_session_mutation_lock(
+                self._cfg.sql_connection_string, ctx, dialect=self._cfg.sql_dialect,
+            ) as guard:
+                try:
+                    if refresh and not nested:
+                        self._load_extraction_recovery_before_accumulation(ctx.session_id, ctx, force_reload=True)
+                except SessionOperationInProgress:
+                    raise
+                except Exception as exc:
+                    raise RecoveryNeedsConfirmationError("durable session refresh failed: " + str(exc)) from exc
+                yield guard
+            return
+        if isinstance(self._write_api, MemoryWriteAPI):
+            fs = self._write_api._fs
+        elif self._write_api is not None:
+            yield None
+            return
+        else:
+            manager = self.get_session_manager()
+            fs = manager._get_context_fs() if callable(manager._get_context_fs) else self._get_context_fs()
+            if fs is not None:
+                manager._get_context_fs = lambda: fs
+        acquire = (getattr(type(fs), "session_mutation_lock", None)
+                   or getattr(type(fs), "session_recovery_lock", None))
+        if not callable(acquire):
+            yield None
+            return
+        if callable(getattr(type(fs), "active_session_recovery", None)):
+            nested = fs.active_session_recovery() is not None
+        from session.session_state import SessionState
+        with acquire(fs, SessionState.state_uri(ctx.account_id, ctx.session_id), ctx) as guard:
+            try:
+                if refresh and not nested:
+                    self._load_extraction_recovery_before_accumulation(ctx.session_id, ctx, force_reload=True)
+            except SessionOperationInProgress:
+                raise
+            except Exception as exc:
+                raise RecoveryNeedsConfirmationError("durable session refresh failed: " + str(exc)) from exc
+            yield guard
+
+    def _load_extraction_recovery_before_accumulation(self, session_id, ctx, *, force_reload=False):
+        """Load once without creating any model, embedder or extraction API."""
+        from service.api import MemoryWriteAPI
+        manager = self.get_session_manager()
+        if manager.extraction_recovery_loaded(session_id, ctx) and not force_reload:
+            return
+        if isinstance(self._write_api, MemoryWriteAPI):
+            fs = self._write_api._fs
+        elif self._write_api is not None:
+            # Legacy integrations with mocked/in-process writers do not have
+            # the persistent accepted-candidate and node-receipt contract.
+            return
+        elif callable(manager._get_context_fs):
+            fs = manager._get_context_fs()
+        else:
+            fs = self._get_context_fs()
+        if fs is None:
+            return
+        if not (callable(getattr(type(fs), "read_node", None))
+                and callable(getattr(type(fs), "write_node", None))):
+            return
+        manager.require_extraction_recovery(session_id)
+        # Bind a new, empty buffer only after its durable owner is validated.
+        manager.get_or_create(session_id)
+        manager.enable_extraction_recovery(session_id, ctx, fs, force_reload=force_reload)
+
+    def _queue_card_format_recovery(self, ctx, error, *, archive_id, client_request_id):
+        from service.extraction_retry import background_retry_running
+        if not isinstance(error, MemoryCardFormatError) or background_retry_running():
+            return None
+        task = self._extraction_retry.register(
+            ctx, {"error": str(error), "failure_kind": "memory_card_format",
+                  "extraction_archive_id": archive_id, "client_request_id": client_request_id})
+        if task is None or task.get("status") not in {"queued", "running"}:
+            return None
+        return {"ok": True, "status": "queued", "reason": "memory_card_format",
+                "recovery_task": task, "last_error": str(error)}
+
+    @retry_failed_source
+    @_after_turn_deadline
+    @_attribute_request_usage
+    @_guard_session_mutation
     def after_turn(self, params: dict) -> dict:
+        messages = params.get("messages", [])
+        if not messages:
+            return {"ok": True}
+
+        ctx = params.get("_ctx") or self.build_context(params)
+        try:
+            self._load_extraction_recovery_before_accumulation(params.get("sessionId", "unknown"), ctx)
+        except SessionOperationInProgress:
+            raise
+        except Exception as exc:
+            return {"ok": False, "status": "needs_confirmation", "retryable": False,
+                    "error": "durable extraction state unavailable: " + str(exc)}
+
+        client_request_id = str(
+            params.get("clientRequestId") or params.get("client_request_id") or ""
+        ).strip()
+        if not client_request_id:
+            return self._after_turn(params)
+        if len(client_request_id) > 128:
+            raise ValueError("client_request_id must be at most 128 characters")
+
+        buf = self.get_session_manager().get_or_create(
+            params.get("sessionId", "unknown"),
+            ctx=ctx,
+        )
+        claim_status = buf.claim_request(client_request_id)
+        if claim_status == "completed":
+            return self._after_turn(params)
+        if claim_status == "processing":
+            return {
+                "ok": False,
+                "status": "processing",
+                "retryable": True,
+                "client_request_id": client_request_id,
+            }
+
+        try:
+            result = self._after_turn(params)
+        except Exception:
+            buf.release_request(client_request_id)
+            raise
+        if result.get("ok", True) is False or result.get("status") == "queued":
+            buf.release_request(client_request_id)
+        return result
+
+    def _after_turn(self, params: dict) -> dict:
+        return self._after_turn_impl(params)
+
+    def _after_turn_impl(self, params: dict) -> dict:
+        """Reserve ordinary source preparation without serializing ordinary turns."""
+        if not params.get("messages"):
+            return self._after_turn_source_impl(params)
+        session_id = params.get("sessionId", "unknown")
+        ctx = params.get("_ctx") or self.build_context(params)
+        buf = self.get_session_manager().get_or_create(session_id, ctx=ctx)
+        with buf.extraction_lock:
+            if buf.lifecycle_prepare_in_progress:
+                return {"ok": False, "status": "processing", "retryable": True,
+                        "reason": "lifecycle_preparing"}
+            if lifecycle_kind(buf) is not None:
+                return {"ok": False, "status": "needs_confirmation", "retryable": False,
+                        "error": "resume the pending lifecycle batch before after_turn"}
+            buf.ordinary_turns_in_progress += 1
+        try:
+            return self._after_turn_source_impl(params)
+        finally:
+            with buf.extraction_lock:
+                buf.ordinary_turns_in_progress -= 1
+
+
+    def _after_turn_source_impl(self, params: dict) -> dict:
         """Unified write entry point: accumulate session buffer + extract memories.
 
         Step 1 (every turn): add new messages to session buffer (lightweight).
@@ -2321,16 +3844,88 @@ internal_tool_usage_tracker=self._internal_tool_usage,
         """
         session_id = params.get("sessionId", "unknown")
         messages = params.get("messages", [])
-        pre_prompt_count = params.get("prePromptMessageCount", 0)
         if not messages:
             return {"ok": True}
 
         ctx = params.get("_ctx") or self.build_context(params)
-
-        # Extract new messages only (skip pre-prompt system messages)
-        new_messages = messages[pre_prompt_count:]
-        if not new_messages:
+        client_request_id = str(
+            params.get("clientRequestId") or params.get("client_request_id") or ""
+        ).strip()
+        automatic_card_identity = (self._cfg.card_format_enabled or self._cfg.node_processing_enabled) and not client_request_id
+        if automatic_card_identity:
+            client_request_id = "card-" + uuid4().hex
+            params = {**params, "clientRequestId": client_request_id}
+        if len(client_request_id) > 128:
+            raise ValueError("client_request_id must be at most 128 characters")
+        pre_prompt_count = _bounded_message_count(
+            params.get("prePromptMessageCount", 0),
+            len(messages),
+        )
+        if (
+            not client_request_id and (not messages[pre_prompt_count:])
+        ):
             return {"ok": True, "status": "no_new_messages"}
+
+        mgr = self.get_session_manager()
+        buf = mgr.get_or_create(session_id, ctx=ctx)
+
+        if lifecycle_kind(buf) is not None:
+            return {"ok": False, "status": "needs_confirmation", "retryable": False,
+                    "error": "resume the pending lifecycle batch before after_turn"}
+
+        from service.api import MemoryWriteAPI as _CheckpointWriteAPI
+
+        def _save_idempotency_state() -> bool:
+            if (
+                not getattr(self._cfg, 'session_state_bridge_enabled', True) and (not isinstance(self._write_api, _CheckpointWriteAPI))
+            ):
+                return True
+            return mgr.save_session_state(session_id, ctx)
+
+        def _complete_request(result: dict) -> dict:
+            if client_request_id and result.get("ok", True):
+                buf.mark_request_completed(client_request_id)
+                result["client_request_id"] = client_request_id
+                if not _save_idempotency_state():
+                    return {
+                        "ok": False,
+                        "status": "failed",
+                        "error": "idempotency state unavailable",
+                        "retryable": True,
+                        "client_request_id": client_request_id,
+                    }
+                buf.release_request(client_request_id)
+            return result
+        pending = buf.runtime_extensions.get("memory_extraction_recovery", {}).get("batch", {})
+        pending_request_retry = bool(client_request_id and pending.get("client_request_id") == client_request_id)
+        if client_request_id and buf.request_completed(client_request_id) and not pending_request_retry:
+            if not _save_idempotency_state():
+                return {
+                    "ok": False,
+                    "status": "failed",
+                    "error": "idempotency state unavailable",
+                    "retryable": True,
+                    "client_request_id": client_request_id,
+                }
+            buf.release_request(client_request_id)
+            return {
+                "ok": True,
+                "status": "duplicate",
+                "client_request_id": client_request_id,
+            }
+
+        if pending_request_retry and is_frozen_source_retry(ctx, pending):
+            new_messages = deepcopy(pending["request_messages"])
+        new_messages = messages[pre_prompt_count:]
+        if pending_request_retry and pending.get("request_messages") != new_messages:
+            return {"ok": False, "status": "needs_confirmation", "retryable": False,
+                    "error": "the pending request source messages changed"}
+
+        if _ambiguous_pending_replay(pending, new_messages, client_request_id):
+            return {"ok": False, "status": "needs_confirmation", "retryable": False,
+                    "error": "a stable source ID is required to distinguish a pending replay from a new message"}
+        if not new_messages:
+            return _complete_request({"ok": True, "status": "no_new_messages"})
 
         request_session_time = None
         for msg in new_messages:
@@ -2344,62 +3939,156 @@ internal_tool_usage_tracker=self._internal_tool_usage,
 
         # Step 1: Accumulate in session buffer (lightweight, every turn)
         # Dedup: skip messages already written by ingest()
-        mgr = self.get_session_manager()
-        buf = mgr.get_or_create(session_id, ctx=ctx)
         from extraction.tool_collector import update_buffer_stats
-        # Snapshot buffer tail once to avoid TOCTOU race with concurrent ingest()
-        buf_snapshot = list(buf.messages[-len(new_messages):]) if buf.messages else []
-        for msg in new_messages:
-            role = msg.get("role", "user")
-            content_raw = msg.get("content", "")
-            parsed = extract_content_and_tool_calls(content_raw)
-            content = parsed["text"]
+        if not pending_request_retry:
+            # Snapshot buffer tail once to avoid TOCTOU race with concurrent ingest().
+            buf_snapshot = list(buf.messages[-len(new_messages):]) if buf.messages else []
+            for index, msg in enumerate(new_messages):
+                role = msg.get("role", "user")
+                content_raw = msg.get("content", "")
+                parsed = extract_content_and_tool_calls(content_raw)
+                content = parsed["text"]
+                message_id = msg.get("id") or (request_message_id(ctx, client_request_id, index)
+                                              if client_request_id else None)
+                if content and buf_snapshot and not msg.get("id"):
+                    for existing in buf_snapshot:
+                        if (existing.id not in buf.pending_extraction_ids()
+                                and (existing.id in buf.ingest_handoff_ids
+                                     or not existing.id.startswith("msg_request_"))
+                                and existing.role == role and existing.content == content):
+                            buf.ingest_handoff_ids.discard(existing.id)
+                            buf_snapshot.remove(existing)
+                            content = None
+                            break
+                if content:
+                    created_at = (
+                        msg.get("created_at")
+                        if isinstance(msg, dict)
+                        else getattr(msg, "created_at", None)
+                    )
+                    mgr.add_message(
+                        session_id,
+                        role,
+                        content,
+                        ctx,
+                        created_at=created_at,
+                        message_id=message_id,
+                    )
+                    buf.ingest_handoff_ids.discard(message_id)
+                if parsed["tool_calls"]:
+                    update_buffer_stats(
+                        buf.usage_stats,
+                        parsed["tool_calls"],
+                        session_id=session_id,
+                    )
 
-            # Dedup against ingest-written messages (match role+content in snapshot)
-            if content and buf_snapshot:
-                for existing in buf_snapshot:
-                    if existing.role == role and existing.content == content:
-                        content = None
-                        break
-
-            if content:
-                created_at = msg.get("created_at") if isinstance(msg, dict) else getattr(msg, "created_at", None)
-                mgr.add_message(session_id, role, content, ctx, created_at=created_at)
-            # Accumulate tool call metadata into buffer stats
-            if parsed["tool_calls"]:
-                update_buffer_stats(buf.usage_stats, parsed["tool_calls"], session_id=session_id)
 
         # Check pending_tokens
         session = mgr.get_session(session_id, ctx)
         pending_tokens = session.get("pending_tokens", 0)
+        force_extract = self._param_bool(
+            params, "forceExtract", "force_extract", default=False
+        )
 
-        if pending_tokens < threshold:
-            return {"ok": True, "status": "accumulating", "pending_tokens": pending_tokens}
+        if pending_tokens < threshold and not force_extract and not buf.pending_extraction_ids():
+            return _complete_request(
+                {"ok": True, "status": "accumulating", "pending_tokens": pending_tokens}
+            )
 
         # Step 2: Threshold reached → extract memories + write + index + archive
+        check_deadline()
         write_api = self.get_write_api()
         if write_api is None:
             logger.warning("after_turn: write API unavailable, session commit only")
-            result = mgr.commit(session_id, ctx, wait=False)
-            return {"ok": True, **result}
+            result = mgr.commit(session_id, ctx, wait=bool(client_request_id))
+            return _complete_request({"ok": True, **result})
+
+        checkpoint_enabled = isinstance(write_api, _CheckpointWriteAPI)
+        if checkpoint_enabled:
+            mgr.enable_extraction_recovery(session_id, ctx, write_api._fs)
+            if client_request_id and buf.request_completed(client_request_id):
+                return _complete_request({"ok": True, "status": "duplicate"})
 
         # Extract candidates → filter → write to AGFS → create OutboxEvents
         # Use INCREMENTAL messages (after watermark) + extraction summary
         buf = mgr.get_or_create(session_id, ctx=ctx)
         extraction_run_id = uuid4().hex[:12]
-        extraction_in_progress_before = buf.extraction_in_progress
-        extraction_state = self._build_incremental_extraction_state(buf)
-        incremental = extraction_state["incremental"]
+        extraction_claim = buf.claim_incremental_extraction()
+        extraction_in_progress_before = extraction_claim["extraction_in_progress_before"]
+        incremental = extraction_claim["incremental"]
+        if not incremental:
+            if extraction_in_progress_before:
+                return _complete_request({
+                    "ok": False,
+                    "status": "processing",
+                    "retryable": True,
+                    "pending_tokens": pending_tokens,
+                    "client_request_id": client_request_id,
+                })
+            return _complete_request(
+                {
+                    "ok": True,
+                    "status": "no_new_messages",
+                    "pending_tokens": pending_tokens,
+                }
+            )
+
+        try:
+            extraction_state = self._build_incremental_extraction_state(
+                buf,
+                incremental=incremental,
+            )
+            check_deadline()
+        except Exception:
+            buf.rewind_watermark_to_ids({message.id for message in incremental})
+            if extraction_claim["extraction_started"]:
+                buf.end_extraction()
+            raise
         archive_snapshot = list(incremental)
         archive_snapshot_ids = {m.id for m in archive_snapshot}
         extraction_messages = extraction_state["messages"]
-        original_extraction_watermark = buf.extraction_watermark
+        original_extraction_watermark = extraction_claim["original_watermark"]
 
         # Pre-generate archive_id so extraction and commit_snapshot share the
         # same provenance link. commit_session auto-generates when archive_id
         # is None, but after_turn must pass it explicitly across both calls.
         from session.session_manager import generate_archive_id
         archive_id = generate_archive_id()
+        extraction_journal = None
+        if checkpoint_enabled:
+            try:
+                extraction_journal = ExtractionBatchJournal(
+                    mgr, buf, ctx, archive_snapshot, archive_id=archive_id,
+                    messages=extraction_messages,
+                    session_time=extraction_state["session_time"] or request_session_time,
+                    session_summary=extraction_claim["extraction_summary"],
+                    tool_stats_text=extraction_state["tool_stats_text"],
+                    client_request_id=client_request_id, request_messages=new_messages)
+                archive_id = extraction_journal.batch["archive_id"]
+            except Exception as exc:
+                buf.rewind_watermark_to_ids(archive_snapshot_ids)
+                if extraction_claim["extraction_started"]:
+                    buf.end_extraction()
+                return {"ok": False, "status": "needs_confirmation" if isinstance(exc, RecoveryNeedsConfirmationError) else "failed",
+                        "error": str(exc), "retryable": not isinstance(exc, RecoveryNeedsConfirmationError)}
+
+        def _finish_archived_batch():
+            if extraction_journal is not None:
+                extraction_journal.finish()
+                return len(archive_snapshot)
+            removed = buf.remove_messages_by_id(archive_snapshot_ids)
+            if removed:
+                mgr.save_session_state(session_id, ctx)
+            return removed
+
+        def _completion_status():
+            if (extraction_journal is not None
+                    and client_request_id != extraction_journal_request_id and buf.messages):
+                return "accumulating"
+            return "completed"
+
+        extraction_journal_request_id = (extraction_journal.batch.get("client_request_id", "")
+                                         if extraction_journal is not None else client_request_id)
 
         def _rewind_failed_archive_watermark() -> bool:
             rewound = buf.rewind_watermark_to_ids(archive_snapshot_ids)
@@ -2415,7 +4104,7 @@ internal_tool_usage_tracker=self._internal_tool_usage,
             session_id[:8],
             pending_tokens,
             len(buf.messages),
-            buf.extraction_watermark,
+            original_extraction_watermark,
             len(incremental),
             len(extraction_messages),
             getattr(buf, "extraction_active_count", 0),
@@ -2431,14 +4120,19 @@ internal_tool_usage_tracker=self._internal_tool_usage,
                 getattr(buf, "extraction_active_count", 0),
             )
         if not extraction_messages:
-            buf.extraction_watermark = len(buf.messages)
-            drain_stats = self.drain_outbox_sync(account_id=ctx.account_id)
-            commit_result = mgr.commit_snapshot(session_id, archive_snapshot, ctx, wait=True, archive_id=archive_id)
+            try:
+                check_deadline()
+                drain_stats = self.drain_outbox_sync(account_id=ctx.account_id)
+                check_deadline()
+                commit_result = mgr.commit_snapshot(session_id, archive_snapshot, ctx, wait=True, archive_id=archive_id)
+            except OperationDeadlineExceededError:
+                _rewind_failed_archive_watermark()
+                if extraction_claim["extraction_started"]:
+                    buf.end_extraction()
+                raise
             removed = 0
             if commit_result.get("archived"):
-                removed = buf.remove_messages_by_id(archive_snapshot_ids)
-                if removed:
-                    mgr.save_session_state(session_id, ctx)
+                removed = _finish_archived_batch()
             logger.info(
                 "after_turn no-extractable snapshot commit: run=%s session=%s "
                 "archived=%s removed=%d reason=%s",
@@ -2466,13 +4160,15 @@ internal_tool_usage_tracker=self._internal_tool_usage,
                     "commit": commit_result,
                     "extraction_run_id": extraction_run_id,
                 }
-            return {
-                "ok": True,
-                "status": "no_extractable_messages",
-                "drain": drain_stats,
-                "commit": commit_result,
-                "extraction_run_id": extraction_run_id,
-            }
+            return _complete_request(
+                {
+                    "ok": True,
+                    "status": "no_extractable_messages",
+                    "drain": drain_stats,
+                    "commit": commit_result,
+                    "extraction_run_id": extraction_run_id,
+                }
+            )
 
         # Keep the upstream async after_turn behavior, but source extraction
         # inputs from the shared incremental-state helper so after_turn and
@@ -2480,11 +4176,9 @@ internal_tool_usage_tracker=self._internal_tool_usage,
         tool_stats_text = extraction_state["tool_stats_text"]
         session_time = extraction_state["session_time"] or request_session_time
         extraction_watermark = original_extraction_watermark
-        extraction_summary = buf.extraction_summary
-        buf.extraction_watermark = len(buf.messages)
+        extraction_summary = extraction_claim["extraction_summary"]
 
         import time as _time
-        buf.begin_extraction()
 
         def _background_extract_write():
             start_time = _time.monotonic()
@@ -2499,6 +4193,7 @@ internal_tool_usage_tracker=self._internal_tool_usage,
                     extraction_run_id=extraction_run_id,
                     session_id=session_id,
                     archive_id=archive_id,
+                    extraction_journal=extraction_journal,
                 )
                 if self._write_result_has_failures(write_result):
                     raise RuntimeError("memory extraction write failed")
@@ -2554,9 +4249,7 @@ internal_tool_usage_tracker=self._internal_tool_usage,
                         commit_result.get("error", "archive commit failed"),
                     )
                 elif commit_result.get("archived"):
-                    removed = buf.remove_messages_by_id(archive_snapshot_ids)
-                    if removed:
-                        mgr.save_session_state(session_id, ctx)
+                    removed = _finish_archived_batch()
                 logger.info(
                     "after_turn background snapshot commit done: run=%s session=%s "
                     "archived=%s reason=%s removed=%d buffer_len=%d watermark=%d",
@@ -2568,18 +4261,49 @@ internal_tool_usage_tracker=self._internal_tool_usage,
                     len(buf.messages),
                     buf.extraction_watermark,
                 )
+                if commit_result.get("status") != "failed":
+                    _complete_request({"ok": True, "status": "completed"})
             except Exception as exc:
                 rewound = buf.rewind_watermark_to_ids(archive_snapshot_ids)
+                self._queue_card_format_recovery(
+                    ctx, exc, archive_id=archive_id, client_request_id=extraction_journal_request_id)
                 logger.error(
                     "after_turn background extract failed for run=%s session=%s "
                     "rewound=%s: %s",
                     extraction_run_id, session_id[:8], rewound, exc, exc_info=True,
                 )
+                if (isinstance(exc, (ExtractionIncompleteError, ToolCallProtocolError, SessionMutationBusyError))
+                        and not isinstance(exc, OperationDeadlineExceededError)):
+                    self._extraction_retry.register_background_failure(ctx, extraction_journal, exc)
             finally:
                 buf.end_extraction()
 
-        if self._param_bool(params, "wait", "wait", default=False):
+        def _background_owned():
+            """The child acquires its own connection after the HTTP handoff."""
+            ran = False
             try:
+                with self._session_mutation_scope(ctx) as guard:
+                    if guard is not None and extraction_journal is not None:
+                        latest = buf.runtime_extensions.get("memory_extraction_recovery", {}).get("batch", {})
+                        if latest.get("archive_id") != archive_id:
+                            if archive_snapshot_ids.intersection(message.id for message in buf.messages):
+                                raise RecoveryNeedsConfirmationError("the scheduled source batch changed")
+                            # Another fenced worker durably finished the original source.
+                            return
+                    ran = True
+                    _background_extract_write()
+                if guard is not None and guard.post_commit_drain:
+                    self._async_drain(account_id=ctx.account_id)
+            except Exception as exc:
+                logger.error("fenced background extraction stopped session=%s: %s", session_id[:8], exc)
+                self._extraction_retry.wake(ctx, pending_task or {})
+            finally:
+                if not ran:
+                    buf.end_extraction()
+
+        def _extract_synchronously():
+            try:
+                check_deadline()
                 write_result = self._chunk_and_extract(
                     messages=extraction_messages,
                     write_api=write_api,
@@ -2590,6 +4314,7 @@ internal_tool_usage_tracker=self._internal_tool_usage,
                     extraction_run_id=extraction_run_id,
                     session_id=session_id,
                     archive_id=archive_id,
+                    extraction_journal=extraction_journal,
                 )
                 if self._write_result_has_failures(write_result):
                     rewound = _rewind_failed_archive_watermark()
@@ -2606,6 +4331,8 @@ internal_tool_usage_tracker=self._internal_tool_usage,
                         "ok": False,
                         "status": "failed",
                         "error": "memory extraction write failed",
+                        "retryable": (extraction_journal is not None
+                                      and extraction_journal.has_retryable_write_failure()),
                         "commit": None,
                         "extraction_run_id": extraction_run_id,
                     }
@@ -2614,7 +4341,9 @@ internal_tool_usage_tracker=self._internal_tool_usage,
                     buf.extraction_summary = _update_extraction_summary(
                         buf.extraction_summary, write_result
                     )
+                check_deadline()
                 drain_stats = self.drain_outbox_sync(account_id=ctx.account_id)
+                check_deadline()
                 commit_result = mgr.commit_snapshot(
                     session_id,
                     archive_snapshot,
@@ -2622,7 +4351,6 @@ internal_tool_usage_tracker=self._internal_tool_usage,
                     wait=True,
                     archive_id=archive_id,
                 )
-                removed = 0
                 if commit_result.get("status") == "failed":
                     rewound = _rewind_failed_archive_watermark()
                     logger.error(
@@ -2643,19 +4371,27 @@ internal_tool_usage_tracker=self._internal_tool_usage,
                         "extraction_run_id": extraction_run_id,
                     }
                 if commit_result.get("archived"):
-                    removed = buf.remove_messages_by_id(archive_snapshot_ids)
-                    if removed:
-                        mgr.save_session_state(session_id, ctx)
-                return {
-                    "ok": True,
-                    **write_result,
-                    "status": "completed",
-                    "extraction_run_id": extraction_run_id,
-                    "drain": drain_stats,
-                    "commit": commit_result,
-                }
+                    _finish_archived_batch()
+                return _complete_request(
+                    {
+                        "ok": True,
+                        **write_result,
+                        "status": _completion_status(),
+                        "extraction_run_id": extraction_run_id,
+                        "drain": drain_stats,
+                        "commit": commit_result,
+                    }
+                )
             except Exception as exc:
                 rewound = _rewind_failed_archive_watermark()
+                if (isinstance(exc, SessionMutationBusyError) and extraction_journal is not None
+                        and is_frozen_source_retry(ctx, extraction_journal.batch)):
+                    return {"ok": False, "status": "processing", "retryable": True,
+                            "error": str(exc), "extraction_run_id": extraction_run_id}
+                queued = self._queue_card_format_recovery(
+                    ctx, exc, archive_id=archive_id, client_request_id=extraction_journal_request_id)
+                if queued is not None:
+                    return {**queued, "extraction_run_id": extraction_run_id}
                 logger.error(
                     "after_turn wait extraction failed for run=%s session=%s "
                     "rewound=%s: %s",
@@ -2667,22 +4403,41 @@ internal_tool_usage_tracker=self._internal_tool_usage,
                 )
                 return {
                     "ok": False,
-                    "status": "failed",
+                    "status": "needs_confirmation" if isinstance(exc, (RecoveryNeedsConfirmationError, WriteOutcomeUnknownError)) else "failed",
                     "error": str(exc),
+                    "retryable": not isinstance(exc, (RecoveryNeedsConfirmationError, WriteOutcomeUnknownError)),
                     "extraction_run_id": extraction_run_id,
+                    "failure_kind": ("memory_card_format" if isinstance(exc, MemoryCardFormatError) else
+                                     "llm_transient" if isinstance(exc, LLMTransientError) else ""),
                 }
             finally:
                 buf.end_extraction()
 
+        if (client_request_id and not automatic_card_identity) or self._param_bool(params, "wait", "wait", default=False):
+            result = _extract_synchronously()
+            if result.get("ok") is False and extraction_journal is not None:
+                result.update(extraction_archive_id=archive_id,
+                              client_request_id=extraction_journal_request_id)
+            return result
+
+        try:
+            pending_task = self._extraction_retry.register_pending_source(ctx, extraction_journal)
+            if extraction_journal is not None:
+                extraction_journal_request_id = extraction_journal.batch.get("client_request_id", "")
+        except Exception as exc:
+            _rewind_failed_archive_watermark()
+            buf.end_extraction()
+            logger.exception("Cannot register background extraction session=%s", session_id[:8])
+            return {"ok": False, "status": "failed", "retryable": True, "error": str(exc),
+                    "extraction_archive_id": archive_id, "client_request_id": extraction_journal_request_id}
         try:
             t = threading.Thread(
-                target=_background_extract_write, daemon=True,
+                target=lambda: _run_with_usage_scope(ctx, _background_owned),
+                daemon=True,
                 name=f"extract-{session_id[:8]}",
             )
             t.start()
         except Exception as exc:
-            # Thread spawn failed — fall back to synchronous (better than losing data)
-            buf.end_extraction()
             logger.error(
                 "Failed to spawn background extract thread: run=%s session=%s %s",
                 extraction_run_id,
@@ -2690,88 +4445,13 @@ internal_tool_usage_tracker=self._internal_tool_usage,
                 exc,
                 exc_info=True,
             )
-            # Sync fallback: use chunking-aware extraction
-            write_result = self._chunk_and_extract(
-                messages=extraction_messages,
-                write_api=write_api,
-                ctx=ctx,
-                session_time=session_time,
-                session_summary=extraction_summary,
-                tool_stats_text=tool_stats_text,
-                extraction_run_id=extraction_run_id,
-                session_id=session_id,
-                archive_id=archive_id,
-            )
-            if self._write_result_has_failures(write_result):
-                rewound = _rewind_failed_archive_watermark()
-                logger.error(
-                    "after_turn sync extraction write failed: "
-                    "run=%s session=%s rewound=%s write_result=%s",
-                    extraction_run_id,
-                    session_id[:8],
-                    rewound,
-                    write_result,
-                )
-                return {
-                    **write_result,
-                    "ok": False,
-                    "status": "failed",
-                    "error": "memory extraction write failed",
-                    "commit": None,
-                    "extraction_run_id": extraction_run_id,
-                }
-            buf.extraction_watermark = len(buf.messages)
-            self._invalidate_identity_cache_if_profile_written(session_id, write_result)
-            if write_result.get("candidates_extracted", 0) > 0:
-                buf.extraction_summary = _update_extraction_summary(
-                    buf.extraction_summary, write_result
-                )
-            try:
-                self._async_drain()
-            except Exception:
-                pass
-            commit_result = mgr.commit_snapshot(session_id, archive_snapshot, ctx, wait=True, archive_id=archive_id)
-            removed = 0
-            if commit_result.get("status") == "failed":
-                rewound = _rewind_failed_archive_watermark()
-                logger.error(
-                    "after_turn sync snapshot commit failed: "
-                    "run=%s session=%s rewound=%s error=%s",
-                    extraction_run_id,
-                    session_id[:8],
-                    rewound,
-                    commit_result.get("error", "archive commit failed"),
-                )
-                return {
-                    **write_result,
-                    "ok": False,
-                    "status": "failed",
-                    "error": commit_result.get("error", "archive commit failed"),
-                    "commit": commit_result,
-                    "extraction_run_id": extraction_run_id,
-                }
-            if commit_result.get("archived"):
-                removed = buf.remove_messages_by_id(archive_snapshot_ids)
-                if removed:
-                    mgr.save_session_state(session_id, ctx)
-            logger.info(
-                "after_turn sync snapshot commit done: run=%s session=%s "
-                "archived=%s removed=%d reason=%s",
-                extraction_run_id,
-                session_id[:8],
-                commit_result.get("archived"),
-                removed,
-                commit_result.get("reason", ""),
-            )
-            return {
-                "ok": True,
-                "status": "completed",
-                "extraction_run_id": extraction_run_id,
-                **write_result,
-            }
+            return _extract_synchronously()
 
         return {"ok": True, "status": "processing", "extraction_run_id": extraction_run_id}
 
+
+    @_attribute_request_usage
+    @_guard_session_mutation
     def ingest(self, params: dict) -> dict:
         """Ingest messages into the session buffer.
 
@@ -2783,27 +4463,96 @@ internal_tool_usage_tracker=self._internal_tool_usage,
         messages = params.get("messages", [])
         if not messages:
             return {"ingested": True}
-
         ctx = params.get("_ctx") or self.build_context(params)
+        try:
+            self._load_extraction_recovery_before_accumulation(session_id, ctx)
+        except SessionOperationInProgress:
+            raise
+        except Exception as exc:
+            return {"ok": False, "ingested": False, "status": "needs_confirmation", "retryable": False,
+                    "error": "durable extraction state unavailable: " + str(exc)}
         mgr = self.get_session_manager()
+        buf = mgr.get_or_create(session_id, ctx=ctx)
+        with buf.extraction_lock:
+            if buf.lifecycle_prepare_in_progress:
+                return {"ok": False, "ingested": False, "status": "processing", "retryable": True,
+                        "reason": "lifecycle_preparing"}
+            if lifecycle_kind(buf) is not None:
+                return {"ok": False, "ingested": False, "status": "needs_confirmation", "retryable": False,
+                        "error": "resume the pending lifecycle batch before ingest"}
+            buf.begin_operation()
+            buf.ordinary_turns_in_progress += 1
+        try:
+            return self._ingest_source_impl(params, messages, ctx, session_id, mgr)
+        finally:
+            with buf.extraction_lock:
+                buf.ordinary_turns_in_progress -= 1
+                buf.end_operation()
 
+
+    def _ingest_source_impl(self, params, messages, ctx, session_id, mgr):
+        client_request_id = str(params.get("clientRequestId") or params.get("client_request_id") or "").strip()
+        if len(client_request_id) > 128:
+            raise ValueError("client_request_id must be at most 128 characters")
+        buf = mgr.get_or_create(session_id, ctx=ctx)
+        pending = buf.runtime_extensions.get("memory_extraction_recovery", {}).get("batch", {})
+        if client_request_id and pending.get("client_request_id") == client_request_id:
+            if pending.get("request_messages") == messages:
+                return {"ingested": True, "count": 0}
+            return {"ok": False, "ingested": False, "status": "needs_confirmation", "retryable": False,
+                    "error": "the pending request source messages changed"}
+        if _ambiguous_pending_replay(pending, messages, client_request_id):
+            return {"ok": False, "ingested": False, "status": "needs_confirmation", "retryable": False,
+                    "error": "ingest requires a stable source ID to distinguish a pending replay from a new message"}
         count = 0
-        for msg in messages:
+        for index, msg in enumerate(messages):
             role = msg.get("role", "user") if isinstance(msg, dict) else getattr(msg, "role", "user")
             content_raw = msg.get("content", "") if isinstance(msg, dict) else getattr(msg, "content", "")
             content = extract_content_and_tool_calls(content_raw).get("text", "")
             created_at = msg.get("created_at") if isinstance(msg, dict) else getattr(msg, "created_at", None)
             if content:
-                mgr.add_message(session_id, role, content, ctx, created_at=created_at)
+                message_id = (msg.get("id") if isinstance(msg, dict) else getattr(msg, "id", None))
+                message_id = message_id or (request_message_id(ctx, client_request_id, index)
+                                            if client_request_id else None)
+                added = mgr.add_message(session_id, role, content, ctx, created_at=created_at, message_id=message_id)
+                with buf.extraction_lock:
+                    buf.ingest_handoff_ids.add(added["message_id"])
                 count += 1
-
         return {"ingested": True, "count": count}
 
+
+    @_attribute_request_usage
     def ingest_batch(self, params: dict) -> dict:
         """Batch ingest — same as ingest() for multiple messages."""
         return self.ingest(params)
 
+    @_guard_session_mutation
     def compact(self, params: dict) -> dict:
+        """Run the complete compaction flow under the shared session operation guard."""
+        if params.get("prepared") and not params.get("prepareToken"):
+            raise ValueError("prepare token required when prepared=true")
+        session_id = params.get("sessionId", "unknown")
+        ctx = params.get("_ctx") or self.build_context(params)
+        try:
+            self._load_extraction_recovery_before_accumulation(session_id, ctx)
+        except SessionOperationInProgress:
+            raise
+        except Exception as exc:
+            return {"ok": False, "compacted": False, "status": "needs_confirmation",
+                    "retryable": False, "error": "durable extraction state unavailable: " + str(exc)}
+        buf = self.get_session_manager().begin_managed_operation(session_id, ctx)
+        try:
+            with buf.lifecycle_lock:
+                return self._compact_impl(params)
+        except (RecoveryNeedsConfirmationError, WriteOutcomeUnknownError) as exc:
+            return {"ok": False, "compacted": False, "status": "needs_confirmation",
+                    "retryable": False, "error": str(exc)}
+        except RecoveryPersistenceError as exc:
+            return {"ok": False, "compacted": False, "status": "failed", "retryable": True, "error": str(exc)}
+        finally:
+            buf.end_operation()
+
+    def _compact_impl(self, params: dict) -> dict:
         """Compact session: commit synchronously, return compressed context."""
         prepare_token = params.get("prepareToken")
         prepared_flag = bool(params.get("prepared"))
@@ -2823,19 +4572,28 @@ internal_tool_usage_tracker=self._internal_tool_usage,
         tokens_before = session.get("pending_tokens", 0)
 
         # Commit synchronously (wait=true)
-        commit_result = mgr.commit(
-            session_id,
-            ctx,
-            wait=True,
-            archive_id=prepared.get("archive_id"),
-        )
+        journal = prepared.get("_lifecycle_journal")
+        if journal is not None:
+            commit_result = mgr.commit_snapshot(session_id, journal.snapshot, ctx, wait=True,
+                                                 archive_id=journal.batch["archive_id"],
+                                                 archive_checkpoint=journal)
+            if commit_result.get("archived") and commit_result.get("status") == "completed":
+                try:
+                    journal.finish(reset_window_state=True)
+                except Exception as exc:
+                    return {"ok": False, "compacted": False, "status": "failed",
+                            "retryable": True, "error": str(exc), "commit": commit_result}
+        else:
+            commit_result = mgr.commit(
+                session_id, ctx, wait=True, archive_id=prepared.get("archive_id"))
 
-        if not commit_result.get("archived"):
-            if commit_result.get("status") == "failed":
+        if not commit_result.get("archived") or commit_result.get("status") in {"failed", "needs_confirmation"}:
+            if commit_result.get("status") in {"failed", "needs_confirmation"}:
                 return {
                     "ok": False,
                     "compacted": False,
-                    "status": "failed",
+                    "status": commit_result["status"],
+                    "retryable": commit_result["status"] != "needs_confirmation",
                     "error": commit_result.get("error", "archive commit failed"),
                     "commit": commit_result,
                     "result": {
@@ -2906,20 +4664,39 @@ internal_tool_usage_tracker=self._internal_tool_usage,
         ctx = params.get("_ctx") or self.build_context(params)
         mgr = self.get_session_manager()
         buf = mgr.get_or_create(session_id, ctx=ctx)
-        extraction_state = self._build_incremental_extraction_state(buf)
+        kind = lifecycle_kind(buf)
+        if buf.pending_extraction_ids() and kind != "compaction":
+            return {"ok": False, "status": "needs_confirmation", "retryable": False,
+                    "session_id": session_id,
+                    "error": "resume the pending memory batch before compaction"}
+        with buf.extraction_lock:
+            if kind == "compaction":
+                batch = buf.runtime_extensions[EXTENSION_KEY]["batch"]
+                source_snapshot = buf.capture_lifecycle_source(
+                    [SessionMessage(**value) for value in batch["snapshot"]])
+                extraction_state = {"incremental": source_snapshot,
+                                    "messages": deepcopy(batch["messages"]),
+                                    "session_time": _parse_session_time(batch.get("session_time")),
+                                    "tool_stats_text": batch["tool_stats_text"]}
+            else:
+                source_snapshot = buf.capture_lifecycle_source()
+                extraction_state = self._build_incremental_extraction_state(
+                    buf, incremental=source_snapshot[buf.extraction_watermark:])
 
         result = {
             "session_id": session_id,
             "ctx": ctx,
             "mgr": mgr,
             "buffer": buf,
+            "source_snapshot": source_snapshot,
             **extraction_state,
         }
 
         return result
 
-    def _build_incremental_extraction_state(self, buf) -> dict:
-        incremental = buf.messages[buf.extraction_watermark:]
+    def _build_incremental_extraction_state(self, buf, incremental=None) -> dict:
+        if incremental is None:
+            incremental = buf.messages[buf.extraction_watermark:]
         extraction_messages = [
             {"role": message.role, "content": message.content, "id": message.id}
             for message in incremental
@@ -2957,7 +4734,17 @@ internal_tool_usage_tracker=self._internal_tool_usage,
 
     def _consume_prepared_compaction_state(self, params: dict, prepare_token: str) -> dict:
         result = self._build_compaction_state(params)
+        if result.get("ok") is False:
+            return result
         ttl_seconds = _positive_int(getattr(self._cfg, "compact_prepare_token_ttl", 300), 300)
+        if lifecycle_kind(result["buffer"]) == "compaction":
+            journal = self._compaction_journal(result)
+            prepared = journal.prepare_state(ttl_seconds)
+            if prepared is None or prepared["prepareToken"] != prepare_token:
+                raise ValueError("invalid prepare token")
+            result.update(prepared)
+            result["_lifecycle_journal"] = journal
+            return result
         archive_id = result["mgr"].get_compaction_prepare_archive_id(result["session_id"])
         if not result["mgr"].consume_compaction_prepare_token(
             result["session_id"],
@@ -3016,13 +4803,76 @@ internal_tool_usage_tracker=self._internal_tool_usage,
         if self._write_result_updates_profile(write_result):
             self.get_session_manager().invalidate_topic_slot(session_id, "identity")
 
+    @_guard_session_mutation
     def prepare_compaction(self, params: dict) -> dict:
+        """Prepare extraction while preventing lifecycle cleanup from interleaving."""
+        session_id = params.get("sessionId", "unknown")
+        ctx = params.get("_ctx") or self.build_context(params)
+        try:
+            self._load_extraction_recovery_before_accumulation(session_id, ctx)
+        except SessionOperationInProgress:
+            raise
+        except Exception as exc:
+            return {"ok": False, "status": "needs_confirmation", "retryable": False,
+                    "error": "durable extraction state unavailable: " + str(exc)}
+        buf = self.get_session_manager().begin_managed_operation(session_id, ctx)
+        try:
+            with buf.lifecycle_lock:
+                with buf.lifecycle_source_scope() as conflict:
+                    if conflict is not None:
+                        return {"ok": False, "status": "processing", "retryable": True,
+                                "session_id": session_id, "reason": conflict}
+                    buf.begin_extraction()
+                    try:
+                        return self._prepare_compaction_impl(params)
+                    finally:
+                        buf.end_extraction()
+        except (RecoveryNeedsConfirmationError, WriteOutcomeUnknownError) as exc:
+            return {"ok": False, "status": "needs_confirmation", "retryable": False, "error": str(exc)}
+        except RecoveryPersistenceError as exc:
+            return {"ok": False, "status": "failed", "retryable": True, "error": str(exc)}
+        finally:
+            buf.end_operation()
+
+    def _prepare_compaction_impl(self, params: dict) -> dict:
         """Prepare incremental extraction state before compact commit."""
         result = self._build_compaction_state(params)
+        if result.get("ok") is False:
+            return result
         result["mgr"].load_session_state(result["session_id"], result["ctx"])
         buf = result["buffer"]
         incremental = result["incremental"]
         ttl_seconds = _positive_int(getattr(self._cfg, "compact_prepare_token_ttl", 300), 300)
+
+        from service.api import MemoryWriteAPI as _CheckpointWriteAPI
+        write_api = self.get_write_api() if result["messages"] else self._write_api
+        if (lifecycle_kind(buf) == "compaction"
+                or isinstance(write_api, _CheckpointWriteAPI) and result["source_snapshot"]):
+            journal = self._compaction_journal(result)
+            result["archive_id"] = journal.batch["archive_id"]
+            result["_lifecycle_journal"] = journal
+            prepared = journal.prepare_state(ttl_seconds)
+            if prepared is not None:
+                result.update(prepared)
+                return result
+            if journal.batch["messages"]:
+                write_result = self._chunk_and_extract(
+                    messages=journal.batch["messages"], write_api=write_api, ctx=result["ctx"],
+                    session_time=result["session_time"], session_summary=journal.batch["session_summary"],
+                    tool_stats_text=journal.batch["tool_stats_text"], extraction_run_id="prepare_compaction",
+                    session_id=result["session_id"], archive_id=journal.batch["archive_id"],
+                    extraction_journal=journal)
+                if self._write_result_has_failures(write_result):
+                    raise RuntimeError("compaction extraction write failed")
+                self._invalidate_identity_cache_if_profile_written(result["session_id"], write_result)
+                if write_result.get("candidates_extracted", 0) > 0:
+                    buf.extraction_summary = _update_extraction_summary(buf.extraction_summary, write_result)
+                result["write_result"] = write_result
+            result["prepareToken"] = journal.issue_prepare_token()
+            source_ids = set(journal.batch["message_ids"])
+            buf.extraction_watermark = max((index + 1 for index, message in enumerate(buf.messages)
+                                           if message.id in source_ids), default=buf.extraction_watermark)
+            return result
 
         existing_prepare = result["mgr"].get_compaction_prepare_state(
             result["session_id"],
@@ -3034,7 +4884,7 @@ internal_tool_usage_tracker=self._internal_tool_usage,
             return result
 
         from session.session_manager import generate_archive_id
-        archive_id = generate_archive_id()
+        archive_id = result["mgr"].get_compaction_prepare_archive_id(result["session_id"]) or generate_archive_id()
         result["archive_id"] = archive_id
 
         if not incremental:
@@ -3084,6 +4934,18 @@ internal_tool_usage_tracker=self._internal_tool_usage,
         result["write_result"] = write_result
         return result
 
+    def _compaction_journal(self, result):
+        from session.session_manager import generate_archive_id
+        buf = result["buffer"]
+        pending = buf.runtime_extensions.get("memory_extraction_recovery", {}).get("batch")
+        snapshot = result["source_snapshot"]
+        return LifecycleBatchJournal(result["mgr"], buf, result["ctx"], snapshot,
+            kind="compaction", archive_id=(pending["archive_id"] if pending
+                else buf.compaction_prepare_archive_id or generate_archive_id()),
+            messages=result["messages"],
+            session_time=result["session_time"], session_summary=buf.extraction_summary,
+            tool_stats_text=result["tool_stats_text"])
+
     def bootstrap(self, params: dict) -> dict:
         return {"bootstrapped": True}
 
@@ -3093,137 +4955,385 @@ internal_tool_usage_tracker=self._internal_tool_usage,
     def on_subagent_ended(self, params: dict) -> dict:
         return {"cleaned": True}
 
+    def _save_dispose_snapshot(self, mgr, session_id, params, buf, snapshot_ids):
+        with buf.session_state_save_lock, mgr._lock, buf.extraction_lock:
+            rollback = buf.capture_rollback_state()
+            try:
+                buf.remove_messages_by_id(snapshot_ids)
+                self._save_session_state_best_effort(mgr, session_id, params)
+            except Exception:
+                buf.restore_rollback_state(rollback)
+                buf.rewind_watermark_to_ids(snapshot_ids)
+                raise
+
+    def _run_dispose_background(self, mgr, session_id: str, params: dict, ctx, buf, source_snapshot=None, operation=None) -> None:
+        try:
+            from service.api import MemoryWriteAPI
+            fs = self._write_api._fs if isinstance(self._write_api, MemoryWriteAPI) else None
+            if (not self._use_sql and not callable(getattr(type(fs), "session_mutation_lock", None))
+                    and not callable(getattr(type(fs), "session_recovery_lock", None))):
+                with buf.lifecycle_lock:
+                    _run_with_usage_scope(ctx, self._run_dispose_background_impl,
+                                          mgr, session_id, params, ctx, buf, source_snapshot)
+                return
+            try:
+                effective_ctx = ctx or self.build_context(params)
+                while True:
+                    # The ordinary extraction worker needs its own SQL connection.
+                    # Never wait for its event while holding the session advisory lock.
+                    with buf.extraction_lock:
+                        event = buf.extraction_done_event if buf.extraction_in_progress else None
+                    if event is not None and not event.wait(timeout=600):
+                        return
+                    with self._session_mutation_scope(effective_ctx) as guard:
+                        # An ordinary worker may have started before acquisition.
+                        # Release ownership and wait outside it before taking source.
+                        with buf.extraction_lock:
+                            extraction_active = buf.extraction_in_progress
+                        if extraction_active:
+                            continue
+                        with buf.lifecycle_lock:
+                            _run_with_usage_scope(effective_ctx, self._run_dispose_background_impl,
+                                                  mgr, session_id, params, effective_ctx, buf, source_snapshot)
+                        if guard is not None:
+                            guard.ensure_owned()
+                    if guard is not None and guard.post_commit_drain:
+                        self._async_drain(account_id=effective_ctx.account_id)
+                    break
+            except Exception as exc:
+                logger.error("fenced dispose stopped session=%s: %s", session_id[:8], exc)
+        finally:
+            if operation is not None:
+                operation.release()
+
+    def _dispose_journal(self, mgr, buf, ctx, snapshot):
+        from session.session_manager import generate_archive_id
+        state = self._build_incremental_extraction_state(buf, incremental=snapshot)
+        pending = buf.runtime_extensions.get("memory_extraction_recovery", {}).get("batch")
+        return LifecycleBatchJournal(mgr, buf, ctx, snapshot, kind="dispose",
+            archive_id=pending["archive_id"] if pending else generate_archive_id(), messages=state["messages"],
+            session_time=state["session_time"], session_summary=buf.extraction_summary,
+            tool_stats_text=state["tool_stats_text"])
+
+    def _prepare_dispose_source(self, mgr, buf, ctx, params):
+        from service.api import MemoryWriteAPI as _CheckpointWriteAPI
+
+        with buf.lifecycle_lock:
+            with buf.extraction_lock:
+                if buf.extraction_in_progress:
+                    return {"source_snapshot": None}
+                pending_ids = buf.pending_extraction_ids()
+                snapshot = buf.capture_lifecycle_source(
+                    [message for message in buf.messages if message.id in pending_ids]
+                    if pending_ids else buf.messages[buf.extraction_watermark:])
+                durable_flush = (snapshot and sum(len(message.content) // 4 for message in snapshot) >= 200
+                                 and any(message.role != "assistant" for message in snapshot))
+            if durable_flush and (isinstance(self._write_api, _CheckpointWriteAPI)
+                    or getattr(self.get_write_api, "__func__", None) is MemoryService.get_write_api):
+                write_api = self.get_write_api()
+                if isinstance(write_api, _CheckpointWriteAPI):
+                    ctx = ctx or self.build_context(params)
+                    self._load_extraction_recovery_before_accumulation(buf.session_id, ctx)
+                    self._dispose_journal(mgr, buf, ctx, snapshot)
+            return {"source_snapshot": snapshot}
+
+    def _run_dispose_background_impl(self, mgr, session_id: str, params: dict, ctx, buf, source_snapshot=None) -> None:
+        snapshot_ids: set[str] = set()
+        extraction_started = False
+        succeeded = False
+        effective_ctx = ctx
+        journal = None
+        source_stack = ExitStack()
+        try:
+            with buf.extraction_lock:
+                event = buf.extraction_done_event if buf.extraction_in_progress else None
+            if event is not None:
+                from fs.sql_adapter.session_mutation import active_session_guard
+                if active_session_guard() is not None:
+                    logger.warning("dispose source became active; preserving pending session=%s", session_id[:8])
+                    return
+                event.wait(timeout=600)
+                with buf.extraction_lock:
+                    if buf.extraction_in_progress:
+                        logger.warning(
+                            "dispose: extraction still active after timeout; keeping session=%s",
+                            session_id[:8],
+                        )
+                        return
+
+            with buf.extraction_lock:
+                if buf.pending_extraction_ids() and lifecycle_kind(buf) != "dispose":
+                    return
+            conflict = source_stack.enter_context(buf.lifecycle_source_scope())
+            if conflict is not None:
+                logger.warning("dispose source preparation busy session=%s: %s", session_id[:8], conflict)
+                return
+
+            with buf.extraction_lock:
+                original_watermark = buf.extraction_watermark
+                pending_ids = buf.pending_extraction_ids()
+                snapshot = buf.capture_lifecycle_source(
+                    [SessionMessage(**value) for value in buf.runtime_extensions[EXTENSION_KEY]["batch"]["snapshot"]]
+                    if pending_ids else source_snapshot if source_snapshot is not None
+                    else buf.messages[original_watermark:])
+                snapshot_ids = {message.id for message in snapshot}
+                pending_tokens = sum(len(message.content) // 4 for message in snapshot)
+                extraction_messages = [
+                    {"role": message.role, "content": message.content}
+                    for message in snapshot
+                    if message.role != "assistant"
+                ]
+                if snapshot:
+                    buf.extraction_watermark = max(index + 1 for index, message in enumerate(buf.messages)
+                                                   if message.id in snapshot_ids)
+                if pending_tokens >= 200 and extraction_messages:
+                    buf.begin_extraction()
+                    extraction_started = True
+                    extraction_summary = buf.extraction_summary
+
+            if pending_tokens >= 200 and extraction_messages:
+                write_api = self.get_write_api()
+                if write_api is None:
+                    raise RuntimeError("dispose write API unavailable")
+                effective_ctx = ctx or self.build_context(params)
+                from service.api import MemoryWriteAPI as _CheckpointWriteAPI
+                if isinstance(write_api, _CheckpointWriteAPI):
+                    journal = self._dispose_journal(mgr, buf, effective_ctx, snapshot)
+                    extraction_messages = journal.batch["messages"]
+                tool_stats_text = ""
+                try:
+                    from extraction.tool_collector import format_tool_stats_text
+
+                    tool_stats_text = format_tool_stats_text(buf.usage_stats)
+                except Exception:
+                    pass
+                run_id = f"dispose-{uuid4().hex[:12]}"
+                write_result = self._chunk_and_extract(
+                    messages=extraction_messages,
+                    write_api=write_api,
+                    ctx=effective_ctx,
+                    session_time=None,
+                    session_summary=extraction_summary,
+                    tool_stats_text=tool_stats_text,
+                    extraction_run_id=run_id,
+                    session_id=session_id,
+                    archive_id=journal.batch["archive_id"] if journal is not None else None,
+                    extraction_journal=journal,
+                )
+                if self._write_result_has_failures(write_result):
+                    raise RuntimeError("dispose extraction write failed")
+                self._invalidate_identity_cache_if_profile_written(session_id, write_result)
+                self.drain_outbox_sync(account_id=effective_ctx.account_id)
+                if journal is not None:
+                    journal.finish()
+                else:
+                    self._save_dispose_snapshot(mgr, session_id, params, buf, snapshot_ids)
+                succeeded = True
+                logger.info(
+                    "dispose background flush done: run=%s session=%s extracted=%d writes=%d",
+                    run_id,
+                    session_id[:8],
+                    write_result.get("candidates_extracted", 0),
+                    write_result.get("writes_completed", 0),
+                )
+            else:
+                self._save_dispose_snapshot(mgr, session_id, params, buf, snapshot_ids)
+                succeeded = True
+        except Exception as exc:
+            if snapshot_ids:
+                buf.rewind_watermark_to_ids(snapshot_ids)
+            if journal is not None:
+                try:
+                    failure = {
+                        "status": "needs_confirmation" if isinstance(exc, (RecoveryNeedsConfirmationError, WriteOutcomeUnknownError)) else "failed",
+                        "retryable": not isinstance(exc, (RecoveryNeedsConfirmationError, WriteOutcomeUnknownError)), "error": str(exc)}
+                    journal.mutate(lambda batch: batch["lifecycle"].update(last_error=failure))
+                except Exception:
+                    logger.exception("dispose failure checkpoint unavailable: session=%s", session_id[:8])
+            logger.exception("dispose background flush failed: session=%s", session_id[:8])
+        finally:
+            source_stack.close()
+            if extraction_started:
+                buf.end_extraction()
+            if succeeded:
+                removed_session = mgr.remove_session_if_empty(
+                    session_id,
+                    buf,
+                    ctx=effective_ctx,
+                )
+                if removed_session:
+                    self._flush_session_tool_usage_async(session_id, effective_ctx)
+
+    @_attribute_request_usage
+    @_guard_session_mutation
     def dispose(self, params: dict | None = None) -> dict:
-        """Session end: dispatch background flush for pending memories."""
+        """Session end: safely dispatch a non-blocking pending-memory flush."""
         params = params or {}
+        self.wake_skill_sedimentation()
         session_id = params.get("sessionId") or params.get("session_id") or ""
         if not session_id:
             return {"disposed": True, "flushed": False, "reason": "no_session_id"}
 
         mgr = self.get_session_manager()
         ctx = params.get("_ctx")
-        if not mgr.has_session(session_id, ctx=ctx):
+        if ctx is not None and mgr.has_session(session_id) and not mgr.has_session(session_id, ctx=ctx):
             return {"disposed": True, "flushed": False, "reason": "session_not_found"}
-
-        buf = mgr.get_or_create(session_id, ctx=ctx)
-
-        # Wait for any in-progress background extraction to finish before
-        # touching the session.  This prevents the race where after_turn()
-        # has optimistically advanced extraction_watermark but the background
-        # thread hasn't committed yet — removing the session here would cause
-        # the background commit to fail and lose data.
-        if buf.extraction_in_progress and buf.extraction_done_event is not None:
-            logger.info("dispose: waiting for background extraction on session=%s", session_id[:8])
-            completed = buf.extraction_done_event.wait(timeout=30)
-            if not completed and buf.extraction_in_progress:
-                logger.warning(
-                    "dispose: background extraction still in progress after timeout; "
-                    "keeping session=%s active_extractions=%d watermark=%d total=%d",
-                    session_id[:8],
-                    getattr(buf, "extraction_active_count", 0),
-                    buf.extraction_watermark,
-                    len(buf.messages),
-                )
-                return {
-                    "disposed": True,
-                    "flushed": False,
-                    "reason": "extraction_in_progress_timeout",
-                    "extraction_in_progress": True,
-                    "active_extractions": getattr(buf, "extraction_active_count", 0),
-                }
-
-        unextracted = buf.messages[buf.extraction_watermark:]
-        if not unextracted:
-            self._save_session_state_best_effort(mgr, session_id, params)
-            self._flush_session_tool_usage_async(session_id, ctx)
-            mgr.remove_session(session_id, ctx=ctx)
-            return {"disposed": True, "flushed": False, "reason": "no_pending_messages"}
-
-        pending_tokens = sum(len(m.content) // 4 for m in unextracted)
-        _MIN_FLUSH_TOKENS = 200
-        if pending_tokens < _MIN_FLUSH_TOKENS:
-            logger.info(
-                "dispose flush skipped: session=%s pending_tokens=%d < %d",
-                session_id[:8], pending_tokens, _MIN_FLUSH_TOKENS,
-            )
-            self._save_session_state_best_effort(mgr, session_id, params)
-            self._flush_session_tool_usage_async(session_id, ctx)
-            mgr.remove_session(session_id, ctx=ctx)
-            return {"disposed": True, "flushed": False, "reason": "below_token_threshold",
-                    "pending_tokens": pending_tokens}
-
-        extraction_messages = [
-            {"role": m.role, "content": m.content}
-            for m in unextracted if m.role != "assistant"
-        ]
-        if not extraction_messages:
-            self._save_session_state_best_effort(mgr, session_id, params)
-            self._flush_session_tool_usage_async(session_id, ctx)
-            mgr.remove_session(session_id, ctx=ctx)
-            return {"disposed": True, "flushed": False, "reason": "no_user_messages"}
-
-        # Check write_api BEFORE removing the session so that we can bail
-        # out safely without losing pending data.
-        write_api = self.get_write_api()
-        if write_api is None:
-            logger.warning("dispose: write API unavailable, keeping session for retry session=%s", session_id[:8])
-            # Do NOT remove the session — a subsequent dispose or flush can retry.
-            return {"disposed": True, "flushed": False, "reason": "no_write_api"}
-
-        ctx = ctx or self.build_context(params)
-        extraction_summary = buf.extraction_summary
-        tool_stats_text = ""
-        try:
-            from extraction.tool_collector import format_tool_stats_text
-            tool_stats_text = format_tool_stats_text(buf.usage_stats)
-        except Exception:
-            pass
-
-        buf.extraction_watermark = len(buf.messages)
-        self._save_session_state_best_effort(mgr, session_id, params)
-        mgr.remove_session(session_id, ctx=ctx)
-
-        logger.info(
-            "dispose: dispatching background flush for session=%s msgs=%d tokens=%d",
-            session_id[:8], len(extraction_messages), pending_tokens,
-        )
-
-        svc = self
-
-        def _background_flush():
+        from service.api import MemoryWriteAPI as _CheckpointWriteAPI
+        if (isinstance(self._write_api, _CheckpointWriteAPI) or callable(mgr._get_context_fs)
+                or not mgr.has_session(session_id)):
+            ctx = ctx or self.build_context(params)
             try:
-                write_result = svc._chunk_and_extract(
-                    messages=extraction_messages,
-                    write_api=write_api,
-                    ctx=ctx,
-                    session_time=None,
-                    session_summary=extraction_summary,
-                    tool_stats_text=tool_stats_text,
-                    extraction_run_id="dispose",
-                    session_id=session_id,
-                )
-                logger.info(
-                    "dispose background flush done: session=%s extracted=%d writes=%d",
-                    session_id[:8],
-                    write_result.get("candidates_extracted", 0),
-                    write_result.get("writes_completed", 0),
-                )
-                try:
-                    svc.drain_outbox_sync()
-                except Exception:
-                    pass
-                svc._flush_session_tool_usage_async(session_id, ctx)
-            except Exception:
-                logger.exception("dispose background flush failed: session=%s", session_id[:8])
-                svc._flush_session_tool_usage_async(session_id, ctx)
+                self._load_extraction_recovery_before_accumulation(session_id, ctx)
+            except SessionOperationInProgress:
+                raise
+            except Exception as exc:
+                return {"disposed": False, "flushed": False, "status": "needs_confirmation",
+                        "retryable": False, "error": "durable extraction state unavailable: " + str(exc)}
+        try:
+            buf = mgr.begin_managed_operation(
+                session_id,
+                ctx,
+                create=False,
+            )
+        except SessionOperationInProgress as exc:
+            if exc.retryable:
+                raise
+            return {
+                "disposed": False,
+                "flushed": False,
+                "status": 409,
+                "error_code": "session_operation_in_progress",
+                "conflict_type": exc.conflict_type,
+                "retryable": exc.retryable,
+            }
+        if buf is None:
+            return {"disposed": True, "flushed": False, "reason": "session_not_found"}
+        operation = _DisposeOperationLease(buf)
+        source_stack = ExitStack()
+        try:
+            with buf.extraction_lock:
+                if buf.ordinary_turns_in_progress:
+                    return {"disposed": False, "flushed": False, "status": "processing",
+                            "retryable": True, "reason": "ordinary_turn_in_progress"}
+                pending_kind = lifecycle_kind(buf)
+                ordinary_worker_active = pending_kind is None and buf.extraction_in_progress
+                if buf.pending_extraction_ids() and pending_kind != "dispose" and not ordinary_worker_active:
+                    return {"disposed": False, "flushed": False, "status": "needs_confirmation",
+                            "retryable": False, "reason": "pending_memory_batch"}
+                if buf.dispose_in_progress:
+                    return {
+                        "disposed": True,
+                        "flushed": False,
+                        "status": "background_flush_dispatched",
+                        "reason": "dispose_in_progress",
+                    }
+                operation.claim_dispose()
+            source_stack.enter_context(buf.lifecycle_lock)
+            conflict = source_stack.enter_context(buf.lifecycle_source_scope(allow_active_extraction=True))
+            if conflict is not None:
+                return {"disposed": False, "flushed": False, "status": "processing",
+                        "retryable": True, "reason": conflict}
+            return self._dispose_source_impl(mgr, buf, ctx, params, source_stack, operation)
+        finally:
+            try:
+                source_stack.close()
+            finally:
+                operation.release(local=True)
 
-        import threading
-        threading.Thread(target=_background_flush, daemon=True).start()
-        return {"disposed": True, "flushed": True, "status": "background_flush_dispatched",
-                "pending_tokens": pending_tokens}
+    def _dispose_source_impl(self, mgr, buf, ctx, params, source_stack, operation):
+        session_id = buf.session_id
+        try:
+            source_state = self._prepare_dispose_source(mgr, buf, ctx, params)
+            if source_state.get("ok") is False:
+                return {"disposed": False, "flushed": False, **source_state}
+            source_snapshot = source_state["source_snapshot"]
+        except Exception as exc:
+            if isinstance(exc, RecoveryPersistenceError):
+                return {"disposed": False, "flushed": False, "status": "failed",
+                        "retryable": True, "error": str(exc)}
+            if isinstance(exc, RecoveryNeedsConfirmationError):
+                return {"disposed": False, "flushed": False, "status": "needs_confirmation",
+                        "retryable": False, "error": str(exc)}
+            raise
 
+        fast_path_reason = None
+        snapshot_ids = set()
+        with buf.extraction_lock:
+            extraction_active = buf.extraction_in_progress
+            reason = "extraction_in_progress" if extraction_active else "background_flush_dispatched"
+            pending_tokens = None
+            if not extraction_active and source_snapshot is not None:
+                unextracted = source_snapshot
+                pending_tokens = sum(len(message.content) // 4 for message in unextracted)
+                if not unextracted:
+                    reason = "no_pending_messages"
+                elif pending_tokens < 200:
+                    reason = "below_token_threshold"
+                elif not any(message.role != "assistant" for message in unextracted):
+                    reason = "no_user_messages"
+
+                if reason in {
+                    "no_pending_messages",
+                    "below_token_threshold",
+                    "no_user_messages",
+                }:
+                    fast_path_reason = reason
+                    if unextracted:
+                        snapshot_ids = {message.id for message in unextracted}
+
+        if fast_path_reason is not None:
+            self._save_dispose_snapshot(mgr, session_id, params, buf, snapshot_ids)
+            removed_session = mgr.remove_session_if_empty(
+                session_id,
+                buf,
+                ctx=ctx,
+            )
+            if removed_session:
+                self._flush_session_tool_usage_async(session_id, ctx)
+
+            result = {
+                "disposed": True,
+                "flushed": False,
+                "reason": fast_path_reason,
+            }
+            if pending_tokens is not None:
+                result["pending_tokens"] = pending_tokens
+            return result
+
+        # The fixed durable batch now owns eligible real-writer source. The
+        # worker acquires its own preparation scope, including inline callers.
+        source_stack.close()
+        try:
+            operation.worker_owned = True
+            threading.Thread(
+                target=self._run_dispose_background,
+                args=(mgr, session_id, params, ctx, buf, source_snapshot, operation),
+                daemon=True,
+                name=f"dispose-{session_id[:8]}",
+            ).start()
+        except Exception as exc:
+            operation.release()
+            logger.error(
+                "dispose background thread unavailable: session=%s: %s",
+                session_id[:8],
+                exc,
+                exc_info=True,
+            )
+            return {"disposed": True, "flushed": False, "reason": "thread_unavailable"}
+
+        result = {
+            "disposed": True,
+            "flushed": False,
+            "status": "dispose_deferred" if extraction_active else "background_flush_dispatched",
+            "reason": reason,
+        }
+        if pending_tokens is not None:
+            result["pending_tokens"] = pending_tokens
+        return result
+
+    @_attribute_request_usage
     def wait_until_idle(self, params: dict | None = None) -> dict:
-        """Wait for process-local extraction/indexing to settle without removing the session."""
+        """Wait for process-local dispose/extraction/indexing to settle."""
         params = params or {}
         session_id = params.get("sessionId") or params.get("session_id") or ""
         if not session_id:
@@ -3233,6 +5343,38 @@ internal_tool_usage_tracker=self._internal_tool_usage,
         ctx = params.get("_ctx") or self.build_context(params)
         drain_outbox = self._param_bool(params, "drainOutbox", "drain_outbox", default=True)
         wait_outbox = self._param_bool(params, "waitOutbox", "wait_outbox", default=not drain_outbox)
+        had_local_session = mgr.has_session(session_id, ctx=ctx)
+        try:
+            # Preserve the public not-found contract for a known foreign local
+            # buffer. An absent local buffer still requires the strict read.
+            if had_local_session or not mgr.has_session(session_id):
+                local_busy = had_local_session and mgr.get_or_create(
+                    session_id, ctx=ctx).active_operation_count > 0
+                scope = nullcontext() if local_busy else self._session_mutation_scope(ctx, refresh=False)
+                with scope as guard:
+                    local_active = False
+                    if had_local_session:
+                        local = mgr.get_or_create(session_id, ctx=ctx)
+                        with local.extraction_lock:
+                            local_active = bool(local.active_operation_count or local.dispose_in_progress
+                                                or local.extraction_in_progress or local.commit_in_progress)
+                    if guard is None or not local_active:
+                        self._load_extraction_recovery_before_accumulation(
+                            session_id, ctx, force_reload=guard is not None)
+        except SessionOperationInProgress:
+            raise
+        except Exception as exc:
+            if isinstance(exc, SessionMutationBusyError):
+                return {"idle": False, "reason": "session_mutation_in_progress", "retryable": True}
+            return {"idle": False, "reason": "recovery_state_unavailable",
+                    "status": "needs_confirmation", "retryable": False,
+                    "error": "durable extraction state unavailable: " + str(exc)}
+        if not had_local_session and mgr.has_session(session_id, ctx=ctx):
+            # Strict observation can materialize an empty finished state. Keep
+            # idle from resurrecting a disposed buffer, without removing any
+            # source or operation that arrived during that read.
+            mgr.remove_session_if_empty(session_id, mgr.get_or_create(session_id, ctx=ctx),
+                                        ctx=ctx, require_quiescent=True)
         if not mgr.has_session(session_id, ctx=ctx):
             if drain_outbox:
                 drain_stats = self.drain_outbox_sync(account_id=ctx.account_id)
@@ -3263,17 +5405,72 @@ internal_tool_usage_tracker=self._internal_tool_usage,
 
         buf = mgr.get_or_create(session_id, ctx=ctx)
         timeout_seconds = self._idle_timeout_seconds(params)
+        import time as _time
 
-        if buf.extraction_in_progress:
-            event = buf.extraction_done_event
-            completed = bool(event.wait(timeout=timeout_seconds)) if event is not None else False
-            if not completed and buf.extraction_in_progress:
+        deadline = _time.monotonic() + timeout_seconds
+        while True:
+            with buf.extraction_lock:
+                extraction_in_progress = bool(buf.extraction_in_progress)
+                dispose_in_progress = bool(buf.dispose_in_progress)
+                extraction_event = buf.extraction_done_event
+                active_extractions = getattr(buf, "extraction_active_count", 0)
+
+            if not extraction_in_progress and not dispose_in_progress:
+                break
+
+            remaining = deadline - _time.monotonic()
+            if remaining <= 0:
                 return {
                     "idle": False,
-                    "reason": "extraction_in_progress_timeout",
-                    "extraction_in_progress": True,
-                    "active_extractions": getattr(buf, "extraction_active_count", 0),
+                    "reason": (
+                        "dispose_in_progress_timeout"
+                        if dispose_in_progress
+                        else "extraction_in_progress_timeout"
+                    ),
+                    "extraction_in_progress": extraction_in_progress,
+                    "dispose_in_progress": dispose_in_progress,
+                    "active_extractions": active_extractions,
                 }
+
+            # Extraction has an event; dispose itself does not, so poll briefly
+            # while sharing the same overall timeout budget for both states.
+            if (
+                extraction_in_progress
+                and extraction_event is not None
+                and not extraction_event.is_set()
+            ):
+                extraction_event.wait(timeout=remaining)
+            else:
+                _time.sleep(min(0.01, remaining))
+
+        with buf.extraction_lock:
+            extension = deepcopy(buf.runtime_extensions.get(EXTENSION_KEY))
+        if extension is not None:
+            batch = extension.get("batch") if isinstance(extension, dict) else None
+            if (not isinstance(extension, dict) or extension.get("version") != 1
+                    or not isinstance(batch, dict) or batch.get("owner") != recovery_owner(ctx)):
+                return {"idle": False, "reason": "extraction_recovery_pending",
+                        "status": "needs_confirmation", "retryable": False,
+                        "error": "pending extraction batch has a different owner or format"}
+            lifecycle = batch.get("lifecycle")
+            if "lifecycle" in batch and (not isinstance(lifecycle, dict)
+                    or lifecycle.get("kind") not in {"compaction", "dispose"}):
+                return {"idle": False, "reason": "lifecycle_recovery_pending",
+                        "status": "needs_confirmation", "retryable": False,
+                        "error": "pending lifecycle checkpoint is invalid"}
+            failure = (lifecycle or {}).get("last_error", {})
+            task = batch.get("retry_task")
+            if task is not None and not lifecycle:
+                self._extraction_retry.wake(ctx, task)
+                return {"idle": False, "reason": "extraction_retry_task",
+                        "status": task["status"], "recovery_task": deepcopy(task),
+                        "retryable": task["status"] in {"queued", "running", "failed"},
+                        "extraction_in_progress": False, "dispose_in_progress": False}
+            return {"idle": False, "reason": "lifecycle_recovery_pending" if lifecycle
+                    else "extraction_recovery_pending",
+                    "status": failure.get("status", "pending"),
+                    "retryable": failure.get("retryable", True),
+                    "extraction_in_progress": False, "dispose_in_progress": False}
 
         if drain_outbox:
             drain_stats = self.drain_outbox_sync(account_id=ctx.account_id)
@@ -3367,8 +5564,14 @@ internal_tool_usage_tracker=self._internal_tool_usage,
     ) -> None:
         try:
             ctx = params.get("_ctx") or self.build_context(params)
-            mgr.save_session_state(session_id, ctx)
+            saved = mgr.save_session_state(session_id, ctx)
+            from fs.sql_adapter.session_mutation import active_session_guard
+            if active_session_guard() is not None and not saved:
+                raise RecoveryNeedsConfirmationError("dispose checkpoint was not acknowledged")
         except Exception as exc:
+            from fs.sql_adapter.session_mutation import active_session_guard
+            if active_session_guard() is not None:
+                raise
             logger.warning("dispose session state save skipped session=%s: %s", session_id, exc)
 
     def get_cumulative_token_usage(self, reset: bool = False) -> dict:
@@ -3400,6 +5603,431 @@ internal_tool_usage_tracker=self._internal_tool_usage,
                 + result.get("embedding", {}).get("total_tokens", 0)
             )
         return result
+
+    def get_model_usage_metrics(
+        self,
+        days: int = 14,
+        *,
+        account_id: str = "",
+        owner_spaces: tuple[str, ...] = (),
+    ) -> dict:
+        store = self._get_model_usage_store()
+        if store is not None:
+            metrics = store.metrics(days, account_id, owner_spaces)
+            if not metrics['models']['llm']:
+                metrics['models']['llm'] = self._provider_cfg.openai_llm_model
+            if not metrics['models']['embedding']:
+                metrics['models']['embedding'] = (
+                    self._provider_cfg.st_model
+                    if self._provider_cfg.embedding_provider == 'st'
+                    else self._provider_cfg.openai_embedding_model
+                )
+            return metrics
+        trackers = {
+            "llm": getattr(self._llm, "token_tracker", None) if self._llm else None,
+            "embedding": (
+                getattr(self._embedder, "token_tracker", None) if self._embedder else None
+            ),
+        }
+        series_by_date: dict[str, dict] = {}
+        for source, tracker in trackers.items():
+            if tracker is None or not hasattr(tracker, "daily_snapshot"):
+                continue
+            for row in tracker.daily_snapshot(
+                days, account_id=account_id, owner_spaces=owner_spaces
+            ):
+                item = series_by_date.setdefault(
+                    str(row["date"]),
+                    {
+                        "date": str(row["date"]),
+                        "llm_input": 0,
+                        "llm_output": 0,
+                        "embedding_input": 0,
+                        "total": 0,
+                    },
+                )
+                if source == "llm":
+                    item["llm_input"] = int(row["input_tokens"])
+                    item["llm_output"] = int(row["output_tokens"])
+                else:
+                    item["embedding_input"] = int(row["embed_tokens"])
+
+        series = [series_by_date[key] for key in sorted(series_by_date)]
+        for item in series:
+            item["total"] = item["llm_input"] + item["llm_output"] + item["embedding_input"]
+
+        llm_snapshot = (
+            trackers["llm"].scoped_snapshot(account_id, owner_spaces)
+            if trackers["llm"] and account_id
+            else trackers["llm"].snapshot() if trackers["llm"] else None
+        )
+        embedding_snapshot = (
+            trackers["embedding"].scoped_snapshot(account_id, owner_spaces)
+            if trackers["embedding"] and account_id
+            else trackers["embedding"].snapshot() if trackers["embedding"] else None
+        )
+        llm = {
+            "input_tokens": llm_snapshot.input_tokens if llm_snapshot else 0,
+            "output_tokens": llm_snapshot.output_tokens if llm_snapshot else 0,
+            "cache_read": llm_snapshot.cache_read if llm_snapshot else 0,
+            "cache_write": llm_snapshot.cache_write if llm_snapshot else 0,
+            "total_tokens": (
+                llm_snapshot.input_tokens + llm_snapshot.output_tokens if llm_snapshot else 0
+            ),
+            "calls": llm_snapshot.llm_calls if llm_snapshot else 0,
+        }
+        embedding = {
+            "total_tokens": embedding_snapshot.embed_tokens if embedding_snapshot else 0,
+            "calls": embedding_snapshot.embed_calls if embedding_snapshot else 0,
+        }
+        today = (
+            series[-1]
+            if series
+            else {
+                "date": "",
+                "llm_input": 0,
+                "llm_output": 0,
+                "embedding_input": 0,
+                "total": 0,
+            }
+        )
+        llm_model = getattr(trackers["llm"], "model", None)
+        if not llm_model:
+            llm_model = (
+                "mock"
+                if self._provider_cfg.provider == "mock"
+                else self._provider_cfg.openai_llm_model
+            )
+        embedding_provider = self._provider_cfg.embedding_provider or self._provider_cfg.provider
+        embedding_model = getattr(trackers["embedding"], "model", None)
+        if not embedding_model:
+            if embedding_provider == "st":
+                embedding_model = self._provider_cfg.st_model
+            elif embedding_provider == "mock":
+                embedding_model = "mock"
+            else:
+                embedding_model = self._provider_cfg.openai_embedding_model
+        return {
+            "enabled": True,
+            "scope": {"account_id": account_id, "owner_spaces": list(owner_spaces)},
+            "models": {"llm": llm_model, "embedding": embedding_model},
+            "today": today,
+            "cumulative": {
+                "total_tokens": llm["total_tokens"] + embedding["total_tokens"],
+                "llm": llm,
+                "embedding": embedding,
+            },
+            "series": series,
+        }
+
+    def record_retrieval_metric(
+        self,
+        ctx: RequestContext,
+        *,
+        request_id: str,
+        duration_ms: float,
+        scores: list[float],
+        categories: list[str],
+        rerank_used: bool,
+        failed: bool = False,
+        trace: dict[str, Any] | None = None,
+    ) -> None:
+        owner_space = ctx.agent_space_name() if ctx.agent_id else ctx.user_space_name()
+        key = (ctx.account_id, owner_space)
+        with self._retrieval_monitoring_lock:
+            metric = self._retrieval_monitoring.setdefault(key, {
+                "queries": 0, "failures": 0, "results": 0, "zero_results": 0,
+                "score_total": 0.0, "score_count": 0, "score_min": None,
+                "score_max": None, "duration_total_ms": 0.0, "duration_max_ms": 0.0,
+                "rerank_used": 0, "by_type": {}, "stages": {},
+            })
+            metric["queries"] += 1
+            metric["failures"] += int(failed)
+            metric["results"] += len(scores)
+            metric["zero_results"] += int(not scores and not failed)
+            metric["duration_total_ms"] += max(0.0, duration_ms)
+            metric["duration_max_ms"] = max(metric["duration_max_ms"], duration_ms)
+            metric["rerank_used"] += int(rerank_used)
+            metric["request_id"] = request_id
+            metric["updated_at"] = _dt.now(UTC).isoformat()
+            if scores:
+                metric["score_total"] += sum(scores)
+                metric["score_count"] += len(scores)
+                metric["score_min"] = min(scores) if metric["score_min"] is None else min(metric["score_min"], *scores)
+                metric["score_max"] = max(scores) if metric["score_max"] is None else max(metric["score_max"], *scores)
+            for category in categories:
+                metric["by_type"][category] = metric["by_type"].get(category, 0) + 1
+            for stage in (trace or {}).get("stages", []):
+                name = str(stage.get("name") or stage.get("stage") or "unknown")
+                elapsed = float(stage.get("duration_ms") or stage.get("elapsed_ms") or 0.0)
+                row = metric["stages"].setdefault(name, {"calls": 0, "total_ms": 0.0, "max_ms": 0.0})
+                row["calls"] += 1
+                row["total_ms"] += elapsed
+                row["max_ms"] = max(row["max_ms"], elapsed)
+
+    def get_retrieval_monitoring_metrics(
+        self, account_id: str, owner_spaces: tuple[str, ...] = ()
+    ) -> dict[str, Any]:
+        visible = set(owner_spaces)
+        lock = getattr(self, "_retrieval_monitoring_lock", None)
+        if lock is None:
+            rows = []
+        else:
+            with lock:
+                rows = [deepcopy(value) for (account, owner), value in self._retrieval_monitoring.items()
+                        if account == account_id and (not visible or owner in visible)]
+        result = {
+            "queries": 0, "failures": 0, "results": 0, "zero_results": 0,
+            "score_total": 0.0, "score_count": 0, "score_min": None,
+            "score_max": None, "duration_total_ms": 0.0, "duration_max_ms": 0.0,
+            "rerank_used": 0, "by_type": {}, "stages": {}, "request_id": "",
+        }
+        for row in rows:
+            for key in ("queries", "failures", "results", "zero_results", "score_total",
+                        "score_count", "duration_total_ms", "rerank_used"):
+                result[key] += row.get(key, 0)
+            result["duration_max_ms"] = max(result["duration_max_ms"], row.get("duration_max_ms", 0.0))
+            for key in ("score_min", "score_max"):
+                value = row.get(key)
+                if value is not None:
+                    result[key] = value if result[key] is None else (min if key == "score_min" else max)(result[key], value)
+            if row.get("updated_at", "") >= result.get("updated_at", ""):
+                result["updated_at"] = row.get("updated_at", "")
+                result["request_id"] = row.get("request_id", "")
+            for name, count in row.get("by_type", {}).items():
+                result["by_type"][name] = result["by_type"].get(name, 0) + count
+            for name, stage in row.get("stages", {}).items():
+                target = result["stages"].setdefault(name, {"calls": 0, "total_ms": 0.0, "max_ms": 0.0})
+                target["calls"] += stage["calls"]
+                target["total_ms"] += stage["total_ms"]
+                target["max_ms"] = max(target["max_ms"], stage["max_ms"])
+        return result
+
+    def get_monitoring_overview(self, ctx: RequestContext) -> dict:
+        health = self.health()
+        outbox = self._count_outbox_unfinished(ctx)
+        worker_alive = bool(self._outbox_thread and self._outbox_thread.is_alive())
+        storage_backend = str(health.get("storage_backend") or self._cfg.storage_backend)
+        storage_healthy = (
+            health.get("sql") == "connected"
+            if storage_backend == "sql"
+            else health.get("agfs") is True and bool(health.get("agfs_url"))
+        )
+        lexical = health.get("lexical") if isinstance(health.get("lexical"), dict) else {}
+        lexical_backfill = (
+            health.get("lexical_backfill")
+            if isinstance(health.get("lexical_backfill"), dict)
+            else {}
+        )
+        hybrid_enabled = bool(self._cfg.retrieval_hybrid_enabled)
+        lexical_healthy = not hybrid_enabled or lexical.get("available") is True
+        backfill_busy = any(
+            lexical_backfill.get(key)
+            for key in (
+                "queued",
+                "running",
+                "at_capacity",
+                "cooldown_failures",
+                "last_errors",
+                "stopping",
+            )
+        )
+        index_status = "error" if not lexical_healthy else "degraded" if backfill_busy else "ok"
+        queue_status = (
+            "error"
+            if outbox.get("error")
+            else "degraded"
+            if int(outbox.get("total") or 0) > 0 and not worker_alive
+            else "ok"
+        )
+        service_status = str(health.get("status") or "error")
+        if service_status not in {"ok", "degraded", "error"}:
+            service_status = "error"
+        embedding_provider = self._provider_cfg.embedding_provider or self._provider_cfg.provider
+        embedding_model = (
+            self._provider_cfg.st_model
+            if embedding_provider == "st"
+            else "mock"
+            if embedding_provider == "mock"
+            else self._provider_cfg.openai_embedding_model
+        )
+        owner_spaces = tuple(ctx.visible_owner_spaces)
+        try:
+            model_usage = self.get_model_usage_metrics(
+                days=1, account_id=ctx.account_id, owner_spaces=owner_spaces
+            )
+        except Exception:
+            model_usage = {"cumulative": {"llm": {}, "embedding": {}}}
+        llm_usage = model_usage.get("cumulative", {}).get("llm", {})
+        embedding_usage = model_usage.get("cumulative", {}).get("embedding", {})
+        retrieval = self.get_retrieval_monitoring_metrics(ctx.account_id, owner_spaces)
+        try:
+            vector_count = self._get_shared_vector_index().count({
+                "account_id": ctx.account_id,
+                **({"owner_space": list(owner_spaces)} if owner_spaces else {}),
+            })
+        except Exception:
+            vector_count = None
+        try:
+            version = _metadata.version("context-engine")
+        except _metadata.PackageNotFoundError:
+            version = "dev"
+        queries = int(retrieval["queries"])
+        score_count = int(retrieval["score_count"])
+        average_duration = retrieval["duration_total_ms"] / queries if queries else 0.0
+        average_score = retrieval["score_total"] / score_count if score_count else 0.0
+        zero_rate = retrieval["zero_results"] / queries * 100 if queries else 0.0
+        score_range = (
+            f"{retrieval['score_min']:.4f} - {retrieval['score_max']:.4f}"
+            if retrieval["score_min"] is not None else "暂无结果"
+        )
+        components = [
+            {
+                "id": "service",
+                "name": "服务",
+                "description": "oGMemory HTTP 服务与核心运行状态。",
+                "status": service_status,
+                "details": {
+                    "后端": health.get("backend", "og-memory"),
+                    "版本": version,
+                    "状态": health.get("status", "unknown"),
+                    "错误": health.get("error", ""),
+                },
+            },
+            {
+                "id": "storage",
+                "name": "存储",
+                "description": "ContextFS 持久化与连接状态。",
+                "status": "ok" if storage_healthy else "error",
+                "details": {
+                    "类型": storage_backend,
+                    "连接": health.get("sql") or ("connected" if storage_healthy else "unavailable"),
+                    "地址": health.get("agfs_url", ""),
+                },
+            },
+            {
+                "id": "models",
+                "name": "模型",
+                "description": "LLM 与 Embedding 模型配置。",
+                "status": "ok" if health.get("llm") else "error",
+                "details": {
+                    "LLM": health.get("llm", "unavailable"),
+                    "Embedding": embedding_model or "unavailable",
+                    "Embedding Provider": embedding_provider or "unavailable",
+                    "统计范围": "当前服务进程",
+                },
+                "tables": [{
+                    "title": "模型用量",
+                    "columns": ["类型", "模型", "Provider", "调用次数", "输入 Token", "输出 Token", "总 Token"],
+                    "rows": [
+                        ["LLM", health.get("llm", "unknown"), getattr(self._provider_cfg, "provider", "unknown"),
+                         int(llm_usage.get("calls") or 0), int(llm_usage.get("input_tokens") or 0),
+                         int(llm_usage.get("output_tokens") or 0), int(llm_usage.get("total_tokens") or 0)],
+                        ["Embedding", embedding_model or "unknown", embedding_provider or "unknown",
+                         int(embedding_usage.get("calls") or 0), int(embedding_usage.get("input_tokens") or 0),
+                         "—", int(embedding_usage.get("total_tokens") or 0)],
+                    ],
+                }],
+            },
+            {
+                "id": "index",
+                "name": "索引",
+                "description": "向量索引与混合检索投影。",
+                "status": index_status,
+                "details": {
+                    "VectorDB": self._cfg.vector_db_type,
+                    "混合检索": hybrid_enabled,
+                    "BM25": lexical.get("available") if hybrid_enabled else "未启用",
+                    "历史回填": "进行中" if backfill_busy else "就绪",
+                    "向量数量": vector_count if vector_count is not None else "不可用",
+                },
+                "tables": [{
+                    "title": "索引规模",
+                    "columns": ["范围", "向量数量", "VectorDB", "BM25", "历史回填"],
+                    "rows": [[ctx.account_id, vector_count if vector_count is not None else "不可用",
+                              self._cfg.vector_db_type, lexical.get("available") if hybrid_enabled else "未启用",
+                              "进行中" if backfill_busy else "就绪"]],
+                }],
+            },
+            {
+                "id": "queue",
+                "name": "任务队列",
+                "description": "当前账户的记忆索引异步任务。",
+                "status": queue_status,
+                "details": {
+                    "账户": ctx.account_id,
+                    "待处理": int(outbox.get("pending") or 0),
+                    "处理中": int(outbox.get("processing") or 0),
+                    "总计": int(outbox.get("total") or 0),
+                    "后台 Worker": "运行中" if worker_alive else "按需启动",
+                    "错误": outbox.get("error", ""),
+                },
+                "tables": [{
+                    "title": "实时队列",
+                    "columns": ["队列", "待处理", "处理中", "未完成", "Worker", "错误"],
+                    "rows": [["Memory Index Outbox", int(outbox.get("pending") or 0),
+                              int(outbox.get("processing") or 0), int(outbox.get("total") or 0),
+                              "运行中" if worker_alive else "按需启动", outbox.get("error") or "—"]],
+                }],
+            },
+            {
+                "id": "retrieval",
+                "name": "检索",
+                "description": "记忆语义检索与混合召回能力。",
+                "status": "error" if not storage_healthy else index_status,
+                "details": {
+                    "语义检索": True,
+                    "混合检索": hybrid_enabled,
+                    "Embedding": embedding_model or "unavailable",
+                },
+                "tables": [
+                    {
+                        "title": "检索质量与性能",
+                        "columns": ["指标", "数值"],
+                        "rows": [
+                            ["查询总数", queries], ["失败查询", retrieval["failures"]],
+                            ["返回结果", retrieval["results"]],
+                            ["平均结果/查询", f"{retrieval['results'] / queries if queries else 0:.1f}"],
+                            ["零结果查询", retrieval["zero_results"]], ["零结果率", f"{zero_rate:.1f}%"],
+                            ["平均分数", f"{average_score:.4f}"], ["分数区间", score_range],
+                            ["Rerank 使用", retrieval["rerank_used"]],
+                            ["平均端到端延迟", f"{average_duration:.1f} ms"],
+                            ["最大端到端延迟", f"{retrieval['duration_max_ms']:.1f} ms"],
+                            ["最近请求 ID", retrieval["request_id"] or "暂无"],
+                        ],
+                    },
+                    {
+                        "title": "结果类型分布", "columns": ["记忆类型", "结果数"],
+                        "rows": [[name, count] for name, count in sorted(retrieval["by_type"].items())],
+                    },
+                    {
+                        "title": "检索阶段", "columns": ["阶段", "次数", "平均耗时", "最大耗时"],
+                        "rows": [[name, stage["calls"], f"{stage['total_ms'] / stage['calls']:.1f} ms",
+                                  f"{stage['max_ms']:.1f} ms"]
+                                 for name, stage in sorted(retrieval["stages"].items())],
+                    },
+                ],
+            },
+        ]
+        severity = {"ok": 0, "degraded": 1, "error": 2}
+        overall_status = max(
+            (component["status"] for component in components),
+            key=severity.__getitem__,
+        )
+        return {
+            "account_id": ctx.account_id,
+            "version": version,
+            "status": overall_status,
+            "healthy": overall_status == "ok",
+            "healthy_count": sum(component["status"] == "ok" for component in components),
+            "total_count": len(components),
+            "updated_at": _dt.now(UTC).isoformat(),
+            "errors": [
+                {"component": component["id"], "message": component["details"].get("错误")}
+                for component in components if component["details"].get("错误")
+            ],
+            "components": components,
+        }
 
     def _flush_session_tool_usage_async(
         self,
@@ -3473,6 +6101,7 @@ internal_tool_usage_tracker=self._internal_tool_usage,
             "storage_backend": self._cfg.storage_backend,
             "agfs": agfs_required and _HAS_AGFS,
             "sql": None,
+            "status": "ok",
         }
         try:
             if agfs_required:
@@ -3497,9 +6126,48 @@ internal_tool_usage_tracker=self._internal_tool_usage,
                 finally:
                     pool.return_connection(conn)
                 info["sql"] = "connected"
+                info["sql_dialect"] = self._cfg.sql_dialect
+                if self._cfg.retrieval_hybrid_enabled:
+                    self._get_shared_vector_index()
+                    lexical_health = self._lexical_index.health()
+                    info["lexical"] = lexical_health
+                    if not lexical_health.get("available", False):
+                        raise RuntimeError("required openGauss BM25 projection is unavailable")
+                    backfill_health = self._get_lexical_backfill().health()
+                    info["lexical_backfill"] = backfill_health
+                    if (
+                        backfill_health.get("queued")
+                        or backfill_health.get("running")
+                        or backfill_health.get("at_capacity")
+                        or backfill_health.get("cooldown_failures")
+                        or backfill_health.get("last_errors")
+                        or backfill_health.get("stopping")
+                    ):
+                        info["status"] = "degraded"
+                        info["error"] = "lexical historical projection is not ready"
             llm = self.get_llm()
             info["llm"] = getattr(llm, "model", "unknown")
-            info["status"] = "ok"
+            if self._cfg.skill_sedimentation_enabled:
+                worker_status = (
+                    self._skill_sedimentation_worker.status()
+                    if self._skill_sedimentation_worker is not None
+                    else {"running": False, "last_error": "worker not initialized"}
+                )
+                worker_status["thread_alive"] = bool(
+                    self._skill_sedimentation_thread
+                    and self._skill_sedimentation_thread.is_alive()
+                )
+                trace_store = self._get_trace_event_store()
+                worker_status["scheduler_backlog"] = (
+                    trace_store.count_skill_work_accounts() if trace_store else None
+                )
+                info["skill_sedimentation"] = worker_status
+                if not worker_status["thread_alive"]:
+                    info["status"] = "error"
+                    info["error"] = "skill sedimentation worker is not running"
+                elif worker_status.get("last_error"):
+                    info["status"] = "error"
+                    info["error"] = str(worker_status["last_error"])
         except Exception as exc:
             info["status"] = "error"
             info["error"] = str(exc)

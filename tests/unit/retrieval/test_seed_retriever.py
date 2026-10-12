@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import sys
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 
@@ -11,9 +12,10 @@ _root = Path(__file__).resolve().parents[3]
 if str(_root) not in sys.path:
     sys.path.insert(0, str(_root))
 
-from core.models import IndexRecord, RetrievalConfig, RequestContext, TypedQuery
-from providers.vector_index.in_memory_index import InMemoryVectorIndex
+from core.lexical import LexicalHit
+from core.models import IndexRecord, RequestContext, RetrievalConfig, SeedHit, TypedQuery
 from providers.embedder.mock_embedder import MockEmbedder
+from providers.vector_index.in_memory_index import InMemoryVectorIndex
 from retrieval.seed_retriever import SeedRetriever
 
 
@@ -146,6 +148,186 @@ class TestSeedRetriever:
         assert result.initial_candidates
         assert all(hit.owner_space == "user_u1" for hit in result.initial_candidates)
 
+    def test_owner_space_defaults_to_visible_spaces(self, embedder):
+        idx = InMemoryVectorIndex(dimension=8)
+        idx.upsert(
+            [
+                IndexRecord(
+                    id="visible",
+                    uri="ctx://acct-1/users/u1/memories/visible",
+                    level=2,
+                    text="shared visible support group",
+                    filters={"account_id": "acct-1", "owner_space": "user:u1"},
+                    metadata={"context_type": "MEMORY", "category": "event"},
+                ),
+                IndexRecord(
+                    id="hidden",
+                    uri="ctx://acct-1/users/u2/memories/hidden",
+                    level=2,
+                    text="shared visible support group",
+                    filters={"account_id": "acct-1", "owner_space": "user:u2"},
+                    metadata={"context_type": "MEMORY", "category": "event"},
+                ),
+            ]
+        )
+        ctx = RequestContext(
+            account_id="acct-1",
+            user_id="u1",
+            agent_id="a1",
+            session_id="s1",
+            trace_id="t1",
+            visible_owner_spaces=("user:u1",),
+        )
+        retriever = SeedRetriever(
+            idx,
+            embedder,
+            RetrievalConfig(global_search_topk=10, owner_scope_filter_enabled=True),
+        )
+        query = TypedQuery(
+            text="support group",
+            context_type="MEMORY",
+            categories=[],
+            top_k=5,
+            account_id="acct-1",
+            owner_space=None,
+        )
+
+        result = retriever.search(query, ctx)
+
+        assert {hit.owner_space for hit in result.initial_candidates} == {"user:u1"}
+
+    def test_explicit_owner_space_is_intersected_with_visible_spaces(self, embedder):
+        idx = InMemoryVectorIndex(dimension=8)
+        idx.upsert(
+            [
+                IndexRecord(
+                    id="visible",
+                    uri="ctx://acct-1/users/u1/memories/visible",
+                    level=2,
+                    text="support group",
+                    filters={"account_id": "acct-1", "owner_space": "user:u1"},
+                    metadata={"context_type": "MEMORY"},
+                ),
+                IndexRecord(
+                    id="hidden",
+                    uri="ctx://acct-1/users/u2/memories/hidden",
+                    level=2,
+                    text="support group",
+                    filters={"account_id": "acct-1", "owner_space": "user:u2"},
+                    metadata={"context_type": "MEMORY"},
+                ),
+            ]
+        )
+        ctx = RequestContext(
+            account_id="acct-1",
+            user_id="u1",
+            agent_id="a1",
+            session_id="s1",
+            trace_id="t1",
+            visible_owner_spaces=("user:u1",),
+        )
+        retriever = SeedRetriever(
+            idx,
+            embedder,
+            RetrievalConfig(global_search_topk=10, owner_scope_filter_enabled=True),
+        )
+
+        hidden_result = retriever.search(
+            TypedQuery(
+                text="support group",
+                context_type="MEMORY",
+                categories=[],
+                top_k=5,
+                account_id="acct-1",
+                owner_space="user:u2",
+            ),
+            ctx,
+        )
+        mixed_result = retriever.search(
+            TypedQuery(
+                text="support group",
+                context_type="MEMORY",
+                categories=[],
+                top_k=5,
+                account_id="acct-1",
+                owner_space=["user:u1", "user:u2"],
+            ),
+            ctx,
+        )
+
+        assert hidden_result.initial_candidates == []
+        assert {hit.owner_space for hit in mixed_result.initial_candidates} == {"user:u1"}
+
+    def test_owner_space_intersection_accepts_legacy_alias(self, embedder):
+        idx = InMemoryVectorIndex(dimension=8)
+        idx.upsert(
+            [
+                IndexRecord(
+                    id="legacy",
+                    uri="ctx://acct-1/users/u1/memories/legacy",
+                    level=2,
+                    text="legacy support group",
+                    filters={"account_id": "acct-1", "owner_space": "user_u1"},
+                    metadata={"context_type": "MEMORY"},
+                )
+            ]
+        )
+        ctx = RequestContext(
+            account_id="acct-1",
+            user_id="u1",
+            agent_id="a1",
+            session_id="s1",
+            trace_id="t1",
+            visible_owner_spaces=("user:u1",),
+        )
+        retriever = SeedRetriever(
+            idx,
+            embedder,
+            RetrievalConfig(global_search_topk=10, owner_scope_filter_enabled=True),
+        )
+
+        result = retriever.search(
+            TypedQuery(
+                text="legacy support group",
+                context_type="MEMORY",
+                categories=[],
+                top_k=5,
+                account_id="acct-1",
+                owner_space="user_u1",
+            ),
+            ctx,
+        )
+
+        assert {hit.owner_space for hit in result.initial_candidates} == {"user_u1"}
+
+    def test_resource_query_applies_visible_owner_space_filter(self, embedder, ctx):
+        class RecordingIndex:
+            def __init__(self) -> None:
+                self.filters = None
+
+            def search_by_vector(self, query_vector, filters, top_k):
+                self.filters = filters
+                return []
+
+        idx = RecordingIndex()
+        retriever = SeedRetriever(
+            idx,
+            embedder,
+            RetrievalConfig(global_search_topk=10, owner_scope_filter_enabled=True),
+        )
+        query = TypedQuery(
+            text="resource reference",
+            context_type="RESOURCE",
+            categories=[],
+            top_k=5,
+            account_id="acct-1",
+            owner_space=["user:u1", "agent:a1"],
+        )
+
+        retriever.search(query, ctx)
+
+        assert idx.filters["owner_space"] == ["user:u1", "user_u1", "agent:a1", "agent_a1"]
+
     def test_root_uris_include_visible_shared_agents(self, retriever, ctx):
         shared_ctx = RequestContext(
             account_id="acct-1",
@@ -170,3 +352,347 @@ class TestSeedRetriever:
 
         assert "ctx://acct-1/agents/a1/memories/" in result.root_uris
         assert "ctx://acct-1/agents/a2/memories/" in result.root_uris
+
+    def test_root_uris_include_legacy_visible_shared_agents(self, retriever):
+        shared_ctx = RequestContext(
+            account_id="acct-1",
+            user_id="u1",
+            agent_id="",
+            session_id="s1",
+            trace_id="t1",
+            visible_owner_spaces=("user_u1", "agent_a2"),
+        )
+
+        result = retriever.search(
+            TypedQuery(
+                text="user profile",
+                context_type="MEMORY",
+                categories=[],
+                top_k=10,
+                account_id="acct-1",
+                owner_space=["user_u1"],
+            ),
+            shared_ctx,
+        )
+
+        assert "ctx://acct-1/agents/a2/memories/" in result.root_uris
+
+    def test_vector_search_uses_internal_candidate_pool(self, embedder, ctx):
+        class RecordingIndex:
+            def __init__(self) -> None:
+                self.top_k: int | None = None
+
+            def search_by_vector(self, query_vector, filters, top_k):
+                self.top_k = top_k
+                return []
+
+        idx = RecordingIndex()
+        cfg = RetrievalConfig(
+            global_search_topk=30,
+            default_top_k=5,
+            candidate_pool_enabled=True,
+            candidate_pool_multiplier=3,
+            min_candidate_pool_size=15,
+        )
+        retriever = SeedRetriever(idx, embedder, cfg)
+        query = TypedQuery(
+            text="user profile",
+            context_type="MEMORY",
+            categories=[],
+            top_k=5,
+            account_id="acct-1",
+            owner_space="user_u1",
+        )
+
+        retriever.search(query, ctx)
+
+        assert idx.top_k == 15
+
+    def test_candidate_pool_does_not_cap_below_requested_top_k(self, embedder, ctx):
+        class RecordingIndex:
+            def __init__(self) -> None:
+                self.top_k: int | None = None
+
+            def search_by_vector(self, query_vector, filters, top_k):
+                self.top_k = top_k
+                return []
+
+        idx = RecordingIndex()
+        cfg = RetrievalConfig(
+            global_search_topk=30,
+            default_top_k=5,
+            candidate_pool_enabled=True,
+            candidate_pool_multiplier=3,
+            min_candidate_pool_size=15,
+        )
+        retriever = SeedRetriever(idx, embedder, cfg)
+        query = TypedQuery(
+            text="large result set",
+            context_type="MEMORY",
+            categories=[],
+            top_k=40,
+            account_id="acct-1",
+            owner_space="user_u1",
+        )
+
+        retriever.search(query, ctx)
+
+        assert idx.top_k == 40
+
+    def test_vector_search_uses_global_topk_when_candidate_pool_disabled(self, embedder, ctx):
+        class RecordingIndex:
+            def __init__(self) -> None:
+                self.top_k: int | None = None
+
+            def search_by_vector(self, query_vector, filters, top_k):
+                self.top_k = top_k
+                return []
+
+        idx = RecordingIndex()
+        cfg = RetrievalConfig(global_search_topk=30, default_top_k=5)
+        retriever = SeedRetriever(idx, embedder, cfg)
+        query = TypedQuery(
+            text="user profile",
+            context_type="MEMORY",
+            categories=[],
+            top_k=5,
+            account_id="acct-1",
+            owner_space="user_u1",
+        )
+
+        retriever.search(query, ctx)
+
+        assert idx.top_k == 30
+
+    def test_weighted_rrf_rewards_hits_returned_by_both_paths(self):
+        shared = SeedHit(uri="ctx://acct-1/shared", score=0.9, level=2)
+        vector_only = SeedHit(uri="ctx://acct-1/vector", score=0.8, level=2)
+        lexical_only = SeedHit(uri="ctx://acct-1/lexical", score=0.0, level=2)
+
+        fused = SeedRetriever._weighted_rrf(
+            [shared, vector_only],
+            [shared, lexical_only],
+            semantic_weight=1.0,
+            lexical_weight=1.0,
+            rrf_k=60,
+        )
+
+        assert fused[0].uri == shared.uri
+        assert fused[0].metadata["_fusion_strategy"] == "weighted_rrf"
+        assert fused[0].metadata["_retrieval_ranks"] == {
+            "semantic": 1,
+            "lexical": 1,
+        }
+
+        weighted = SeedRetriever._weighted_rrf(
+            [vector_only],
+            [lexical_only],
+            semantic_weight=3.0,
+            lexical_weight=1.0,
+            rrf_k=60,
+        )
+        assert weighted[0].uri == vector_only.uri
+
+    def test_weighted_rrf_omits_candidates_from_zero_weight_path(self):
+        vector = SeedHit(uri="ctx://acct-1/vector", score=0.8, level=2)
+        lexical = SeedHit(uri="ctx://acct-1/lexical", score=1.0, level=2)
+
+        fused = SeedRetriever._weighted_rrf(
+            [vector],
+            [lexical],
+            semantic_weight=1.0,
+            lexical_weight=0.0,
+            rrf_k=60,
+        )
+
+        assert [hit.uri for hit in fused] == [vector.uri]
+
+    def test_hybrid_search_uses_configured_provider_limits_and_owner_filter(
+        self, embedder, ctx
+    ):
+        class VectorIndex:
+            def search_by_vector(self, query_vector, filters, top_k):
+                self.filters, self.top_k = filters, top_k
+                return []
+
+        class LexicalIndex:
+            supported_filters = frozenset({"account_id", "owner_space"})
+
+            def search(self, query, top_k, filters):
+                self.filters, self.top_k = filters, top_k
+                return []
+
+        vector, lexical = VectorIndex(), LexicalIndex()
+        cfg = RetrievalConfig(hybrid_enabled=True, vector_top_k=7, lexical_top_k=3)
+        query = TypedQuery(
+            text="hybrid",
+            context_type="MEMORY",
+            categories=[],
+            top_k=2,
+            account_id="acct-1",
+            owner_space="user_u1",
+        )
+
+        backfill = SimpleNamespace(ensure_ready=lambda _ctx, _scopes: True)
+        SeedRetriever(vector, embedder, cfg, lexical, backfill).search(query, ctx)
+
+        assert vector.top_k == 7
+        assert lexical.top_k == 3
+        assert lexical.filters["account_id"] == "acct-1"
+        assert "user_u1" in lexical.filters["owner_space"]
+
+    def test_zero_lexical_weight_skips_backfill_and_bm25(self, embedder, ctx):
+        class VectorIndex:
+            def search_by_vector(self, query_vector, filters, top_k):
+                return [
+                    SeedHit(
+                        uri="ctx://acct-1/users/u1/memories/vector/content.md",
+                        score=0.9,
+                        level=2,
+                    )
+                ]
+
+        class LexicalIndex:
+            def search(self, **_kwargs):
+                raise AssertionError("zero-weight lexical search must be skipped")
+
+        backfill = SimpleNamespace(
+            ensure_ready=lambda *_args: (_ for _ in ()).throw(
+                AssertionError("zero-weight lexical backfill must be skipped")
+            )
+        )
+        cfg = RetrievalConfig(
+            hybrid_enabled=True,
+            semantic_weight=1.0,
+            lexical_weight=0.0,
+        )
+        query = TypedQuery(
+            text="semantic only",
+            context_type="MEMORY",
+            categories=[],
+            top_k=5,
+            account_id="acct-1",
+            owner_space="user_u1",
+        )
+
+        result = SeedRetriever(
+            VectorIndex(), embedder, cfg, LexicalIndex(), backfill
+        ).search(query, ctx)
+
+        assert [hit.uri for hit in result.initial_candidates] == [
+            "ctx://acct-1/users/u1/memories/vector/content.md"
+        ]
+
+    def test_zero_semantic_weight_skips_embedding_and_vector_search(self, ctx):
+        class Embedder:
+            def embed_texts(self, _texts):
+                raise AssertionError("zero-weight embedding must be skipped")
+
+        class VectorIndex:
+            def search_by_vector(self, **_kwargs):
+                raise AssertionError("zero-weight vector search must be skipped")
+
+        class LexicalIndex:
+            supported_filters = frozenset({"account_id", "owner_space", "level"})
+
+            def search(self, query, top_k, filters):
+                assert filters["level"] == 2
+                return [
+                    LexicalHit(
+                        id="lexical-leaf",
+                        score=5.0,
+                        metadata={
+                            "uri": "ctx://acct-1/users/u1/memories/lexical/content.md",
+                            "level": 2,
+                            "account_id": "acct-1",
+                            "owner_space": "user_u1",
+                        },
+                    )
+                ]
+
+        cfg = RetrievalConfig(
+            hybrid_enabled=True,
+            semantic_weight=0.0,
+            lexical_weight=1.0,
+        )
+        query = TypedQuery(
+            text="lexical only",
+            context_type="MEMORY",
+            categories=[],
+            top_k=5,
+            account_id="acct-1",
+            owner_space="user_u1",
+        )
+        backfill = SimpleNamespace(ensure_ready=lambda _ctx, _scopes: True)
+
+        result = SeedRetriever(
+            VectorIndex(), Embedder(), cfg, LexicalIndex(), backfill
+        ).search(query, ctx)
+
+        assert result.query_vector == []
+        assert result.root_uris == []
+        assert result.starting_points == []
+        assert [hit.uri for hit in result.initial_candidates] == [
+            "ctx://acct-1/users/u1/memories/lexical/content.md"
+        ]
+
+    def test_hybrid_lexical_results_are_revalidated_against_tenant_scope(
+        self, index_with_data, embedder, ctx
+    ):
+        class LexicalIndex:
+            supported_filters = frozenset({"account_id", "owner_space"})
+
+            def search(self, query, top_k, filters):
+                return [
+                    LexicalHit(
+                        id="wrong-owner",
+                        score=8.0,
+                        metadata={
+                            "uri": "ctx://acct-1/users/u2/memories/leak",
+                            "level": 2,
+                            "account_id": "acct-1",
+                            "owner_space": "user_u2",
+                        },
+                    ),
+                    LexicalHit(
+                        id="bad",
+                        score=10.0,
+                        metadata={
+                            "uri": "ctx://other/users/u1/memories/leak",
+                            "level": 2,
+                            "account_id": "other",
+                            "owner_space": "user_u1",
+                        },
+                    ),
+                    LexicalHit(
+                        id="good",
+                        score=5.0,
+                        metadata={
+                            "uri": "ctx://acct-1/users/u1/memories/good",
+                            "level": 2,
+                            "account_id": "acct-1",
+                            "owner_space": "user_u1",
+                        },
+                    ),
+                ]
+
+        hybrid_cfg = RetrievalConfig(hybrid_enabled=True)
+        backfill = SimpleNamespace(ensure_ready=lambda _ctx, _scopes: True)
+        retriever = SeedRetriever(
+            index_with_data, embedder, hybrid_cfg, LexicalIndex(), backfill
+        )
+        query = TypedQuery(
+            text="good",
+            context_type="MEMORY",
+            categories=[],
+            top_k=5,
+            account_id="acct-1",
+            owner_space="user_u1",
+        )
+
+        result = retriever.search(query, ctx)
+
+        uris = {hit.uri for hit in result.initial_candidates}
+        assert "ctx://other/users/u1/memories/leak" not in uris
+        assert "ctx://acct-1/users/u2/memories/leak" not in uris
+        assert "ctx://acct-1/users/u1/memories/good" in uris

@@ -9,6 +9,15 @@ import sys
 from cli import __version__
 
 
+class ExplicitStore(argparse.Action):
+    """Keep public parser defaults while distinguishing explicitly supplied values."""
+    def __call__(self, parser, namespace, values, option_string=None):
+        setattr(namespace, self.dest, values)
+        fields = set(getattr(namespace, "_explicit_fields", ()))
+        fields.add(self.dest)
+        namespace._explicit_fields = fields
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="ogmem",
@@ -28,7 +37,9 @@ def build_parser() -> argparse.ArgumentParser:
     p_onboard = sub.add_parser("onboard", help="Interactive setup wizard")
     p_onboard.add_argument("--non-interactive", action="store_true", help="Run without prompts")
     p_onboard.add_argument(
-        "--mode", choices=["docker", "plugin", "headless"], help="Deployment mode"
+        "--mode",
+        choices=["local", "docker", "plugin", "headless"],
+        help="Deployment mode (local is the single-machine OpenGauss mode)",
     )
     p_onboard.add_argument(
         "--provider", help="LLM provider (openai/volcengine/dashscope/zhipu/mock)"
@@ -36,17 +47,50 @@ def build_parser() -> argparse.ArgumentParser:
     p_onboard.add_argument("--api-key", help="LLM API key")
     p_onboard.add_argument("--base-url", help="LLM API base URL")
     p_onboard.add_argument("--model", help="LLM model name")
+    plugin = p_onboard.add_argument_group("Existing Agent connection (plugin mode)")
+    plugin.add_argument(
+        "--agent",
+        help="openclaw, claude-code, codex, opencode, deepseek-harness, hermes, deepagents, agent-plugins; other names use MCP",
+    )
+    plugin.add_argument("--ogmem-url", help="oGMemory HTTP API base URL as seen by the Agent")
+    plugin.add_argument("--mcp-url", help="Full Streamable HTTP MCP URL, including its port and path")
+    credentials = plugin.add_mutually_exclusive_group()
+    credentials.add_argument("--ogmem-api-key", help="oGMemory service key (not an LLM key)")
+    credentials.add_argument("--ogmem-api-key-env", help="Read the service key from this environment variable")
+    plugin.add_argument("--account-id", help="oGMemory account ID")
+    plugin.add_argument("--user-id", help="oGMemory user ID")
+    plugin.add_argument("--agent-id", help="oGMemory identity for this Agent")
+    plugin.add_argument("--output-dir", help="Export directory; defaults to ./ogmem-client-config/<adapter>")
     p_onboard.add_argument("--embedding-model", help="Embedding model name")
     p_onboard.add_argument("--embedding-provider", help="Embedding provider")
-    p_onboard.add_argument("--vector-db", choices=["chroma", "opengauss"], help="Vector DB type")
-    p_onboard.add_argument("--port", type=int, default=8090, help="HTTP port")
+    p_onboard.add_argument("--embedding-base-url", help="Embedding API base URL")
+    p_onboard.add_argument("--embedding-api-key", help="Embedding API key")
+    p_onboard.add_argument("--embedding-dimension", type=int, help="Embedding output dimension")
+    p_onboard.add_argument(
+        "--vector-db",
+        choices=["chroma", "opengauss"],
+        help="Vector DB type (local mode defaults to opengauss)",
+    )
+    p_onboard.add_argument("--port", type=int, default=8090, action=ExplicitStore, help="HTTP port")
+    p_onboard.add_argument("--instance-name", default="ogmem", help="Docker quickstart instance name")
+    p_onboard.add_argument("--opengauss-port", type=int, default=15432, help="Docker host port for OpenGauss")
+    p_onboard.add_argument("--mcp-port", type=int, default=18091, help="Docker host port for oGMemory MCP")
+    p_onboard.add_argument("--openclaw-ce-port", type=int, default=18790, help="Docker host port for OpenClaw CE")
+    p_onboard.add_argument("--openclaw-mcp-port", type=int, default=18791, help="Docker host port for OpenClaw MCP")
     p_onboard.add_argument(
         "--storage-backend",
         choices=["agfs", "sql"],
-        default="sql",
+        default="sql", action=ExplicitStore,
         help="Storage backend (default: sql)",
     )
-    p_onboard.add_argument("--db-connection", help="PostgreSQL connection string (SQL backend)")
+    p_onboard.add_argument("--db-connection", help="SQL storage connection string")
+    p_onboard.add_argument("--vector-db-connection", help="Vector database connection string (defaults to SQL connection on first setup)")
+    p_onboard.add_argument(
+        "--sql-dialect",
+        choices=["postgresql", "opengauss"],
+        default="opengauss", action=ExplicitStore,
+        help="SQL storage dialect (default: opengauss)",
+    )
 
     # -- start --
     p_start = sub.add_parser("start", help="Start services")
@@ -54,7 +98,7 @@ def build_parser() -> argparse.ArgumentParser:
         "mode",
         nargs="?",
         default=None,
-        choices=["headless", "local", "docker", "plugin", "index"],
+        choices=["headless", "local", "index"],
         help="What to start",
     )
     p_start.add_argument("-d", "--daemon", action="store_true", help="Run in background")
@@ -64,18 +108,13 @@ def build_parser() -> argparse.ArgumentParser:
     p_start.add_argument(
         "--health-timeout", type=int, default=30, help="Health check timeout (seconds)"
     )
-    # docker-specific
-    p_start.add_argument("--env-file", help="Path to deploy.env (docker mode)")
-    p_start.add_argument("--skip-pull", action="store_true", help="Skip image pull (docker mode)")
-    p_start.add_argument("--password", "-p", help="openGauss password (docker mode)")
-
     # -- stop --
     p_stop = sub.add_parser("stop", help="Stop services")
     p_stop.add_argument(
         "mode",
         nargs="?",
         default=None,
-        choices=["headless", "local", "docker", "plugin"],
+        choices=["headless", "local"],
         help="What to stop",
     )
 
@@ -90,8 +129,9 @@ def build_parser() -> argparse.ArgumentParser:
             "Run the MCP server. HTTP settings default to mcp.host, mcp.port, and "
             "mcp.path (OGMEM_MCP_HOST, OGMEM_MCP_PORT, and OGMEM_MCP_PATH). SSE uses "
             "the configured path for "
-            "GET and /messages/ for POST. SSE sessions are process-local; use one "
-            "instance or sticky routing. SSE requires OG_ROLE_CONTROL_ENABLED=true "
+            "GET and /messages/ for POST. Legacy MCP sessions are process-local; use "
+            "one instance or sticky routing for pre-2026 clients. SSE requires "
+            "OG_ROLE_CONTROL_ENABLED=true "
             "and OG_ROOT_API_KEY or OG_ADMIN_API_KEYS; clients send the key with "
             "X-API-Key or Authorization: Bearer. Concurrent SSE sessions are capped "
             "by OGMEM_MCP_MAX_SSE_CONNECTIONS (default: 64)."
@@ -134,6 +174,36 @@ def build_parser() -> argparse.ArgumentParser:
     config_sub = p_config.add_subparsers(dest="config_action")
     config_sub.add_parser("show", help="Show resolved config (masked)")
     config_sub.add_parser("init", help="Generate starter ogmem.yaml")
+
+    # -- skill --
+    p_skill = sub.add_parser("skill", help="Inspect published and sync generated Agent Skills")
+    p_skill.add_argument(
+        "--base-url",
+        default=None,
+        help=(
+            "oGMemory HTTP base URL (default: OGMEM_HTTP_BASE_URL, "
+            "OGMEM_SERVER_URL, or http://127.0.0.1:8090)"
+        ),
+    )
+    p_skill.add_argument("--api-key", default=None, help="API key (or OGMEM_MCP_API_KEY)")
+    p_skill.add_argument("--account-id", default=None, help="Account header override")
+    p_skill.add_argument("--user-id", default=None, help="User header override")
+    p_skill.add_argument("--agent-id", default=None, help="Agent whose skills are requested")
+    p_skill.add_argument("-c", "--config", default=None, help="Config containing an optional sync target")
+    skill_sub = p_skill.add_subparsers(dest="skill_action", required=True)
+    p_skill_list = skill_sub.add_parser("list", help="List published skills")
+    p_skill_list.add_argument("--query", default=None, help="Optional semantic/text query")
+    p_skill_list.add_argument("--limit", type=int, default=50)
+    p_skill_show = skill_sub.add_parser("show", help="Show one published SKILL.md")
+    p_skill_show.add_argument("name")
+    p_skill_show.add_argument("--source", choices=["generated", "imported"], default=None)
+    p_skill_show.add_argument("--raw", action="store_true", help="Print only SKILL.md content")
+    p_candidates = skill_sub.add_parser("candidates", help="Inspect held or accumulating candidates")
+    p_candidates.add_argument("--state", default=None, choices=["accumulating", "held"])
+    p_sync = skill_sub.add_parser("sync", help="Sync published skills to an Agent Skills directory")
+    p_sync.add_argument("--target-dir", default=None)
+    p_sync.add_argument("--dry-run", action="store_true")
+    p_sync.add_argument("--prune", action="store_true")
 
     return parser
 
@@ -189,6 +259,9 @@ def main(argv: list[str] | None = None) -> int:
     elif cmd == "config":
         from cli.commands.config import run
 
+        return run(args)
+    elif cmd == "skill":
+        from cli.commands.skill import run
         return run(args)
     else:
         parser.print_help()

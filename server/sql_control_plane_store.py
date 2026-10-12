@@ -39,13 +39,14 @@ class SQLControlPlaneStore(PoolAdapterMixin):
         connection_string: str | None = None,
         pool_size: int = 5,
         pool=None,
+        dialect: str = "postgresql",
     ):
         if not _HAS_PSYCOPG2:
             raise ImportError(
                 "psycopg2 is required for SQLControlPlaneStore. "
                 "Install with: pip install psycopg2-binary"
             )
-        self._init_pool(pool, connection_string, pool_size)
+        self._init_pool(pool, connection_string, pool_size, dialect)
         self._ensure_table()
 
     # ------------------------------------------------------------------
@@ -70,7 +71,7 @@ class SQLControlPlaneStore(PoolAdapterMixin):
 
         conn = self._get_connection()
         try:
-            ensure_schema(conn)
+            ensure_schema(conn, self.sql_dialect)
         except Exception:
             conn.rollback()
             raise
@@ -121,9 +122,7 @@ class SQLControlPlaneStore(PoolAdapterMixin):
         try:
             with conn.cursor() as cur:
                 if entity == "accounts":
-                    cur.execute(
-                        "SELECT account_id, created_at, status FROM cp_accounts"
-                    )
+                    cur.execute("SELECT account_id, created_at, status FROM cp_accounts")
                     rows = cur.fetchall()
                     if not rows:
                         return default
@@ -209,7 +208,8 @@ class SQLControlPlaneStore(PoolAdapterMixin):
         except Exception:
             logger.warning(
                 "[SQLControlPlaneStore] read_json failed for %s",
-                path, exc_info=True,
+                path,
+                exc_info=True,
             )
             return default
         finally:
@@ -275,24 +275,18 @@ class SQLControlPlaneStore(PoolAdapterMixin):
                 elif entity == "audit_logs":
                     # Append-only: INSERT new events, skip existing by log_id
                     for ev in data.get("events", []):
-                        cur.execute(
-                            "INSERT INTO cp_audit_logs "
-                            "(log_id, account_id, actor, target, action, "
-                            " timestamp, result, trace_id, details) "
-                            "VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s) "
-                            "ON CONFLICT (log_id) DO NOTHING",
-                            (
-                                ev.get("log_id"),
-                                account_id,
-                                ev.get("actor", ""),
-                                ev.get("target", ""),
-                                ev.get("action", ""),
-                                ev.get("timestamp") or None,
-                                ev.get("result", ""),
-                                ev.get("trace_id", ""),
-                                Json(ev.get("details", {})),
-                            ),
+                        params = (
+                            ev.get("log_id"),
+                            account_id,
+                            ev.get("actor", ""),
+                            ev.get("target", ""),
+                            ev.get("action", ""),
+                            ev.get("timestamp") or None,
+                            ev.get("result", ""),
+                            ev.get("trace_id", ""),
+                            Json(ev.get("details", {})),
                         )
+                        self.sql_dialect.insert_audit_log(cur, params)
 
             conn.commit()
         except Exception:

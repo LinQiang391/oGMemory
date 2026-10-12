@@ -18,7 +18,13 @@ _SCRIPT_DIR = Path(__file__).resolve().parent
 if str(_SCRIPT_DIR) not in sys.path:
     sys.path.insert(0, str(_SCRIPT_DIR))
 
-from ogm_plugin_request import base_api_url, base_ctx, http_plugin_headers
+from ogm_plugin_request import (  # noqa: E402
+    _env_bool,
+    auto_capture_enabled,
+    base_api_url,
+    base_ctx,
+    http_plugin_headers,
+)
 
 # ---------------------------------------------------------------------------
 # Config
@@ -115,6 +121,8 @@ def parse_messages(jsonl_text):
 
 def post_after_turn(session_id, messages, hook_event):
     """POST messages to oG-Memory /api/v1/after_turn."""
+    if not auto_capture_enabled():
+        return True
     url = f"{base_api_url()}/api/v1/after_turn"
     body = {**base_ctx(session_id), "messages": messages, "hook_event_name": hook_event}
     payload = json.dumps(body, ensure_ascii=False).encode("utf-8")
@@ -146,6 +154,10 @@ def post_after_turn(session_id, messages, hook_event):
 # ---------------------------------------------------------------------------
 
 def main():
+    if not auto_capture_enabled():
+        log("auto_capture disabled, skipping transcript sync")
+        return
+
     # 1. Read hook input from stdin
     hook_input = sys.stdin.read()
     try:

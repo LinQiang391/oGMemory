@@ -122,10 +122,14 @@ trap cleanup TERM INT
 # cd ensures perf_logs/ and other relative paths resolve under /opt/ogmem (writable by ogmem user)
 cd /opt/ogmem
 OGMEM_PORT=${OGMEM_HTTP_PORT:-8090}
-echo "[entrypoint] Starting oGMemory HTTP server on :${OGMEM_PORT}..."
+OGMEM_THREADS=${OGMEM_THREADS:-${OGMEM_WORKERS:-2}}
+echo "[entrypoint] Starting oGMemory HTTP server on :${OGMEM_PORT} with 1 process and ${OGMEM_THREADS} threads..."
 exec python3 -m gunicorn \
+  --config python:server.gunicorn_config \
   --bind "0.0.0.0:${OGMEM_PORT}" \
-  --workers "${OGMEM_WORKERS:-2}" \
+  --workers 1 \
+  --worker-class gthread \
+  --threads "${OGMEM_THREADS}" \
   --timeout "${OGMEM_GUNICORN_TIMEOUT:-900}" \
   --access-logfile - \
   server.app:app

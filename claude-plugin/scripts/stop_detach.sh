@@ -16,6 +16,13 @@
 # from single quotes or other shell-sensitive bytes in tool/content fields).
 set -u
 
+shopt -s nocasematch
+# Match Python's boolean parser. Unset preserves capture; any explicit value
+# other than 1/true/yes disables it before reading stdin or spawning a child.
+if [[ -v OGMEM_AUTO_CAPTURE ]] && ! [[ "$OGMEM_AUTO_CAPTURE" =~ ^[[:space:]]*(1|true|yes)[[:space:]]*$ ]]; then
+  exit 0
+fi
+
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 SCRIPT="$HERE/call_after_turn.py"
 

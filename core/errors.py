@@ -102,6 +102,43 @@ class ValidationError(ContextEngineError):
         super().__init__(f"Validation failed for {field}: {reason}")
 
 
+class ExtractionIncompleteError(ContextEngineError, RuntimeError):
+    """Extraction stopped with unresolved or incomplete draft operations."""
+
+
+class LLMTransientError(ExtractionIncompleteError):
+    """The model provider can be retried after a transport or service failure."""
+
+
+class MemoryCardFormatError(ExtractionIncompleteError):
+    """A generated preference or entity needs background format recovery."""
+
+
+class OperationDeadlineExceededError(ExtractionIncompleteError, TimeoutError):
+    """The caller's operation budget expired before further work could start."""
+
+
+class LLMOutputTruncatedError(ExtractionIncompleteError):
+    """The model reached its output token limit before completing the response."""
+
+
+class ToolCallProtocolError(ContextEngineError, RuntimeError):
+    """The model response did not satisfy the requested tool-call protocol.
+
+    This is intentionally distinct from transport/auth/rate-limit failures so
+    extraction can use a structured JSON fallback without hiding real API
+    errors.
+    """
+
+    def __init__(self, reason: str, *, tool_choice: str = ""):
+        self.reason = reason
+        self.tool_choice = tool_choice
+        message = f"Tool-call protocol failed: {reason}"
+        if tool_choice:
+            message += f" (tool_choice={tool_choice})"
+        super().__init__(message)
+
+
 class ConcurrentModificationError(ContextEngineError):
     """Optimistic lock failure during concurrent merge.
 

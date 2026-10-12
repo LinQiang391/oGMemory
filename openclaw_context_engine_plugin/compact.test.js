@@ -1,5 +1,7 @@
 import assert from "node:assert/strict";
+import { readFileSync } from "node:fs";
 
+import plugin from "./index.js";
 import {
   appendTakeoverCompactionBoundary,
   delegateCompactionToRuntimeOrThrow,
@@ -96,7 +98,56 @@ const prefetchResolved = resolveConfig({
 assert.equal(prefetchResolved.prefetchEnabled, true);
 assert.equal(prefetchResolved.prefetchTopK, 7);
 
+const pluginManifest = JSON.parse(
+  readFileSync(new URL("./openclaw.plugin.json", import.meta.url), "utf8"),
+);
+for (const key of ["llmProvider", "llmModel", "embeddingModel"]) {
+  assert.equal(
+    Object.hasOwn(pluginManifest.configSchema.properties[key], "default"),
+    false,
+    `${key} schema default would be mistaken for an explicit plugin override`,
+  );
+}
+
+const modelEnvKeys = [
+  "OGMEM_API_KEY",
+  "OGMEM_BASE_URL",
+  "OGMEM_LLM_MODEL",
+  "OGMEM_EMBEDDING_API_KEY",
+  "OGMEM_EMBEDDING_BASE_URL",
+  "OGMEM_EMBEDDING_MODEL",
+];
+const previousModelEnv = Object.fromEntries(
+  modelEnvKeys.map((key) => [key, process.env[key]]),
+);
+Object.assign(process.env, {
+  OGMEM_API_KEY: "env-llm-key",
+  OGMEM_BASE_URL: "https://env-llm.example/v1",
+  OGMEM_LLM_MODEL: "env-llm-model",
+  OGMEM_EMBEDDING_API_KEY: "env-embedding-key",
+  OGMEM_EMBEDDING_BASE_URL: "https://env-embedding.example/v1",
+  OGMEM_EMBEDDING_MODEL: "env-embedding-model",
+});
+try {
+  const envResolved = resolveConfig({});
+  assert.equal(envResolved.llmApiKey, "env-llm-key");
+  assert.equal(envResolved.llmBaseUrl, "https://env-llm.example/v1");
+  assert.equal(envResolved.llmModel, "env-llm-model");
+  assert.equal(envResolved.embeddingApiKey, "env-embedding-key");
+  assert.equal(envResolved.embeddingBaseUrl, "https://env-embedding.example/v1");
+  assert.equal(envResolved.embeddingModel, "env-embedding-model");
+} finally {
+  for (const key of modelEnvKeys) {
+    if (previousModelEnv[key] === undefined) delete process.env[key];
+    else process.env[key] = previousModelEnv[key];
+  }
+}
+
 const spawnedEnv = {};
+assert.deepEqual(resolveConfig({ llmModel: "explicit-model" }).modelConfigOverrides, {
+  llmModel: "explicit-model",
+});
+assert.deepEqual(resolveConfig({ llmModel: "" }).modelConfigOverrides, {});
 const spawned = spawnContextEngine(
   {
     ...resolveConfig({
@@ -105,6 +156,17 @@ const spawned = spawnContextEngine(
       contextEnginePort: 8090,
       prefetchEnabled: true,
       prefetchTopK: 7,
+      llmProvider: "openai",
+      llmApiKey: "llm-key",
+      llmBaseUrl: "https://llm.example/v1",
+      llmModel: "llm-model",
+      llmReasoningEffort: "xhigh",
+      llmIsReasoningModel: true,
+      llmExtraBody: { thinking: { type: "enabled" } },
+      embeddingProvider: "openai",
+      embeddingApiKey: "embedding-key",
+      embeddingBaseUrl: "https://embedding.example/v1",
+      embeddingModel: "embedding-model",
     }),
   },
   { info: () => {}, debug: () => {}, warn: () => {} },
@@ -123,6 +185,258 @@ const spawned = spawnContextEngine(
 assert.ok(spawned);
 assert.equal(spawnedEnv.OGMEM_PREFETCH_ENABLED, "true");
 assert.equal(spawnedEnv.OGMEM_PREFETCH_TOP_K, "7");
+assert.equal(spawnedEnv.OGMEM_API_KEY, "llm-key");
+assert.equal(spawnedEnv.OGMEM_BASE_URL, "https://llm.example/v1");
+assert.equal(spawnedEnv.OGMEM_LLM_MODEL, "llm-model");
+assert.equal(spawnedEnv.LLM_REASONING_EFFORT, "xhigh");
+assert.equal(spawnedEnv.LLM_IS_REASONING_MODEL, "true");
+assert.deepEqual(JSON.parse(spawnedEnv.LLM_EXTRA_BODY), { thinking: { type: "enabled" } });
+assert.equal(spawnedEnv.OGMEM_EMBEDDING_API_KEY, "embedding-key");
+assert.equal(spawnedEnv.OGMEM_EMBEDDING_BASE_URL, "https://embedding.example/v1");
+assert.equal(spawnedEnv.OGMEM_EMBEDDING_MODEL, "embedding-model");
+assert.deepEqual(JSON.parse(spawnedEnv.OGMEM_MODEL_CONFIG_OVERRIDES), {
+  llmProvider: "openai",
+  llmApiKey: "llm-key",
+  llmBaseUrl: "https://llm.example/v1",
+  llmModel: "llm-model",
+  llmReasoningEffort: "xhigh",
+  llmIsReasoningModel: true,
+  llmExtraBody: { thinking: { type: "enabled" } },
+  embeddingProvider: "openai",
+  embeddingApiKey: "embedding-key",
+  embeddingBaseUrl: "https://embedding.example/v1",
+  embeddingModel: "embedding-model",
+});
+
+const originalFetch = globalThis.fetch;
+const lifecycleRequests = [];
+const sessionEndHandlers = [];
+let disposeAttempts = 0;
+let disposeFailuresRemaining = 1;
+let disposeResult = { disposed: true };
+globalThis.fetch = async (url, options) => {
+  lifecycleRequests.push({ url, body: JSON.parse(options.body) });
+  if (url.endsWith("/dispose")) {
+    disposeAttempts += 1;
+    if (disposeFailuresRemaining > 0) {
+      disposeFailuresRemaining -= 1;
+      return {
+        ok: false,
+        status: 503,
+        text: async () => "temporarily unavailable",
+      };
+    }
+    return {
+      ok: true,
+      json: async () => disposeResult,
+    };
+  }
+  return { ok: true, json: async () => ({ ok: true }) };
+};
+try {
+  let createContextEngine;
+  plugin.register({
+    pluginConfig: {
+      mode: "remote",
+      memoryApiBaseUrl: "https://memory.example",
+      accountId: "acct-1",
+      userId: "user-1",
+      agentId: "agent-1",
+    },
+    logger: { info: () => {}, error: () => {} },
+    on: (event, handler) => {
+      if (event === "session_end") sessionEndHandlers.push(handler);
+    },
+    registerService: () => {},
+    registerContextEngine: (_id, factory) => {
+      createContextEngine = factory;
+    },
+  });
+  const contextEngine = createContextEngine();
+  const requestCountBeforeHeartbeat = lifecycleRequests.length;
+  assert.deepEqual(
+    await contextEngine.ingest({
+      sessionId: "heartbeat-session",
+      isHeartbeat: true,
+      message: { role: "user", content: "[OpenClaw heartbeat poll]" },
+    }),
+    { ingested: false },
+  );
+  await contextEngine.afterTurn({
+    sessionId: "heartbeat-session",
+    isHeartbeat: true,
+    messages: [
+      { role: "user", content: "[OpenClaw heartbeat poll]" },
+      { role: "assistant", content: "HEARTBEAT_OK" },
+    ],
+  });
+  assert.equal(lifecycleRequests.length, requestCountBeforeHeartbeat);
+  assert.deepEqual(
+    await contextEngine.ingest({
+      sessionId: "heartbeat-session",
+      message: { role: "user", content: "[OpenClaw heartbeat poll]" },
+    }),
+    { ingested: false },
+  );
+  await contextEngine.afterTurn({
+    sessionId: "heartbeat-session",
+    prePromptMessageCount: 1,
+    messages: [
+      { role: "user", content: "old message" },
+      {
+        role: "user",
+        content: "[Queued user message]\n[OpenClaw heartbeat poll]\n\n[System] Resume interrupted turn.",
+      },
+    ],
+  });
+  assert.equal(lifecycleRequests.length, requestCountBeforeHeartbeat);
+
+  await contextEngine.afterTurn({
+    sessionId: "normal-after-heartbeat",
+    prePromptMessageCount: 1,
+    messages: [
+      { role: "system", content: "memory prefix" },
+      { role: "user", content: "[OpenClaw heartbeat poll]" },
+      { role: "assistant", content: "HEARTBEAT_OK" },
+      { role: "user", content: "normal user turn" },
+      { role: "assistant", content: "normal reply" },
+    ],
+  });
+  assert.equal(lifecycleRequests.at(-1).url, "https://memory.example/api/v1/after_turn");
+  assert.equal(lifecycleRequests.at(-1).body.prePromptMessageCount, 1);
+  assert.deepEqual(lifecycleRequests.at(-1).body.messages, [
+    { role: "system", content: "memory prefix" },
+    { role: "user", content: "normal user turn" },
+    { role: "assistant", content: "normal reply" },
+  ]);
+
+  const requestCountBeforeMixedBatch = lifecycleRequests.length;
+  await contextEngine.afterTurn({
+    sessionId: "normal-before-heartbeat-without-boundary",
+    messages: [
+      { role: "user", content: "normal user turn" },
+      { role: "assistant", content: "normal reply" },
+      { role: "user", content: "[OpenClaw heartbeat poll]" },
+      { role: "assistant", content: "HEARTBEAT_OK" },
+    ],
+  });
+  assert.equal(lifecycleRequests.length, requestCountBeforeMixedBatch + 1);
+  assert.deepEqual(lifecycleRequests.at(-1).body.messages, [
+    { role: "user", content: "normal user turn" },
+    { role: "assistant", content: "normal reply" },
+  ]);
+
+  const requestCountBeforePureHeartbeat = lifecycleRequests.length;
+  await contextEngine.afterTurn({
+    sessionId: "heartbeat-without-boundary",
+    messages: [
+      { role: "user", content: "[OpenClaw heartbeat poll]" },
+      { role: "assistant", content: "HEARTBEAT_OK" },
+    ],
+  });
+  assert.equal(lifecycleRequests.length, requestCountBeforePureHeartbeat);
+
+  await contextEngine.afterTurn({
+    sessionId: "session-1",
+    accountId: "turn-acct",
+    userId: "turn-user",
+    agentId: "turn-agent",
+    messages: [],
+  });
+  const requestCountBeforeDispose = lifecycleRequests.length;
+  assert.deepEqual(await contextEngine.dispose(), {
+    disposed: true,
+    flushed: false,
+    reason: "run_cleanup",
+  });
+  assert.equal(lifecycleRequests.length, requestCountBeforeDispose);
+
+  await sessionEndHandlers.at(-1)(
+    { sessionId: "session-1", reason: "reset" },
+    {},
+  );
+  assert.equal(disposeAttempts, 2);
+  assert.deepEqual(lifecycleRequests.at(-1), {
+    url: "https://memory.example/api/v1/dispose",
+    body: {
+      sessionId: "session-1",
+      accountId: "turn-acct",
+      userId: "turn-user",
+      agentId: "turn-agent",
+    },
+  });
+
+  await contextEngine.afterTurn({
+    sessionId: "session-2",
+    accountId: "retained-acct",
+    userId: "retained-user",
+    agentId: "retained-agent",
+    messages: [],
+  });
+  disposeFailuresRemaining = 3;
+  assert.equal(
+    await sessionEndHandlers.at(-1)(
+      { sessionId: "session-2", reason: "reset" },
+      {},
+    ),
+    undefined,
+  );
+  assert.equal(disposeAttempts, 5);
+
+  await sessionEndHandlers.at(-1)(
+    { sessionId: "session-2", reason: "reset" },
+    {},
+  );
+  assert.equal(disposeAttempts, 6);
+  assert.deepEqual(lifecycleRequests.at(-1), {
+    url: "https://memory.example/api/v1/dispose",
+    body: {
+      sessionId: "session-2",
+      accountId: "acct-1",
+      userId: "user-1",
+      agentId: "agent-1",
+    },
+  });
+
+  await contextEngine.afterTurn({
+    sessionId: "session-3",
+    accountId: "retry-acct",
+    userId: "retry-user",
+    agentId: "retry-agent",
+    messages: [],
+  });
+  disposeResult = {
+    disposed: true,
+    flushed: false,
+    reason: "thread_unavailable",
+  };
+  assert.equal(
+    await sessionEndHandlers.at(-1)(
+      { sessionId: "session-3", reason: "reset" },
+      {},
+    ),
+    undefined,
+  );
+  assert.equal(disposeAttempts, 9);
+
+  disposeResult = { disposed: true };
+  await sessionEndHandlers.at(-1)(
+    { sessionId: "session-3", reason: "reset" },
+    {},
+  );
+  assert.equal(disposeAttempts, 10);
+  assert.deepEqual(lifecycleRequests.at(-1), {
+    url: "https://memory.example/api/v1/dispose",
+    body: {
+      sessionId: "session-3",
+      accountId: "acct-1",
+      userId: "user-1",
+      agentId: "agent-1",
+    },
+  });
+} finally {
+  globalThis.fetch = originalFetch;
+}
 
 const layered = buildLayeredComposeMessages(
   {

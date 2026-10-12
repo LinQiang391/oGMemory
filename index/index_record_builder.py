@@ -76,6 +76,7 @@ def build_index_records(node: ContextNode) -> list[IndexRecord]:
 
     # Build metadata for each level
     base_metadata: dict[str, str | bool] = {
+        "abstract": node.abstract,
         "category": node.category,
         "context_type": node.context_type,
         "parent_uri": node.parent_uri,

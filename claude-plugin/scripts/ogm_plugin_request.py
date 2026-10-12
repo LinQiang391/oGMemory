@@ -38,9 +38,9 @@ def _identity_and_url() -> tuple[str, str, str, str]:
     if cfg is not None:
         api = _default_api_url_from_cfg(cfg)
         return (
-            str(cfg.account_id),
-            str(cfg.user_id),
-            str(cfg.agent_id),
+            os.environ.get("OG_MEMORY_ACCOUNT_ID") or os.environ.get("OG_ACCOUNT_ID") or str(cfg.account_id),
+            os.environ.get("OG_MEMORY_USER_ID") or os.environ.get("OG_USER_ID") or str(cfg.user_id),
+            os.environ.get("OG_MEMORY_AGENT_ID") or os.environ.get("OG_AGENT_ID") or str(cfg.agent_id),
             str(api).rstrip("/"),
         )
     return (
@@ -91,3 +91,24 @@ def base_ctx(session_id: str) -> dict:
         "agentId": agid,
         "sessionId": session_id,
     }
+
+
+_TRUE_VALUES = {"1", "true", "yes"}
+
+
+def _env_bool(name: str, default: bool) -> bool:
+    """Parse the plugin's boolean environment values conservatively."""
+    raw = os.environ.get(name)
+    if raw is None:
+        return default
+    return str(raw).strip().lower() in _TRUE_VALUES
+
+
+def auto_capture_enabled() -> bool:
+    """Allow automatic transcript and tool-message writes (enabled by default)."""
+    return _env_bool("OGMEM_AUTO_CAPTURE", True)
+
+
+def auto_recall_enabled() -> bool:
+    """Allow automatic prompt recall, independently of capture."""
+    return _env_bool("OGMEM_AUTO_RECALL", True)

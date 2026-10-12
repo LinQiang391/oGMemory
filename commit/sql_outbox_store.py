@@ -1,18 +1,22 @@
-"""PostgreSQL-backed OutboxStore implementation.
+"""SQL-backed OutboxStore implementation.
 
 Replaces file-based .outbox/*.json events with rows in outbox_events table.
 Uses ``LISTEN/NOTIFY`` for low-latency wakeups and ``UPDATE … RETURNING`` for
 atomic batch claims instead of filesystem lock files.
 """
 
+import hashlib
 import json
+import time
 import uuid
+from contextlib import contextmanager
 from datetime import UTC, datetime
 
 from core.enums import EventType
 from core.interfaces import ContextFS
 from core.logging_config import get_logger
 from core.models import ContextNode, IndexRecord, OutboxEvent, RequestContext
+from fs.sql_adapter.pool import PoolAdapterMixin
 
 try:
     import psycopg2
@@ -24,9 +28,18 @@ except ImportError:
 
 logger = get_logger(__name__)
 
+_PROCESSING_LOCK_CONNECT_TIMEOUT_SECONDS = 5
+_PROCESSING_LOCK_TIMEOUT_SECONDS = 5.0
+_PROCESSING_LOCK_POLL_SECONDS = 0.05
 
-class SQLOutboxStore:
-    """PostgreSQL-backed outbox event storage.
+
+def _uri_processing_lock_key(uri: str) -> int:
+    digest = hashlib.sha256(f"ogmemory:outbox:uri:{uri}".encode()).digest()
+    return int.from_bytes(digest[:8], "big", signed=True)
+
+
+class SQLOutboxStore(PoolAdapterMixin):
+    """Dialect-aware SQL outbox event storage.
 
     Stores OutboxEvents as rows in the ``outbox_events`` table.
     Locking uses ``UPDATE … RETURNING`` for atomic batch claims.
@@ -41,15 +54,15 @@ class SQLOutboxStore:
         fs: ContextFS | None = None,
         pool_size: int = 5,
         pool=None,
+        dialect: str = "postgresql",
     ):
         if not _HAS_PSYCOPG2:
             raise ImportError(
-                "psycopg2 is required for SQLOutboxStore. "
-                "Install with: pip install psycopg2-binary"
+                "psycopg2 is required for SQLOutboxStore. Install with: pip install psycopg2-binary"
             )
         self._fs = fs
-        from fs.sql_adapter.pool import PoolAdapterMixin
-        PoolAdapterMixin._init_pool(self, pool, connection_string, pool_size)
+        self._init_pool(pool, connection_string, pool_size, dialect)
+        self.supports_batch_claim = self.sql_dialect.supports_batch_claim
         self._ensure_table()
 
     # ------------------------------------------------------------------
@@ -78,7 +91,7 @@ class SQLOutboxStore:
 
         conn = self._get_connection()
         try:
-            ensure_schema(conn)
+            ensure_schema(conn, self.sql_dialect)
         except Exception:
             conn.rollback()
             raise
@@ -91,15 +104,15 @@ class SQLOutboxStore:
 
     def _extract_account_id(self, uri: str) -> str:
         from fs.sql_adapter.sql_context_fs import parse_uri
+
         return parse_uri(uri)["account"]
 
     def _node_uri_to_directory_uri(self, node_uri: str) -> str:
         parts = node_uri.rstrip("/").rsplit("/", 1)
         return parts[0] + "/"
 
-    def _collect_sibling_abstracts(
-        self, node_uri: str, ctx: RequestContext
-    ) -> list[str]:
+    def _collect_sibling_abstracts(self, node_uri: str, ctx: RequestContext) -> list[str]:
+        self.bind_context(ctx)
         dir_uri = self._node_uri_to_directory_uri(node_uri)
         try:
             siblings = self._fs.list_children(dir_uri, ctx)
@@ -116,6 +129,12 @@ class SQLOutboxStore:
         return abstracts
 
     def _insert_event(self, event: OutboxEvent, account_id: str) -> None:
+        from fs.sql_adapter.session_mutation import active_session_guard
+        guard = active_session_guard()
+        if guard is not None:
+            if account_id != guard.ctx.account_id:
+                guard.poison("outbox account does not match its mutation session")
+            guard.check_active()
         conn = self._get_connection()
         try:
             with conn.cursor() as cur:
@@ -138,18 +157,16 @@ class SQLOutboxStore:
                         event.next_retry_at or None,
                     ),
                 )
-                cur.execute(
-                    "SELECT pg_notify(%s, %s)",
-                    (
-                        self.notify_channel,
-                        json.dumps(
-                            {
-                                "event_id": event.event_id,
-                                "account_id": account_id,
-                                "event_type": event.event_type,
-                            },
-                            ensure_ascii=False,
-                        ),
+                self.sql_dialect.notify_outbox(
+                    cur,
+                    self.notify_channel,
+                    json.dumps(
+                        {
+                            "event_id": event.event_id,
+                            "account_id": account_id,
+                            "event_type": event.event_type,
+                        },
+                        ensure_ascii=False,
                     ),
                 )
             conn.commit()
@@ -172,9 +189,7 @@ class SQLOutboxStore:
             created_at,
             next_retry_at,
         ) = row[:8]
-        payload = (
-            json.loads(payload_raw) if isinstance(payload_raw, str) else payload_raw
-        ) or {}
+        payload = (json.loads(payload_raw) if isinstance(payload_raw, str) else payload_raw) or {}
         event = OutboxEvent(
             event_id=event_id,
             event_type=event_type,
@@ -192,37 +207,11 @@ class SQLOutboxStore:
     # ------------------------------------------------------------------
 
     def build_write_event(self, node: ContextNode) -> OutboxEvent:
-        """Build an OutboxEvent for a node write without persisting it.
+        from commit.write_events import build_write_event
+        return build_write_event(node)
 
-        Used by SQLContextFS.write_node_with_outbox to insert the event
-        in the same transaction as the node write.
-        """
-        from index.index_record_builder import build_index_records
-
-        index_records = build_index_records(node)
-        records_data = [
-            {
-                "id": r.id,
-                "uri": r.uri,
-                "level": r.level,
-                "text": r.text,
-                "filters": r.filters,
-                "metadata": r.metadata,
-            }
-            for r in index_records
-        ]
-
-        return OutboxEvent(
-            event_id=str(uuid.uuid4()),
-            event_type=EventType.UPSERT_CONTEXT.value,
-            uri=node.uri,
-            payload={"records": records_data},
-            status="PENDING",
-        )
-
-    def register_write(
-        self, node: ContextNode, ctx: RequestContext
-    ) -> OutboxEvent:
+    def register_write(self, node: ContextNode, ctx: RequestContext) -> OutboxEvent:
+        self.bind_context(ctx)
         event = self.build_write_event(node)
         account_id = self._extract_account_id(node.uri)
         self._insert_event(event, account_id)
@@ -231,6 +220,7 @@ class SQLOutboxStore:
     def register_delete(
         self, uri: str, ctx: RequestContext
     ) -> OutboxEvent:
+        self.bind_context(ctx)
         # Pre-compute ids_to_delete so the worker always has correct L2
         # ids (L2 uses uri/content.md suffix, not bare uri).
         l2_uri = uri.rstrip("/") + "/content.md"
@@ -265,6 +255,7 @@ class SQLOutboxStore:
         Returns:
             OutboxEvent that was registered
         """
+        self.bind_context(ctx)
         from core.models import IndexRecord
 
         l2_uri = uri.rstrip("/") + "/content.md"
@@ -284,9 +275,8 @@ class SQLOutboxStore:
         self._insert_event(event, account_id)
         return event
 
-    def register_directory(
-        self, node: ContextNode, ctx: RequestContext
-    ) -> OutboxEvent:
+    def register_directory(self, node: ContextNode, ctx: RequestContext) -> OutboxEvent:
+        self.bind_context(ctx)
         dir_uri = self._node_uri_to_directory_uri(node.uri)
         abstracts = self._collect_sibling_abstracts(node.uri, ctx)
 
@@ -332,31 +322,127 @@ class SQLOutboxStore:
 
         return [self._row_to_event(row) for row in rows]
 
+    def list_recent(self, account_id: str, limit: int = 200) -> list[tuple[str, OutboxEvent]]:
+        """Return recent live and failed index tasks for the task center."""
+        conn = self._get_connection()
+        try:
+            with conn.cursor() as cur:
+                cur.execute(
+                    """
+                    SELECT event_id, event_type, uri, payload, status,
+                           retry_count, created_at, next_retry_at
+                    FROM outbox_events
+                    WHERE account_id = %s
+                      AND status IN ('PENDING', 'PROCESSING', 'FAILED')
+                    ORDER BY created_at DESC
+                    LIMIT %s
+                    """,
+                    (account_id, limit),
+                )
+                rows = cur.fetchall()
+        finally:
+            conn.rollback()
+            self._return_connection(conn)
+
+        return [self._row_to_event(row) for row in rows]
+
+    def get_event(self, account_id: str, event_id: str) -> OutboxEvent | None:
+        """Return one task scoped to an account."""
+        conn = self._get_connection()
+        try:
+            with conn.cursor() as cur:
+                cur.execute(
+                    """
+                    SELECT event_id, event_type, uri, payload, status,
+                           retry_count, created_at, next_retry_at
+                    FROM outbox_events
+                    WHERE account_id = %s AND event_id = %s
+                    """,
+                    (account_id, event_id),
+                )
+                row = cur.fetchone()
+        finally:
+            conn.rollback()
+            self._return_connection(conn)
+        return self._row_to_event(row)[1] if row else None
+
+    def retry_failed(self, account_id: str, event: OutboxEvent) -> OutboxEvent | None:
+        """Atomically requeue a failed task with a fresh retry budget."""
+        payload = dict(event.payload)
+        payload.pop("failure_reason", None)
+        conn = self._get_connection()
+        try:
+            with conn.cursor() as cur:
+                cur.execute(
+                    """
+                    UPDATE outbox_events
+                    SET status = 'PENDING', retry_count = 0, payload = %s,
+                        next_retry_at = NULL, worker_id = NULL, locked_at = NULL
+                    WHERE account_id = %s AND event_id = %s AND status = 'FAILED'
+                    RETURNING event_id, event_type, uri, payload, status,
+                              retry_count, created_at, next_retry_at
+                    """,
+                    (Json(payload), account_id, event.event_id),
+                )
+                row = cur.fetchone()
+                if row:
+                    self.sql_dialect.notify_outbox(
+                        cur,
+                        self.notify_channel,
+                        json.dumps({
+                            "event_id": event.event_id,
+                            "account_id": account_id,
+                            "event_type": event.event_type,
+                        }, ensure_ascii=False),
+                    )
+            conn.commit()
+        except Exception:
+            conn.rollback()
+            raise
+        finally:
+            self._return_connection(conn)
+        return self._row_to_event(row)[1] if row else None
+
     def claim_batch(
         self,
         worker_id: str,
         limit: int = 100,
         timeout_seconds: int = 300,
     ) -> list[tuple[str, OutboxEvent]]:
-        """Atomically claim a batch of ready events across all accounts."""
+        """Atomically claim ready events while preserving per-URI order."""
         conn = self._get_connection()
         try:
             with conn.cursor() as cur:
                 cur.execute(
                     """
                     WITH ready AS (
-                        SELECT event_id
-                        FROM outbox_events
+                        SELECT candidate.event_id
+                        FROM outbox_events AS candidate
                         WHERE (
-                                status = 'PENDING'
-                                AND (next_retry_at IS NULL OR next_retry_at <= NOW())
+                                (
+                                    candidate.status = 'PENDING'
+                                    AND (
+                                        candidate.next_retry_at IS NULL
+                                        OR candidate.next_retry_at <= NOW()
+                                    )
+                                )
+                                OR (
+                                    candidate.status = 'PROCESSING'
+                                    AND candidate.locked_at
+                                        < NOW() - %s * interval '1 second'
+                                )
                               )
-                           OR (
-                                status = 'PROCESSING'
-                                AND locked_at < NOW() - %s * interval '1 second'
+                          AND NOT EXISTS (
+                                SELECT 1
+                                FROM outbox_events AS earlier
+                                WHERE earlier.account_id = candidate.account_id
+                                  AND earlier.uri = candidate.uri
+                                  AND earlier.seq < candidate.seq
+                                  AND earlier.status IN ('PENDING', 'PROCESSING')
                               )
-                        ORDER BY seq ASC NULLS LAST, created_at ASC
-                        FOR UPDATE SKIP LOCKED
+                        ORDER BY candidate.seq ASC NULLS LAST,
+                                 candidate.created_at ASC
+                        FOR UPDATE OF candidate SKIP LOCKED
                         LIMIT %s
                     ),
                     claimed AS (
@@ -424,13 +510,45 @@ class SQLOutboxStore:
             cur.execute(f"LISTEN {self.notify_channel}")
         return conn
 
+    @contextmanager
+    def processing_lock(self, node_uri: str):
+        """Serialize all side effects for one URI across worker processes."""
+        lock_key = _uri_processing_lock_key(node_uri)
+        conn = psycopg2.connect(
+            self._connection_string,
+            connect_timeout=_PROCESSING_LOCK_CONNECT_TIMEOUT_SECONDS,
+        )
+        acquired = False
+        try:
+            conn.set_session(autocommit=True)
+            deadline = time.monotonic() + _PROCESSING_LOCK_TIMEOUT_SECONDS
+            with conn.cursor() as cur:
+                while True:
+                    cur.execute("SELECT pg_try_advisory_lock(%s)", (lock_key,))
+                    acquired = bool(cur.fetchone()[0])
+                    if acquired:
+                        break
+                    remaining = deadline - time.monotonic()
+                    if remaining <= 0:
+                        raise TimeoutError("timed out acquiring URI processing lock")
+                    time.sleep(min(_PROCESSING_LOCK_POLL_SECONDS, remaining))
+            yield
+        finally:
+            if acquired and conn.closed == 0:
+                try:
+                    with conn.cursor() as cur:
+                        cur.execute("SELECT pg_advisory_unlock(%s)", (lock_key,))
+                except Exception:
+                    conn.close()
+            if conn.closed == 0:
+                conn.close()
+
     def mark_processing(self, event: OutboxEvent, node_uri: str) -> None:
         conn = self._get_connection()
         try:
             with conn.cursor() as cur:
                 cur.execute(
-                    "UPDATE outbox_events SET status = 'PROCESSING' "
-                    "WHERE event_id = %s",
+                    "UPDATE outbox_events SET status = 'PROCESSING' WHERE event_id = %s",
                     (event.event_id,),
                 )
             conn.commit()
@@ -441,7 +559,7 @@ class SQLOutboxStore:
         finally:
             self._return_connection(conn)
 
-    def is_event_current(self, event_id: str) -> bool:
+    def is_event_current(self, event_id: str, node_uri: str | None = None) -> bool:
         """Check whether an event still exists in the outbox table.
 
         Returns True if the event row exists, False if it was deleted
@@ -451,10 +569,16 @@ class SQLOutboxStore:
         conn = self._get_connection()
         try:
             with conn.cursor() as cur:
-                cur.execute(
-                    "SELECT 1 FROM outbox_events WHERE event_id = %s",
-                    (event_id,),
-                )
+                if node_uri is None:
+                    cur.execute(
+                        "SELECT 1 FROM outbox_events WHERE event_id = %s",
+                        (event_id,),
+                    )
+                else:
+                    cur.execute(
+                        "SELECT 1 FROM outbox_events WHERE event_id = %s AND uri = %s",
+                        (event_id, node_uri),
+                    )
                 exists = cur.fetchone() is not None
             conn.commit()
             return exists
@@ -484,9 +608,12 @@ class SQLOutboxStore:
         try:
             with conn.cursor() as cur:
                 cur.execute(
-                    "UPDATE outbox_events SET status = 'FAILED' "
-                    "WHERE event_id = %s",
-                    (event.event_id,),
+                    """
+                    UPDATE outbox_events
+                    SET status = 'FAILED', payload = %s
+                    WHERE event_id = %s
+                    """,
+                    (Json(event.payload), event.event_id),
                 )
             conn.commit()
             event.status = "FAILED"
@@ -510,12 +637,13 @@ class SQLOutboxStore:
                     UPDATE outbox_events
                     SET retry_count = retry_count + 1,
                         status = 'PENDING',
+                        payload = %s,
                         next_retry_at = %s,
                         worker_id = NULL,
                         locked_at = NULL
                     WHERE event_id = %s
                     """,
-                    (next_retry_at, event.event_id),
+                    (Json(event.payload), next_retry_at, event.event_id),
                 )
             conn.commit()
             event.retry_count += 1

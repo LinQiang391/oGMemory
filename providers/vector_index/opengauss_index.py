@@ -286,6 +286,33 @@ class OpenGaussVectorIndex(VectorIndex):
 
         return [self._row_to_hit(r) for r in rows]
 
+    def get_embeddings(
+        self,
+        uris: list[str],
+        filters: dict[str, Any],
+        level: int = 0,
+    ) -> dict[str, list[float]]:
+        if not uris:
+            return {}
+        where, params = self._build_where({**filters, "level": level})
+        params["uris"] = uris
+        conn = self._get_connection()
+        try:
+            with conn.cursor() as cur:
+                cur.execute(
+                    f"SELECT uri, embedding::text FROM {self._table_name} "
+                    f"WHERE {where} AND uri=ANY(%(uris)s)",
+                    params,
+                )
+                rows = cur.fetchall()
+        finally:
+            self._return_connection(conn)
+        output: dict[str, list[float]] = {}
+        for uri, raw in rows:
+            text = str(raw).strip().strip("[]")
+            output[str(uri)] = [float(value) for value in text.split(",") if value]
+        return output
+
     def search_children(
         self,
         parent_uri: str,
@@ -373,11 +400,12 @@ class OpenGaussVectorIndex(VectorIndex):
             context_type=meta.get("context_type", ""),
             category=meta.get("category", ""),
             owner_space=filt.get("owner_space", ""),
-            abstract=row.get("text", "")[:200],
+            abstract=meta.get("abstract", row.get("text", "")[:200]),
             has_overview=meta.get("has_overview", False),
             has_content=meta.get("has_content", False),
             active_count=meta.get("active_count", 0),
             updated_at=meta.get("updated_at"),
+            metadata=dict(meta),
         )
 
     def delete_account_data(self, account_id: str) -> int:
@@ -398,6 +426,18 @@ class OpenGaussVectorIndex(VectorIndex):
                 )
                 conn.commit()
                 return cur.rowcount
+        finally:
+            self._return_connection(conn)
+
+    def count(self, filters: dict[str, Any] | None = None) -> int:
+        """Count index records, optionally constrained by filters."""
+        where_sql, params = self._build_where(filters or {})
+        conn = self._get_connection()
+        try:
+            with conn.cursor() as cur:
+                cur.execute(f"SELECT COUNT(*) FROM {self._table_name} WHERE {where_sql}", params)
+                row = cur.fetchone()
+                return int(row[0] if row else 0)
         finally:
             self._return_connection(conn)
 

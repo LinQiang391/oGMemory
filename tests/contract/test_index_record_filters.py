@@ -609,7 +609,8 @@ class TestIndexRecordFiltersEndToEnd:
         )
 
         records = build_index_records(node)  # Should not raise
-        assert len(records) == 3
+        assert len(records) == 2
+        assert {record.level for record in records} == {0, 2}
 
         # But if we manually create a record without filters...
         from index.index_record_builder import _validate_filters

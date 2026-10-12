@@ -160,7 +160,20 @@ class OutboxScheduler:
             self._metrics.total_dlq += stats.get("moved_to_dlq", 0)
             self._metrics.consecutive_errors = 0
             
-            logger.info(f"run_once completed: {stats}, worker_id={self._worker_id}")
+            # Empty polls are expected while the outbox is drained.  Keep
+            # those details available at DEBUG, but make actual work and
+            # queue failures visible at the normal service log level.
+            has_failure = bool(stats.get("failed", 0) or stats.get("moved_to_dlq", 0))
+            has_activity = any(
+                stats.get(key, 0)
+                for key in ("processed", "succeeded", "skipped")
+            )
+            if has_failure:
+                logger.warning("run_once completed with failures: %s, worker_id=%s", stats, self._worker_id)
+            elif has_activity:
+                logger.info("run_once completed: %s, worker_id=%s", stats, self._worker_id)
+            else:
+                logger.debug("run_once completed (empty poll): %s, worker_id=%s", stats, self._worker_id)
             return stats
             
         except Exception as e:

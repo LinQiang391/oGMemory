@@ -1,0 +1,28 @@
+{
+  "name": "@opengauss/ogmemory-dsh-plugin",
+  "version": "0.1.1",
+  "private": true,
+  "description": "Install oGMemory integration directly into DeepSeek Harness from GitCode",
+  "type": "module",
+  "main": "./deepseek-harness-plugin/index.js",
+  "exports": "./deepseek-harness-plugin/index.js",
+  "files": [
+    "deepseek-harness-plugin/index.js",
+    "deepseek-harness-plugin/lib",
+    "deepseek-harness-plugin/cordis.patch.yml"
+  ],
+  "dsh": {
+    "bundle": {
+      "patch": "./deepseek-harness-plugin/cordis.patch.yml"
+    }
+  },
+  "engines": {
+    "node": "^22.19.0 || >=24.0.0"
+  },
+  "peerDependencies": {
+    "@deepseek-ai/cordis": "^4.0.2",
+    "@deepseek-ai/dsh-llm": "0.1.5-rc.2",
+    "@deepseek-ai/dsh-tools": "0.1.5-rc.2"
+  },
+  "license": "MulanPSL-2.0"
+}

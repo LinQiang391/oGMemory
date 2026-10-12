@@ -1,0 +1,152 @@
+{
+  "description": "Connect every Codex lifecycle stage to oGMemory over HTTP.",
+  "hooks": {
+    "SessionStart": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "python3 \"${PLUGIN_ROOT}/scripts/ogmemory_codex_hook.py\"",
+            "commandWindows": "python \"${PLUGIN_ROOT}/scripts/ogmemory_codex_hook.py\"",
+            "timeout": 30,
+            "statusMessage": "Loading oGMemory session context",
+            "additionalContextLimit": 2500
+          }
+        ]
+      }
+    ],
+    "SessionEnd": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "python3 \"${PLUGIN_ROOT}/scripts/ogmemory_codex_hook.py\"",
+            "commandWindows": "python \"${PLUGIN_ROOT}/scripts/ogmemory_codex_hook.py\"",
+            "timeout": 3,
+            "statusMessage": "Finalizing oGMemory session"
+          }
+        ]
+      }
+    ],
+    "UserPromptSubmit": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "python3 \"${PLUGIN_ROOT}/scripts/ogmemory_codex_hook.py\"",
+            "commandWindows": "python \"${PLUGIN_ROOT}/scripts/ogmemory_codex_hook.py\"",
+            "timeout": 15,
+            "statusMessage": "Recalling oGMemory context",
+            "additionalContextLimit": 2500
+          }
+        ]
+      }
+    ],
+    "PreToolUse": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "python3 \"${PLUGIN_ROOT}/scripts/ogmemory_codex_hook.py\"",
+            "commandWindows": "python \"${PLUGIN_ROOT}/scripts/ogmemory_codex_hook.py\"",
+            "timeout": 15,
+            "statusMessage": "Recalling tool context from oGMemory",
+            "additionalContextLimit": 1800
+          }
+        ]
+      }
+    ],
+    "PermissionRequest": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "python3 \"${PLUGIN_ROOT}/scripts/ogmemory_codex_hook.py\"",
+            "commandWindows": "python \"${PLUGIN_ROOT}/scripts/ogmemory_codex_hook.py\"",
+            "timeout": 8,
+            "statusMessage": "Recording Codex permission request"
+          }
+        ]
+      }
+    ],
+    "PostToolUse": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "python3 \"${PLUGIN_ROOT}/scripts/ogmemory_codex_hook.py\"",
+            "commandWindows": "python \"${PLUGIN_ROOT}/scripts/ogmemory_codex_hook.py\"",
+            "timeout": 8,
+            "statusMessage": "Recording tool result in oGMemory"
+          }
+        ]
+      }
+    ],
+    "PreCompact": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "python3 \"${PLUGIN_ROOT}/scripts/ogmemory_codex_hook.py\"",
+            "commandWindows": "python \"${PLUGIN_ROOT}/scripts/ogmemory_codex_hook.py\"",
+            "timeout": 15,
+            "statusMessage": "Preparing oGMemory compaction"
+          }
+        ]
+      }
+    ],
+    "PostCompact": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "python3 \"${PLUGIN_ROOT}/scripts/ogmemory_codex_hook.py\"",
+            "commandWindows": "python \"${PLUGIN_ROOT}/scripts/ogmemory_codex_hook.py\"",
+            "timeout": 15,
+            "statusMessage": "Committing oGMemory compaction"
+          }
+        ]
+      }
+    ],
+    "SubagentStart": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "python3 \"${PLUGIN_ROOT}/scripts/ogmemory_codex_hook.py\"",
+            "commandWindows": "python \"${PLUGIN_ROOT}/scripts/ogmemory_codex_hook.py\"",
+            "timeout": 30,
+            "statusMessage": "Loading oGMemory subagent context",
+            "additionalContextLimit": 2500
+          }
+        ]
+      }
+    ],
+    "SubagentStop": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "python3 \"${PLUGIN_ROOT}/scripts/ogmemory_codex_hook.py\"",
+            "commandWindows": "python \"${PLUGIN_ROOT}/scripts/ogmemory_codex_hook.py\"",
+            "timeout": 15,
+            "statusMessage": "Saving subagent result to oGMemory"
+          }
+        ]
+      }
+    ],
+    "Stop": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "python3 \"${PLUGIN_ROOT}/scripts/ogmemory_codex_hook.py\"",
+            "commandWindows": "python \"${PLUGIN_ROOT}/scripts/ogmemory_codex_hook.py\"",
+            "timeout": 15,
+            "statusMessage": "Saving turn to oGMemory"
+          }
+        ]
+      }
+    ]
+  }
+}

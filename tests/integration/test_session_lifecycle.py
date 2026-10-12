@@ -4,12 +4,13 @@ Tests the full flow: add messages → threshold → commit → get context.
 Uses mocked AGFS/LLM to avoid external dependencies.
 """
 
+from unittest.mock import Mock, patch
+
 import pytest
-from unittest.mock import Mock, patch, MagicMock
 
 from core.models import RequestContext
-from session.session_manager import SessionManager, SessionBuffer
 from server.memory_service import MemoryService, extract_content_text
+from session.session_manager import SessionManager
 
 
 @pytest.fixture
@@ -159,6 +160,21 @@ class TestMemoryServiceSessionIntegration:
         assert result["status"] == "accumulating"
         assert result["pending_tokens"] > 0
 
+    def test_after_turn_force_extract_bypasses_threshold(self, service):
+        mgr = service.get_session_manager()
+        with (
+            patch.object(service, "get_write_api", return_value=None),
+            patch.object(mgr, "commit", return_value={"status": "processing"}) as commit,
+        ):
+            result = service.after_turn({
+                "sessionId": "sess-force",
+                "messages": [{"role": "user", "content": "Short memory"}],
+                "forceExtract": True,
+            })
+
+        assert result["status"] == "processing"
+        commit.assert_called_once()
+
     def test_after_turn_commits_at_threshold(self, service):
         """after_turn triggers commit when pending_tokens >= threshold."""
         # First turn: accumulate
@@ -179,17 +195,18 @@ class TestMemoryServiceSessionIntegration:
 
     def test_compact_returns_summary(self, service):
         """compact() commits and returns summary with tokensBefore/After."""
+        service._cfg.after_turn_threshold = 100_000
         # Add messages first via after_turn with high threshold
         for i in range(3):
-            service.after_turn({
+            accumulated = service.after_turn({
                 "sessionId": "sess-compact",
                 "messages": [
                     {"role": "user", "content": f"Question {i}: " + "a" * 200},
                     {"role": "assistant", "content": f"Answer {i}: " + "b" * 200},
                 ],
                 "prePromptMessageCount": 0,
-                "commitTokenThreshold": 100_000,  # Don't auto-commit
             })
+            assert accumulated["status"] == "accumulating"
 
         # Now compact
         result = service.compact({

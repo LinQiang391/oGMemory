@@ -10,15 +10,16 @@ from __future__ import annotations
 
 import threading
 from concurrent.futures import ThreadPoolExecutor
+from datetime import UTC, datetime, timedelta
 
 import pytest
 
 from providers.token_tracker import (
-    TokenBucket,
     TokenTracker,
     current_buckets,
     pop_bucket,
     push_bucket,
+    usage_scope,
 )
 
 
@@ -97,12 +98,8 @@ def test_concurrent_threads_no_token_pollution() -> None:
             f"thread {idx}: LLM input contaminated — got {r['llm_input']}, "
             f"expected {r['expected_input']}"
         )
-        assert r["llm_output"] == r["expected_output"], (
-            f"thread {idx}: LLM output contaminated"
-        )
-        assert r["embed"] == r["expected_embed"], (
-            f"thread {idx}: embed contaminated"
-        )
+        assert r["llm_output"] == r["expected_output"], f"thread {idx}: LLM output contaminated"
+        assert r["embed"] == r["expected_embed"], f"thread {idx}: embed contaminated"
         assert r["llm_model"] == f"llm-{idx}"
         assert r["embed_model"] == f"embed-{idx}"
 
@@ -166,6 +163,97 @@ def test_recording_outside_any_bucket_is_safe() -> None:
     assert snap.input_tokens == 10
     assert snap.embed_tokens == 20
     assert snap.local_cache_hits == 1
+
+
+@pytest.mark.unit
+def test_daily_snapshot_tracks_llm_and_embedding_usage() -> None:
+    tracker = TokenTracker(model="m1")
+    tracker.record_llm(100, 25, cache_read=10, cache_write=5)
+    tracker.record_embed(40)
+
+    today = tracker.daily_snapshot(days=1)[0]
+
+    assert today["input_tokens"] == 100
+    assert today["output_tokens"] == 25
+    assert today["cache_read"] == 10
+    assert today["cache_write"] == 5
+    assert today["llm_calls"] == 1
+    assert today["embed_tokens"] == 40
+    assert today["embed_calls"] == 1
+
+
+@pytest.mark.unit
+def test_scoped_snapshots_isolate_accounts_and_owner_spaces() -> None:
+    tracker = TokenTracker(model="m1")
+    with usage_scope("acct-a", "user:alice"):
+        tracker.record_llm(100, 20)
+        tracker.record_embed(30)
+    with usage_scope("acct-a", "agent:agent-a"):
+        tracker.record_llm(40, 10)
+    with usage_scope("acct-b", "user:bob"):
+        tracker.record_embed(70)
+
+    account = tracker.scoped_snapshot("acct-a")
+    alice = tracker.scoped_snapshot("acct-a", ("user:alice", "agent:agent-a"))
+    bob = tracker.daily_snapshot(1, account_id="acct-b", owner_spaces=("user:bob",))[0]
+
+    assert account.total_tokens == 200
+    assert alice.input_tokens == 140
+    assert bob["embed_tokens"] == 70
+
+
+@pytest.mark.unit
+def test_snapshot_and_reset_preserves_dashboard_history() -> None:
+    tracker = TokenTracker(model="m1")
+    with usage_scope("acct-a", "user:alice"):
+        tracker.record_llm(100, 20)
+        tracker.record_embed(30)
+
+    tracker.snapshot_and_reset()
+
+    assert tracker.snapshot().total_tokens == 0
+    assert tracker.scoped_snapshot("acct-a").total_tokens == 150
+    assert tracker.daily_snapshot(1, account_id="acct-a")[0]["embed_tokens"] == 30
+
+
+@pytest.mark.unit
+def test_shared_embed_batch_records_calls_for_each_owner_scope() -> None:
+    tracker = TokenTracker(model="embedding-test")
+
+    tracker.record_scoped_embed_distribution(
+        total_tokens=30,
+        embed_calls=1,
+        scope_weights={
+            ("acct-a", "user:alice"): 2,
+            ("acct-a", "agent:assistant"): 1,
+        },
+    )
+
+    user = tracker.scoped_snapshot("acct-a", ("user:alice",))
+    agent = tracker.scoped_snapshot("acct-a", ("agent:assistant",))
+    account = tracker.scoped_snapshot("acct-a")
+    assert (user.embed_tokens, user.embed_calls) == (20, 1)
+    assert (agent.embed_tokens, agent.embed_calls) == (10, 1)
+    assert (account.embed_tokens, account.embed_calls) == (30, 2)
+
+
+@pytest.mark.unit
+def test_record_prunes_daily_usage_older_than_90_days() -> None:
+    tracker = TokenTracker(model="m1")
+    today = datetime.now(UTC).date()
+    stale_date = (today - timedelta(days=90)).isoformat()
+    retained_date = (today - timedelta(days=89)).isoformat()
+    stale_scope = ("acct-old", "user:old")
+    tracker._daily_usage[stale_date] = {"embed_tokens": 1}
+    tracker._daily_usage[retained_date] = {"embed_tokens": 1}
+    tracker._daily_usage_by_scope[stale_scope] = {stale_date: {"embed_tokens": 1}}
+
+    with usage_scope("acct-a", "user:alice"):
+        tracker.record_embed(10)
+
+    assert stale_date not in tracker._daily_usage
+    assert retained_date in tracker._daily_usage
+    assert stale_scope not in tracker._daily_usage_by_scope
 
 
 @pytest.mark.unit

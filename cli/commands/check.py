@@ -47,18 +47,28 @@ def run(args) -> int:
         v = get_version(cmd) if shutil.which(cmd) else None
         check(v, f"{name}: {v}", f"{name} not installed", is_warn=opt)
 
-    # Section 2: AGFS service
-    print("\n" + "-" * 40 + "\n  Section 2: AGFS Service\n" + "-" * 40)
-    check(shutil.which("agfs-server"), "agfs-server found", "agfs-server not found")
-    agfs_cfg = os.path.expanduser("~/.agfs-config.yaml")
-    check(os.path.exists(agfs_cfg), "~/.agfs-config.yaml exists", "~/.agfs-config.yaml not found")
+    # Onboard knows its selected backend; SQL local and Docker do not need host AGFS.
+    mode = getattr(args, "mode", None)
+    backend = getattr(args, "storage_backend", None) or "sql"
+    needs_host_agfs = mode not in {"docker", "local", "headless"} or (
+        mode in {"local", "headless"} and backend == "agfs"
+    )
+    if needs_host_agfs:
+        # Section 2: AGFS service
+        print("\n" + "-" * 40 + "\n  Section 2: AGFS Service\n" + "-" * 40)
+        check(shutil.which("agfs-server"), "agfs-server found", "agfs-server not found")
+        agfs_cfg = os.path.expanduser("~/.agfs-config.yaml")
+        check(os.path.exists(agfs_cfg), "~/.agfs-config.yaml exists", "~/.agfs-config.yaml not found")
 
-    health = check_agfs()
-    check(health, f"AGFS running (port 1833)", "AGFS not responding on port 1833")
+        health = check_agfs()
+        check(health, f"AGFS running (port 1833)", "AGFS not responding on port 1833")
 
-    agfs_data = os.environ.get("AGFS_DATA_DIR", "/tmp/agfs-data")
-    check(os.path.isdir(agfs_data), f"AGFS data directory: {agfs_data}",
-          f"AGFS data directory not found: {agfs_data}")
+        agfs_data = os.environ.get("AGFS_DATA_DIR", "/tmp/agfs-data")
+        check(os.path.isdir(agfs_data), f"AGFS data directory: {agfs_data}",
+              f"AGFS data directory not found: {agfs_data}")
+
+    else:
+        print(info("Host AGFS checks skipped for the selected deployment/storage mode"))
 
     # Section 3: Python packages
     print("\n" + "-" * 40 + "\n  Section 3: Python Packages\n" + "-" * 40)

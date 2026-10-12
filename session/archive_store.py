@@ -18,7 +18,7 @@ from pathlib import PurePosixPath
 from typing import Any, Optional
 
 from core.interfaces import ContextFS
-from core.models import RequestContext, ContextNode
+from core.models import RequestContext, ContextNode, Role
 from session.models import ArchiveEntry, ArchiveWriteResult
 
 
@@ -40,7 +40,10 @@ def session_uri_to_path(account_id: str, session_id: str, archive_id: str) -> st
 
 
 def _is_merged_metadata(metadata: dict | None) -> bool:
-    return str((metadata or {}).get("status", "")).upper() == "MERGED"
+    metadata = metadata or {}
+    return str(
+        metadata.get("archive_status", metadata.get("status", ""))
+    ).upper() == "MERGED"
 
 
 class SessionArchiveStore:
@@ -61,6 +64,36 @@ class SessionArchiveStore:
 
     def _archive_uri(self, account_id: str, session_id: str, archive_id: str) -> str:
         return f"ctx://{account_id}/sessions/{session_id}/history/{archive_id}"
+
+    def _lifecycle_archive_uris(
+        self,
+        session_id: str,
+        ctx: RequestContext,
+    ) -> list[str]:
+        session_uri = f"ctx://{ctx.account_id}/sessions/{session_id}/history/"
+        list_all = (
+            getattr(self.fs, "list_children_including_inactive", None)
+            if hasattr(type(self.fs), "list_children_including_inactive")
+            else None
+        )
+        return (
+            list_all(session_uri, ctx)
+            if callable(list_all)
+            else self.fs.list_children(session_uri, ctx)
+        )
+
+    def _lifecycle_archive_metadata(self, uri: str, ctx: RequestContext) -> dict:
+        try:
+            return dict(self.fs.read_node(uri, ctx).metadata or {})
+        except Exception:
+            read_all = (
+                getattr(self.fs, "read_node_metadata_including_inactive", None)
+                if hasattr(type(self.fs), "read_node_metadata_including_inactive")
+                else None
+            )
+            if not callable(read_all):
+                raise
+            return dict(read_all(uri, ctx) or {})
 
     def write_archive(
         self,
@@ -102,14 +135,15 @@ class SessionArchiveStore:
         try:
             # Build metadata
             now = datetime.now(timezone.utc).isoformat()
-            archive_metadata = {
+            archive_metadata = dict(metadata or {})
+            archive_metadata.update({
                 "archive_id": archive_id,
                 "session_id": session_id,
                 "created_at": now,
                 "message_count": len(messages),
-            }
-            if metadata:
-                archive_metadata.update(metadata)
+                "owner_user_id": ctx.user_id,
+                "owner_agent_id": ctx.agent_id,
+            })
 
             # Build a ContextNode for the archive
             # Store messages as JSON in content field
@@ -278,6 +312,46 @@ class SessionArchiveStore:
         except Exception:
             return False
 
+    def delete_session_archives(self, session_id: str, ctx: RequestContext) -> int:
+        """Delete archives owned by the callback identity.
+
+        Legacy archives written before durable owner metadata was introduced
+        may have both owner fields empty.  Only an ADMIN/ROOT lifecycle
+        callback may remove those rows; ordinary members remain restricted to
+        their exact owner tuple.
+        """
+        deleted = 0
+        role = ctx.role if isinstance(ctx.role, Role) else Role(str(ctx.role).upper())
+        may_delete_legacy = role in (Role.ADMIN, Role.ROOT)
+        for uri in self._lifecycle_archive_uris(session_id, ctx):
+            metadata = self._lifecycle_archive_metadata(uri, ctx)
+            owner_user = str(metadata.get("owner_user_id", ""))
+            owner_agent = str(metadata.get("owner_agent_id", ""))
+            exact_owner = owner_user == ctx.user_id and owner_agent == ctx.agent_id
+            legacy_ownerless = not owner_user and not owner_agent
+            if not exact_owner and not (may_delete_legacy and legacy_ownerless):
+                continue
+            self.fs.delete_node(uri, ctx)
+            deleted += 1
+        return deleted
+
+    def get_session_owner(self, session_id: str, ctx: RequestContext) -> tuple[str, str] | None:
+        """Return a durable owner without the best-effort list API's error suppression."""
+        owners = set()
+        for uri in self._lifecycle_archive_uris(session_id, ctx):
+            metadata = self._lifecycle_archive_metadata(uri, ctx)
+            owners.add((
+                str(metadata.get("owner_user_id", "")),
+                str(metadata.get("owner_agent_id", "")),
+            ))
+        owners.discard(("", ""))
+        if len(owners) > 1:
+            raise PermissionError("conflicting durable session owners")
+        owner = next(iter(owners)) if owners else None
+        if owner is not None and not all(owner):
+            raise PermissionError("invalid durable session owner metadata")
+        return owner
+
     def unmark_archive_merged(
         self,
         session_id: str,
@@ -295,7 +369,9 @@ class SessionArchiveStore:
                 metadata = dict(node.metadata or {})
                 if metadata.get("merged_into") != merged_into:
                     return False
-                metadata.pop("status", None)
+                metadata.pop("archive_status", None)
+                if str(metadata.get("status", "")).upper() == "MERGED":
+                    metadata.pop("status", None)
                 metadata.pop("merged_into", None)
                 metadata.pop("merged_at", None)
                 self.fs.write_node(
@@ -333,7 +409,7 @@ class SessionArchiveStore:
                 metadata = dict(node.metadata or {})
                 metadata.setdefault("archive_id", archive_id)
                 metadata.setdefault("session_id", session_id)
-                metadata["status"] = "MERGED"
+                metadata["archive_status"] = "MERGED"
                 metadata["merged_into"] = merged_into
                 metadata["merged_at"] = datetime.now(timezone.utc).isoformat()
                 self.fs.write_node(

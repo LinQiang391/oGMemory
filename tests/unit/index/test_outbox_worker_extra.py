@@ -27,6 +27,25 @@ def test_build_request_context_from_user_uri():
     assert ctx.agent_id == "outbox-worker"
 
 
+def test_usage_context_attributes_user_uri_to_user_owner():
+    worker = OutboxWorker(vector_index=Mock(), embedder=Mock())
+    event = OutboxEvent(
+        event_id="evt-usage",
+        event_type="UPSERT_CONTEXT",
+        uri="ctx://acct-1/users/u1/memories/preferences/item",
+        payload={},
+        status="PENDING",
+    )
+
+    worker_ctx = worker._build_request_context(event)
+    usage_ctx = worker._usage_context_for_event(event, worker_ctx)
+
+    assert worker_ctx.agent_id == "outbox-worker"
+    assert usage_ctx.account_id == "acct-1"
+    assert usage_ctx.user_id == "u1"
+    assert usage_ctx.agent_id == ""
+
+
 def test_run_once_passes_built_context_to_process_event(monkeypatch):
     worker = OutboxWorker(vector_index=Mock(), embedder=Mock())
     event = OutboxEvent(

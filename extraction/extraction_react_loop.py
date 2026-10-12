@@ -5,13 +5,22 @@ Implements iterative tool-assisted extraction with safety checks.
 
 from __future__ import annotations
 
+import hashlib
 import json
+from copy import deepcopy
 from dataclasses import dataclass, field
 from logging import getLogger
 from typing import Any
 
-from core.interfaces import ContextFS, LLM
-from core.models import CandidateMemory, RequestContext
+from core.errors import (
+    ExtractionIncompleteError,
+    OperationDeadlineExceededError,
+    ToolCallProtocolError,
+    ValidationError,
+)
+from core.interfaces import LLM, ContextFS
+from core.models import CandidateMemory, ContextNode, RequestContext
+from core.operation_deadline import check_deadline
 from core.react_loop import (
     ReactIterationTrace,
     ReactLoop,
@@ -20,9 +29,20 @@ from core.react_loop import (
     ReactTrace,
 )
 from core.uri_resolver import URIResolver
+from core.validation import validate_candidate
+from extraction.incremental_edit import (
+    INCREMENTAL_TOOLS,
+    coalesce_incremental_edits,
+    incremental_read_key,
+)
 from extraction.prefetch import MemoryPrefetcher, PrefetchResult
 from extraction.schemas.registry import SchemaRegistry
-from extraction.tool_builder import build_extraction_tools, parse_tool_call
+from extraction.tool_builder import (
+    build_extraction_tools,
+    build_update_instruction,
+    parse_tool_call,
+    validate_read_target,
+)
 
 logger = getLogger(__name__)
 
@@ -107,6 +127,8 @@ class ExtractionReActResult:
     iterations: int = 0
     read_uris: set[str] = field(default_factory=set)
     trace: ExtractionTrace | None = None
+    read_versions: dict[str, int] = field(default_factory=dict)
+    read_nodes: dict[str, ContextNode] = field(default_factory=dict)
 
 
 class ExtractionReActLoop(ReactLoop):
@@ -151,11 +173,20 @@ class ExtractionReActLoop(ReactLoop):
         self._prompt_manager = prompt_manager
 
         self._extraction_tools = build_extraction_tools(registry)
+        self._update_instruction = build_update_instruction(registry)
 
         # All available tools: read, list, relations, access_stats, and extraction tools
         self._all_tools = [_READ_TOOL, _LIST_TOOL, _RELATIONS_TOOL, _ACCESS_STATS_TOOL] + self._extraction_tools
 
         self._did_safety_reread: bool = False
+        self._read_versions: dict[str, int] = {}
+        self._read_nodes = {}
+        self._edit_contents = {}
+        self._materialized_edits = []
+        self._edit_candidates = {}
+        self._edit_errors = []
+        self._extraction_errors = []
+        self._ctx = None
 
     def run(
         self,
@@ -163,9 +194,18 @@ class ExtractionReActLoop(ReactLoop):
         ctx: RequestContext,
         prefetch_result: PrefetchResult | None = None,
     ) -> ExtractionReActResult:
+        check_deadline()
         # Reset runtime state
         self._read_uris = set()
         self._did_safety_reread = False
+        self._read_versions = dict(prefetch_result.read_versions) if prefetch_result else {}
+        self._read_nodes = deepcopy(prefetch_result.read_nodes) if prefetch_result else {}
+        self._edit_contents = {}
+        self._materialized_edits = []
+        self._edit_candidates = {}
+        self._edit_errors = []
+        self._extraction_errors = []
+        self._ctx = ctx
 
         # Track prefetch URIs if provided
         if prefetch_result:
@@ -177,6 +217,11 @@ class ExtractionReActLoop(ReactLoop):
         )
 
         loop_result = super().run(ctx, task_ctx)
+        check_deadline()
+        if not loop_result.completed:
+            raise ExtractionIncompleteError(
+                f"Extraction did not complete: {loop_result.finish_reason}"
+            )
         return self._to_extraction_react_result(loop_result, ctx)
 
     def _get_tools(self) -> list[dict]:
@@ -217,6 +262,7 @@ class ExtractionReActLoop(ReactLoop):
 
         # Build system prompt: system_prompt + identity + lazy_tools + examples + output
         system_content = f"{system_prompt}\n\n{identity_block}\n\n{lazy_tools}\n\n{examples}\n\n{output_instruction}"
+        system_content += "\n\n" + self._update_instruction
 
         messages = [{"role": "system", "content": system_content}]
 
@@ -226,8 +272,8 @@ class ExtractionReActLoop(ReactLoop):
                 # Lazy mode: add lightweight URI hints, LLM reads on demand
                 hints_block = self._format_prefetch_hints(prefetch_result.uri_hints)
                 messages.append({"role": "system", "content": hints_block})
-            elif prefetch_result.messages:
-                # Eager mode: inject full content (legacy behavior)
+            if prefetch_result.messages:
+                # Full bodies or identity catalogs accompany lazy hints as well.
                 for msg in prefetch_result.messages:
                     messages.append({"role": "system", "content": msg})
 
@@ -260,6 +306,7 @@ class ExtractionReActLoop(ReactLoop):
         input: dict,
         ctx: RequestContext,
     ) -> dict | str:
+        check_deadline()
         try:
             if name == "read":
                 uri = input.get("uri", "")
@@ -267,6 +314,8 @@ class ExtractionReActLoop(ReactLoop):
                     return {"error": "Missing required parameter: uri"}
 
                 node = self._fs.read_node(uri, ctx)
+                self._read_versions[uri] = node.metadata.get("version", 0)
+                self._read_nodes[uri] = deepcopy(node)
                 return {
                     "uri": uri,
                     "abstract": node.abstract,
@@ -294,22 +343,50 @@ class ExtractionReActLoop(ReactLoop):
                 uri = input.get("uri", "")
                 return self._execute_get_stats(uri, ctx)
 
-            # Extraction tools are parsed later, just record status
+            elif name in INCREMENTAL_TOOLS:
+                candidate = self._to_candidate(name, input)
+                operation_id = len(self._materialized_edits)
+                self._materialized_edits.append(deepcopy(candidate))
+                return {"status": "recorded", "operation_id": operation_id}
+
             elif name.startswith("extract_"):
+                candidate = self._to_candidate(name, input)
+                if candidate is None:
+                    raise ToolCallProtocolError(f"{name} did not produce a schema-valid candidate")
+                validate_candidate(candidate)
+                validate_read_target(candidate, self._read_versions, read_nodes=self._read_nodes, ctx=ctx)
                 return {"status": "recorded"}
 
             else:
                 return {"error": f"Unknown tool: {name}"}
 
+        except OperationDeadlineExceededError:
+            raise
         except Exception as e:
+            if name in INCREMENTAL_TOOLS:
+                self._edit_errors.append(str(e))
+            elif name.startswith("extract_"):
+                if not isinstance(e, (ValidationError, ToolCallProtocolError)):
+                    raise
+                self._extraction_errors.append(e)
             logger.error(f"Tool execution failed for {name}: {e}")
             return {"error": str(e)}
 
     def _to_candidate(self, tool_name: str, tool_input: dict) -> CandidateMemory | None:
-        """Convert extract_* tool call to CandidateMemory.
+        """Convert an extraction or incremental tool call to CandidateMemory.
 
         Unified parsing used by both _parse_output and _to_extraction_react_result.
         """
+        if tool_name in INCREMENTAL_TOOLS:
+            key = incremental_read_key(tool_input)
+            parsed = parse_tool_call(
+                tool_name, tool_input, self._registry, read_nodes=self._read_nodes, ctx=self._ctx,
+                current_content=self._edit_contents.get(key),
+            )
+            candidate = parsed[2]
+            self._edit_contents[key] = candidate.content
+            self._edit_candidates[id(candidate)] = candidate
+            return candidate
         if not tool_name.startswith("extract_"):
             return None
         if "raw" in tool_input and len(tool_input) == 1:
@@ -325,57 +402,83 @@ class ExtractionReActLoop(ReactLoop):
             return candidate
         return None
 
+    def _build_final_instruction(self) -> str:
+        return (
+            "Do not call any more tools. Return ONLY a JSON array of remaining "
+            "extraction operations, each with name and input. "
+            "Operations already recorded through extract_*, edit_memory or append_memory "
+            "tools need not be repeated. "
+            "If all operations have been recorded or there are no memories, return []."
+        )
+
     def _parse_output(self, content: str) -> list[Any] | None:
+        # JSON output is tentative until safety checks accept it. Compose within
+        # this output, retaining native edits but never committing discarded JSON.
+        recorded_contents = self._edit_contents.copy()
         try:
-            data = json.loads(content)
+            try:
+                values = [json.loads(content)]
+            except json.JSONDecodeError:
+                from providers.llm.openai_llm import OpenAILLM
 
-            candidates = []
+                values = OpenAILLM._extract_json_values_from_text(content)
 
-            # Handle different JSON structures
-            if isinstance(data, list):
-                items = data
-            elif isinstance(data, dict):
-                # Check for tool_calls key
-                if "tool_calls" in data:
-                    items = data["tool_calls"]
-                # Check for operations key
-                elif "operations" in data:
-                    items = data["operations"]
-                else:
-                    # Treat dict itself as single operation
-                    items = [data]
-            else:
-                logger.warning(f"Unexpected JSON structure: {type(data)}")
-                return None
-
-            for item in items:
-                if not isinstance(item, dict):
+            has_empty_output = False
+            for data in values:
+                if data == [] or (
+                    isinstance(data, dict)
+                    and data.get("tool_calls", data.get("operations")) == []
+                ):
+                    has_empty_output = True
                     continue
+                candidates = self._candidates_from_json(data)
+                if candidates:
+                    return candidates
+            return [] if has_empty_output else None
 
-                tool_name = item.get("name", "")
-                tool_input = item.get("input", item)
-
-                if not tool_name.startswith("extract_"):
-                    # Maybe input has the tool name
-                    for key in item.keys():
-                        if key.startswith("extract_"):
-                            tool_name = key
-                            tool_input = item[key]
-                            break
-
-                # Use unified _to_candidate method
-                candidate = self._to_candidate(tool_name, tool_input)
-                if candidate:
-                    candidates.append(candidate)
-
-            return candidates if candidates else None
-
+        except ToolCallProtocolError:
+            raise
         except json.JSONDecodeError:
             logger.warning("Failed to parse content as JSON")
             return None
         except Exception as e:
             logger.error(f"Error parsing operations: {e}")
             return None
+        finally:
+            self._edit_contents = recorded_contents
+
+    def _candidates_from_json(self, data: Any) -> list[Any]:
+        if isinstance(data, list):
+            items = data
+        elif isinstance(data, dict):
+            if "tool_calls" in data:
+                items = data["tool_calls"]
+            elif "operations" in data:
+                items = data["operations"]
+            else:
+                items = [data]
+        else:
+            logger.warning(f"Unexpected JSON structure: {type(data)}")
+            return []
+
+        candidates = []
+        for item in items:
+            if not isinstance(item, dict):
+                continue
+
+            tool_name = item.get("name", "") or item.get("tool", "")
+            tool_input = item.get("input", item)
+            if not tool_name.startswith("extract_") and tool_name not in INCREMENTAL_TOOLS:
+                for key in item:
+                    if key.startswith("extract_"):
+                        tool_name = key
+                        tool_input = item[key]
+                        break
+
+            candidate = self._to_candidate(tool_name, tool_input)
+            if candidate:
+                candidates.append(candidate)
+        return candidates
 
     def _should_continue_after_output(
         self,
@@ -395,6 +498,13 @@ class ExtractionReActLoop(ReactLoop):
         ctx: RequestContext,
         iter_trace: ReactIterationTrace | None = None,
     ) -> bool:
+        # A failed native operation has no reliable correction ID. Restart the
+        # entire span through the existing eager fallback instead of forgetting it.
+        if self._extraction_errors:
+            raise ToolCallProtocolError(
+                "native extraction contains a failed operation: "
+                + str(self._extraction_errors[0])[:1000]
+            ) from self._extraction_errors[0]
         candidates = []
         extract_tool_names = []
         for tool_call in tool_calls:
@@ -486,7 +596,8 @@ class ExtractionReActLoop(ReactLoop):
         if self._did_safety_reread:
             return []
 
-        refetch_uris = []
+        refetch_uris: list[str] = []
+        seen_refetch_uris: set[str] = set()
 
         for candidate in candidates:
             schema = self._registry.get(candidate.category)
@@ -499,7 +610,9 @@ class ExtractionReActLoop(ReactLoop):
 
             fields = self._candidate_to_fields(candidate)
             try:
-                uri = self._uri_resolver.resolve(candidate.category, fields, ctx)
+                uri = candidate.target_uri or self._uri_resolver.resolve(candidate.category, fields, ctx)
+                if candidate.target_uri and not self._uri_resolver.validate_uri(uri, ctx):
+                    raise ToolCallProtocolError("memory update target must be in the current namespace")
             except Exception as e:
                 logger.warning(f"Failed to resolve URI for {candidate.category}: {e}")
                 continue
@@ -509,8 +622,9 @@ class ExtractionReActLoop(ReactLoop):
                 continue
 
             # Check if file exists
-            if self._fs.exists(uri, ctx):
+            if uri not in seen_refetch_uris and self._fs.exists(uri, ctx):
                 refetch_uris.append(uri)
+                seen_refetch_uris.add(uri)
 
         return refetch_uris
 
@@ -522,7 +636,10 @@ class ExtractionReActLoop(ReactLoop):
         for uri in refetch_uris:
             try:
                 node = self._fs.read_node(uri, ctx)
+                self._read_versions[uri] = node.metadata.get("version", 0)
+                self._read_nodes[uri] = deepcopy(node)
                 self._read_uris.add(uri)
+                call_id = f"refetch_{hashlib.sha256(uri.encode('utf-8')).hexdigest()[:16]}"
 
                 result = {
                     "uri": uri,
@@ -537,7 +654,7 @@ class ExtractionReActLoop(ReactLoop):
                     "role": "assistant",
                     "content": None,
                     "tool_calls": [{
-                        "id": f"refetch_{uri}",
+                        "id": call_id,
                         "type": "function",
                         "function": {
                             "name": "read",
@@ -548,7 +665,7 @@ class ExtractionReActLoop(ReactLoop):
 
                 messages.append({
                     "role": "tool",
-                    "tool_call_id": f"refetch_{uri}",
+                    "tool_call_id": call_id,
                     "content": json.dumps(result),
                 })
 
@@ -574,7 +691,7 @@ class ExtractionReActLoop(ReactLoop):
         for candidate in candidates:
             fields = self._candidate_to_fields(candidate)
             try:
-                uri = self._uri_resolver.resolve(candidate.category, fields, ctx)
+                uri = candidate.target_uri or self._uri_resolver.resolve(candidate.category, fields, ctx)
                 if not self._uri_resolver.validate_uri(uri, ctx):
                     errors.append(
                         f"Invalid URI for {candidate.category}/{candidate.routing_key}: {uri}"
@@ -643,13 +760,19 @@ class ExtractionReActLoop(ReactLoop):
                 final_candidate_count=len(loop_result.output),
             )
 
-        # Collect candidates from parsed output (content JSON)
-        candidates = [item for item in loop_result.output if isinstance(item, CandidateMemory)]
+        if self._edit_errors:
+            raise ToolCallProtocolError("incremental extraction contains failed operations")
+        if self._extraction_errors:
+            raise ToolCallProtocolError("native extraction contains failed operations")
+        # Materialized edits have already bound their snapshot at execution time.
+        entries = [(id(item) in self._edit_candidates, item) for item in loop_result.output
+                   if isinstance(item, CandidateMemory)]
 
         # Also extract candidates from tools_used (extract_* tool calls)
         # This handles cases where LLM used tool calling instead of outputting JSON
         # Skip records superseded by a safety refetch (pre-refetch candidates
         # were produced without reading existing content).
+        native_edits = []
         for tool_record in loop_result.tools_used:
             if tool_record.get("superseded"):
                 continue
@@ -658,9 +781,24 @@ class ExtractionReActLoop(ReactLoop):
             tool_result = tool_record.get("result", {})
             # Use params (original input) with unified _to_candidate method
             if tool_result.get("status") == "recorded":
-                candidate = self._to_candidate(tool_name, tool_params)
+                incremental = tool_name in INCREMENTAL_TOOLS
+                if incremental:
+                    candidate = self._materialized_edits[tool_result["operation_id"]]
+                else:
+                    candidate = self._to_candidate(tool_name, tool_params)
                 if candidate:
-                    candidates.append(candidate)
+                    if incremental:
+                        native_edits.append((True, candidate))
+                    else:
+                        entries.append((False, candidate))
+
+        # Native calls precede final JSON. Keep that chronology for composed edits,
+        # while retaining the original relative order of complete extract operations.
+        entries = native_edits + entries
+        for incremental, candidate in entries:
+            if not incremental:
+                validate_read_target(candidate, self._read_versions, read_nodes=self._read_nodes, ctx=ctx)
+        candidates = coalesce_incremental_edits(entries)
 
         # Validate URIs before returning
         errors = self._validate_operations_uris(candidates, ctx)
@@ -672,6 +810,6 @@ class ExtractionReActLoop(ReactLoop):
             tools_used=loop_result.tools_used,
             iterations=loop_result.iterations,
             read_uris=self._read_uris.copy(),
+            read_versions=self._read_versions.copy(), read_nodes=deepcopy(self._read_nodes),
             trace=trace,
         )
-

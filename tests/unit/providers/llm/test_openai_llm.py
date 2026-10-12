@@ -2,14 +2,19 @@
 
 from __future__ import annotations
 
+import json
 import logging
+import threading
+from contextlib import nullcontext
 from types import SimpleNamespace
 from unittest.mock import Mock
 
+import httpx
 import pytest
 
 import providers.llm as llm_package
 import providers.llm.openai_llm as openai_llm_module
+from core.errors import LLMTransientError, ToolCallProtocolError
 
 
 def _chat_response(
@@ -28,6 +33,16 @@ def _chat_response(
     )
 
 
+def _bad_request(message: str) -> openai_llm_module.BadRequestError:
+    request = httpx.Request("POST", "https://example.com/v1/chat/completions")
+    response = httpx.Response(400, request=request)
+    return openai_llm_module.BadRequestError(
+        message,
+        response=response,
+        body={"error": {"message": message}},
+    )
+
+
 @pytest.fixture
 def fake_client() -> Mock:
     return Mock()
@@ -41,6 +56,118 @@ def fake_openai_ctor(monkeypatch: pytest.MonkeyPatch, fake_client: Mock) -> Mock
 
 
 class TestOpenAILLM:
+    @pytest.mark.parametrize("mode", ["structured", "text", "tools", "messages"])
+    @pytest.mark.parametrize("failure", ["timeout", "connection", 429, 500, 503])
+    def test_transient_provider_failure_retains_retry_type_and_then_completes(self, fake_client, mode, failure):
+        from openai import APIConnectionError, APIStatusError, APITimeoutError
+
+        request = httpx.Request("POST", "https://example.test/v1/chat/completions")
+        if failure == "timeout":
+            error = APITimeoutError(request=request)
+        elif failure == "connection":
+            error = APIConnectionError(request=request)
+        else:
+            error = APIStatusError("temporary service failure", response=httpx.Response(failure, request=request), body={})
+        payload = '{"value":"recovered"}'
+        calls = [SimpleNamespace(function=SimpleNamespace(name="extract", arguments=payload))]
+        fake_client.chat.completions.create.side_effect = [error, _chat_response(content=payload, tool_calls=calls)]
+        llm = openai_llm_module.OpenAILLM(api_key="test-key", json_mode=mode == "structured")
+        schema = {"type": "object", "required": ["value"]}
+        tool = {"name": "extract", "description": "Extract", "input_schema": schema}
+
+        def complete():
+            if mode in {"structured", "text"}:
+                return llm.complete_json("Extract", schema)
+            if mode == "tools":
+                return llm.complete_with_tools("Extract", [tool], tool_choice="required")[0]["input"]
+            return llm.complete_with_tools_messages([{"role": "user", "content": "Extract"}], [tool])[0][0]["input"]
+
+        with pytest.raises(LLMTransientError) as caught:
+            complete()
+        assert caught.value.__cause__ is error
+        assert complete() == {"value": "recovered"}
+
+    @pytest.mark.parametrize("mode", ["structured", "text", "tools", "messages"])
+    @pytest.mark.parametrize("content", ["not even trying", '{"other":1}'])
+    def test_output_protocol_error_can_be_repaired_on_next_response(self, fake_client, mode, content):
+        llm = openai_llm_module.OpenAILLM(api_key="test-key", json_mode=mode == "structured")
+        schema = {"type": "object", "required": ["value"]}
+        tool = {"name": "extract", "description": "Extract", "input_schema": schema}
+        broken = content if mode in {"structured", "text"} else "not even trying"
+        fake_client.chat.completions.create.side_effect = [
+            _chat_response(content=broken, tool_calls=[SimpleNamespace(function=SimpleNamespace(name="extract", arguments=broken))]),
+            _chat_response(content='{"value":"repaired"}', tool_calls=[SimpleNamespace(
+                function=SimpleNamespace(name="extract", arguments='{"value":"repaired"}'))]),
+        ]
+
+        def complete():
+            if mode in {"structured", "text"}:
+                return llm.complete_json("Extract", schema)
+            if mode == "tools":
+                return llm.complete_with_tools("Extract", [tool], tool_choice="required")[0]["input"]
+            return llm.complete_with_tools_messages([{"role": "user", "content": "Extract"}], [tool])[0][0]["input"]
+
+        with pytest.raises(ToolCallProtocolError):
+            complete()
+        assert complete() == {"value": "repaired"}
+
+    @pytest.mark.parametrize("tools", [None, []])
+    def test_streamed_final_text_round_completes_with_sdk_and_usage(self, tools):
+        from openai import OpenAI
+
+        chunks = [
+            {"choices": [{"index": 0, "delta": {"role": "assistant", "content": "[]"},
+                           "finish_reason": None}]},
+            {"choices": [{"index": 0, "delta": {}, "finish_reason": "stop"}]},
+            {"choices": [], "usage": {"prompt_tokens": 20, "completion_tokens": 2, "total_tokens": 22}},
+        ]
+        events = "".join("data: " + json.dumps({"id": "final-round", "created": 1,
+                            "object": "chat.completion.chunk", "model": "extraction-model", **chunk})
+                         + "\n\n" for chunk in chunks) + "data: [DONE]\n\n"
+        requests = []
+
+        def respond(request):
+            requests.append(request)
+            return httpx.Response(200, headers={"content-type": "text/event-stream"}, content=events)
+
+        llm = openai_llm_module.OpenAILLM(api_key="test-key", extra_body={"stream": True})
+        llm.token_tracker = Mock()
+        with OpenAI(api_key="test-key", base_url="https://example.test/v1",
+                    http_client=httpx.Client(transport=httpx.MockTransport(respond))) as client:
+            llm._client = client
+            result = llm.complete_with_tools_messages(
+                [{"role": "user", "content": "Finish the remaining operations."}],
+                tools=tools, tool_choice="none")
+
+        assert result == ([], "[]")
+        assert len(requests) == 1
+        llm.token_tracker.record_llm.assert_called_once_with(
+            20, 2, 0, 0, usage_known=True, model="extraction-model")
+
+    @pytest.mark.parametrize("json_mode", [False, True])
+    def test_streamed_review_returns_json_and_records_usage(self, fake_client, json_mode):
+        response = _chat_response(content='{"checks": [], "issues": []}')
+        response.model = "review-model"
+        response.usage = SimpleNamespace(prompt_tokens=20, completion_tokens=10)
+        stream = Mock()
+        stream.get_final_completion.return_value = response
+        fake_client.beta.chat.completions.stream.return_value = nullcontext(stream)
+        parameters = {"stream": True, "thinking": {"type": "enabled"},
+                      "reasoning_effort": "low"}
+        llm = openai_llm_module.OpenAILLM(
+            api_key="test-key", model="review-model", json_mode=json_mode,
+            extra_body=parameters)
+        llm.token_tracker = Mock()
+        result = llm.complete_json("Review these supported facts.", {"type": "object"})
+        assert result == {"checks": [], "issues": []}
+        request = fake_client.beta.chat.completions.stream.call_args.kwargs
+        assert request["extra_body"] == {
+            "thinking": {"type": "enabled"}, "reasoning_effort": "low"}
+        assert request["stream_options"] == {"include_usage": True}
+        assert parameters["stream"] is True
+        llm.token_tracker.record_llm.assert_called_once_with(
+            20, 10, 0, 0, usage_known=True, model="review-model")
+
     def test_lazy_loader_returns_classes(self):
         openai_llm, cached_llm = llm_package.get_openai_llm()
         assert openai_llm is openai_llm_module.OpenAILLM
@@ -93,6 +220,62 @@ class TestOpenAILLM:
         assert kwargs["response_format"] == {"type": "json_object"}
         assert kwargs["messages"][0]["role"] == "system"
 
+    def test_complete_json_forwards_reasoning_configuration(self, fake_client: Mock):
+        fake_client.chat.completions.create.return_value = _chat_response(content='{"value": "ok"}')
+        llm = openai_llm_module.OpenAILLM(
+            api_key="test-key",
+            reasoning_effort="max",
+            is_reasoning_model=True,
+            extra_body={"thinking": {"type": "enabled"}},
+        )
+
+        llm.complete_json("Return JSON", {"type": "object"})
+
+        kwargs = fake_client.chat.completions.create.call_args.kwargs
+        assert kwargs["reasoning_effort"] == "max"
+        assert kwargs["extra_body"] == {"thinking": {"type": "enabled"}}
+        assert kwargs["max_completion_tokens"] == 4096
+        assert "max_tokens" not in kwargs
+        assert "temperature" not in kwargs
+
+    def test_complete_json_omits_unconfigured_reasoning(self, fake_client: Mock):
+        fake_client.chat.completions.create.return_value = _chat_response(content='{"value": "ok"}')
+        llm = openai_llm_module.OpenAILLM(api_key="test-key")
+
+        llm.complete_json("Return JSON", {"type": "object"})
+
+        kwargs = fake_client.chat.completions.create.call_args.kwargs
+        assert "reasoning_effort" not in kwargs
+        assert "extra_body" not in kwargs
+
+    def test_custom_model_can_force_reasoning_parameters(self, fake_client: Mock):
+        fake_client.chat.completions.create.return_value = _chat_response(content='{"value": "ok"}')
+        llm = openai_llm_module.OpenAILLM(
+            api_key="test-key", model="5.6luna", is_reasoning_model=True,
+            reasoning_effort="xhigh",
+        )
+
+        llm.complete_json("Return JSON", {"type": "object"})
+
+        kwargs = fake_client.chat.completions.create.call_args.kwargs
+        assert kwargs["reasoning_effort"] == "xhigh"
+        assert kwargs["max_completion_tokens"] == 4096
+        assert "temperature" not in kwargs
+
+    def test_reasoning_model_can_be_forced_to_standard_parameters(self, fake_client: Mock):
+        fake_client.chat.completions.create.return_value = _chat_response(content='{"value": "ok"}')
+        llm = openai_llm_module.OpenAILLM(
+            api_key="test-key", model="gpt-5-custom", is_reasoning_model=False,
+            reasoning_effort="high",
+        )
+
+        llm.complete_json("Return JSON", {"type": "object"})
+
+        kwargs = fake_client.chat.completions.create.call_args.kwargs
+        assert kwargs["max_tokens"] == 4096
+        assert kwargs["temperature"] == 0.7
+        assert "reasoning_effort" not in kwargs
+
     def test_complete_json_uses_text_mode_for_array_schema(self, fake_client: Mock):
         fake_client.chat.completions.create.return_value = _chat_response(content='["a", "b"]')
         llm = openai_llm_module.OpenAILLM(api_key="test-key", json_mode=True)
@@ -107,20 +290,77 @@ class TestOpenAILLM:
         kwargs = fake_client.chat.completions.create.call_args.kwargs
         assert "response_format" not in kwargs
 
+    def test_complete_json_skips_prefixed_json_with_wrong_schema_type(self, fake_client: Mock):
+        fake_client.chat.completions.create.return_value = _chat_response(
+            content='See [1]. Result: {"value": "ok"}'
+        )
+        llm = openai_llm_module.OpenAILLM(api_key="test-key")
+
+        result = llm.complete_json(
+            "Return JSON",
+            {"type": "object", "required": ["value"]},
+        )
+
+        assert result == {"value": "ok"}
+
+    def test_extract_json_from_text_preserves_prefixed_top_level_array(self):
+        result = openai_llm_module.OpenAILLM._extract_json_from_text(
+            'Result: [{"name": "one"}, {"name": "two"}]'
+        )
+
+        assert result == [{"name": "one"}, {"name": "two"}]
+
+    @pytest.mark.parametrize("prefix", ["", "Review result: "])
+    def test_complete_json_closes_outer_object_and_preserves_complete_checks(self, fake_client, prefix):
+        expected = {"checks": [
+            {"device": "Vega", "result": "passed", "note": 'Label contains } and [ and "quoted" text.'},
+            {"device": "Cedar", "result": "scheduled", "date": "2025-03-11"},
+        ]}
+        fake_client.chat.completions.create.return_value = _chat_response(
+            content=prefix + json.dumps(expected)[:-1])
+        llm = openai_llm_module.OpenAILLM(api_key="test-key")
+
+        result = llm.complete_json("Preserve the device checks.",
+                                   {"type": "object", "required": ["checks"]})
+
+        assert result == expected
+        assert fake_client.chat.completions.create.call_count == 1
+
+    def test_extract_json_values_preserves_separate_complete_records(self):
+        records = [{"device": "Vega", "checks": ["pressure"]},
+                   {"device": "Cedar", "checks": ["connector"]}]
+        content = "First result: " + json.dumps(records[0]) + "\nSecond result: " + json.dumps(records[1])
+
+        result = openai_llm_module.OpenAILLM._extract_json_values_from_text(content)
+
+        assert result == records
+
+    @pytest.mark.parametrize(
+        "content",
+        [
+            '{"text": "literal,}"}',
+            '{"text": "literal,}",}',
+        ],
+    )
+    def test_extract_json_from_text_preserves_comma_in_string(self, content):
+        result = openai_llm_module.OpenAILLM._extract_json_from_text(content)
+
+        assert result == {"text": "literal,}"}
+
     def test_complete_json_raises_for_invalid_json(self, fake_client: Mock):
         # Use truly unparseable JSON that can't be recovered by any fallback
         fake_client.chat.completions.create.return_value = _chat_response(content="not even trying")
         # json_mode=False means it will use text fallback
         llm = openai_llm_module.OpenAILLM(api_key="test-key", json_mode=False)
 
-        with pytest.raises(ValueError, match="parse LLM response as JSON"):
+        with pytest.raises(ToolCallProtocolError, match="Invalid JSON response"):
             llm.complete_json("broken", {"type": "object"})
 
     def test_complete_json_validates_required_properties(self, fake_client: Mock):
         fake_client.chat.completions.create.return_value = _chat_response(content='{"other": 1}')
         llm = openai_llm_module.OpenAILLM(api_key="test-key")
 
-        with pytest.raises(ValueError, match="Missing required property"):
+        with pytest.raises(ToolCallProtocolError, match="Missing required property"):
             llm.complete_json(
                 "missing field",
                 {
@@ -168,6 +408,163 @@ class TestOpenAILLM:
         }]
         kwargs = fake_client.chat.completions.create.call_args.kwargs
         assert kwargs["tools"][0]["function"]["name"] == "search_memories"
+
+    def test_complete_with_tools_required_success_keeps_required(self, fake_client: Mock):
+        tool_call = SimpleNamespace(
+            function=SimpleNamespace(name="extract_event", arguments='{"abstract":"ok"}')
+        )
+        fake_client.chat.completions.create.return_value = _chat_response(
+            tool_calls=[tool_call]
+        )
+        llm = openai_llm_module.OpenAILLM(api_key="test-key")
+
+        llm.complete_with_tools("prompt", tools=[{
+            "name": "extract_event",
+            "description": "Extract event",
+            "input_schema": {"type": "object"},
+        }], tool_choice="required")
+
+        assert fake_client.chat.completions.create.call_count == 1
+        assert fake_client.chat.completions.create.call_args.kwargs["tool_choice"] == "required"
+        assert llm._required_tool_choice_capability == "supported"
+
+    def test_waiting_required_calls_leave_probe_lock_after_capability_is_known(
+        self,
+    ):
+        class TrackingLock:
+            def __init__(self):
+                self._lock = threading.Lock()
+                self._guard = threading.Lock()
+                self._attempts = 0
+                self.second_attempted = threading.Event()
+
+            def __enter__(self):
+                with self._guard:
+                    self._attempts += 1
+                    if self._attempts == 2:
+                        self.second_attempted.set()
+                self._lock.acquire()
+                return self
+
+            def __exit__(self, _exc_type, _exc, _traceback):
+                self._lock.release()
+
+            def locked(self):
+                return self._lock.locked()
+
+        llm = openai_llm_module.OpenAILLM(api_key="test-key")
+        probe_lock = TrackingLock()
+        llm._required_tool_choice_lock = probe_lock
+        first_started = threading.Event()
+        release_first = threading.Event()
+        invocation_lock_states = []
+        invocation_guard = threading.Lock()
+
+        def complete_impl(**_kwargs):
+            with invocation_guard:
+                invocation_index = len(invocation_lock_states)
+                invocation_lock_states.append(probe_lock.locked())
+            if invocation_index == 0:
+                first_started.set()
+                assert release_first.wait(timeout=1)
+                llm._required_tool_choice_capability = "supported"
+            return []
+
+        llm._complete_with_tools_impl = Mock(side_effect=complete_impl)
+        tools = [{
+            "name": "extract_event",
+            "description": "Extract event",
+            "input_schema": {"type": "object"},
+        }]
+        errors = []
+
+        def call_required():
+            try:
+                llm.complete_with_tools("prompt", tools, tool_choice="required")
+            except Exception as exc:  # pragma: no cover - asserted below
+                errors.append(exc)
+
+        first = threading.Thread(target=call_required)
+        second = threading.Thread(target=call_required)
+        first.start()
+        assert first_started.wait(timeout=1)
+        second.start()
+        assert probe_lock.second_attempted.wait(timeout=1)
+        release_first.set()
+        first.join(timeout=1)
+        second.join(timeout=1)
+
+        assert not first.is_alive()
+        assert not second.is_alive()
+        assert errors == []
+        assert invocation_lock_states == [True, False]
+
+    def test_required_empty_retries_once_without_marking_unsupported(
+        self,
+        fake_client: Mock,
+        monkeypatch: pytest.MonkeyPatch,
+    ):
+        fake_client.chat.completions.create.return_value = _chat_response(tool_calls=None)
+        monkeypatch.setattr("time.sleep", lambda _delay: None)
+        llm = openai_llm_module.OpenAILLM(api_key="test-key")
+
+        with pytest.raises(ToolCallProtocolError):
+            llm.complete_with_tools("prompt", tools=[{
+                "name": "extract_event",
+                "description": "Extract event",
+                "input_schema": {"type": "object"},
+            }], tool_choice="required")
+
+        assert fake_client.chat.completions.create.call_count == 2
+        assert [
+            call.kwargs["tool_choice"]
+            for call in fake_client.chat.completions.create.call_args_list
+        ] == ["required", "required"]
+        assert llm._required_tool_choice_capability == "unknown"
+
+    def test_required_unsupported_falls_back_to_auto_and_caches(
+        self,
+        fake_client: Mock,
+    ):
+        tool_call = SimpleNamespace(
+            function=SimpleNamespace(name="extract_event", arguments='{"abstract":"ok"}')
+        )
+        fake_client.chat.completions.create.side_effect = [
+            _bad_request("tool_choice=required is not supported; only auto is supported"),
+            _chat_response(tool_calls=[tool_call]),
+            _chat_response(tool_calls=[tool_call]),
+        ]
+        llm = openai_llm_module.OpenAILLM(api_key="test-key")
+        tools = [{
+            "name": "extract_event",
+            "description": "Extract event",
+            "input_schema": {"type": "object"},
+        }]
+
+        llm.complete_with_tools("first", tools=tools, tool_choice="required")
+        llm.complete_with_tools("second", tools=tools, tool_choice="required")
+
+        assert [
+            call.kwargs["tool_choice"]
+            for call in fake_client.chat.completions.create.call_args_list
+        ] == ["required", "auto", "auto"]
+        assert llm._required_tool_choice_capability == "unsupported"
+
+    def test_unrelated_bad_request_does_not_downgrade_required(self, fake_client: Mock):
+        fake_client.chat.completions.create.side_effect = _bad_request(
+            "Invalid tool schema: missing properties"
+        )
+        llm = openai_llm_module.OpenAILLM(api_key="test-key")
+
+        with pytest.raises(RuntimeError, match="Invalid tool schema"):
+            llm.complete_with_tools("prompt", tools=[{
+                "name": "extract_event",
+                "description": "Extract event",
+                "input_schema": {"type": "object"},
+            }], tool_choice="required")
+
+        assert fake_client.chat.completions.create.call_count == 1
+        assert llm._required_tool_choice_capability == "unknown"
 
     def test_complete_with_tools_wraps_client_errors(self, fake_client: Mock):
         fake_client.chat.completions.create.side_effect = RuntimeError("tool boom")

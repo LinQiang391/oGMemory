@@ -1,18 +1,24 @@
 from __future__ import annotations
+from types import SimpleNamespace
+from core.models import RetrievedBlock, SearchMemoryResult
 
 import logging
 from unittest.mock import Mock
 
 import pytest
 
-from core.models import ArchiveRef, RequestContext, Role
+from core.models import ArchiveRef, RequestContext, Role, SeedHit
 from providers.unified_config import OgMemConfig
 from server.memory_service import MemoryService
 from session.models import SessionWindowState
 from session.session_state import Commitment, TaskState
 from session.topic_buffer import SlotContent
 from session.topic_detector import TopicDetection
-from core.models import SeedHit
+
+
+@pytest.fixture(autouse=True)
+def compose_storage(monkeypatch):
+    monkeypatch.setattr(MemoryService, "_get_context_fs", lambda self: None)
 
 
 def _ctx(session_id: str = "sess-archive") -> RequestContext:
@@ -33,6 +39,35 @@ def _disable_session_persistence(service: MemoryService) -> None:
     service._get_context_fs = Mock(return_value=None)
 
 
+def test_get_read_api_applies_retrieval_config_flags():
+    service = MemoryService(
+        config=OgMemConfig(
+            retrieval_max_top_k=60,
+            retrieval_default_top_k=15,
+            retrieval_global_search_topk=45,
+            retrieval_candidate_pool_enabled=True,
+            retrieval_result_ranker_strategy="metadata_aware",
+            retrieval_global_result_rerank_enabled=True,
+            retrieval_owner_scope_filter_enabled=True,
+        )
+    )
+    service._get_shared_embedder = Mock(return_value=Mock())
+    service._get_shared_vector_index = Mock(return_value=Mock())
+    service._get_relation_store = Mock(return_value=None)
+    service._get_context_fs = Mock(return_value=None)
+    service._start_outbox_worker = Mock()
+
+    read_api = service.get_read_api()
+
+    assert read_api._cfg.max_top_k == 60
+    assert read_api._cfg.default_top_k == 15
+    assert read_api._cfg.global_search_topk == 45
+    assert read_api._cfg.candidate_pool_enabled is True
+    assert read_api._cfg.result_ranker_strategy == "metadata_aware"
+    assert read_api._cfg.global_result_rerank_enabled is True
+    assert read_api._cfg.owner_scope_filter_enabled is True
+
+
 class _StructuredStateLLM:
     def __init__(self):
         self.calls = 0
@@ -50,19 +85,112 @@ class _StructuredStateLLM:
 
 
 class _PrefetchHit:
-    def __init__(self, uri, score, category, abstract, overview="", content_excerpt=""):
+    def __init__(self, uri, score, category, abstract, overview="", content_excerpt="", metadata=None):
         self.uri = uri
         self.score = score
         self.category = category
         self.abstract = abstract
         self.overview = overview
         self.content_excerpt = content_excerpt
+        self.metadata = metadata or {}
 
 
 class _PrefetchResult:
     def __init__(self, hits):
         self.hits = hits
         self.trace = None
+
+
+class _WorkingSetResult:
+    def __init__(self, hits):
+        self.hits = hits
+
+    @property
+    def trace(self):
+        raise AssertionError("working-set retrieval must not inspect trace")
+
+
+def test_search_working_set_preserves_legacy_skill_behavior_when_feature_disabled():
+    service = MemoryService(config=OgMemConfig())
+    read_api = Mock()
+    read_api.search_memory.side_effect = [
+        _WorkingSetResult([
+            _PrefetchHit(
+                "ctx://acct-test/agents/agent-test/skills/generated/review-code",
+                0.95,
+                "skill",
+                "Generated Agent Skill must use explicit skill discovery",
+            ),
+            _PrefetchHit(
+                "ctx://acct-test/users/user-test/memories/preferences/style",
+                0.9,
+                "preference",
+                "Use concise answers",
+            )
+        ]),
+        _WorkingSetResult([]),
+    ]
+    service.get_read_api = Mock(return_value=read_api)
+
+    items, summary_items, stats = service._search_working_set("query", _ctx())
+
+    assert [item["uri"] for item in items] == [
+        "ctx://acct-test/agents/agent-test/skills/generated/review-code",
+        "ctx://acct-test/users/user-test/memories/preferences/style"
+    ]
+    assert summary_items == []
+    assert stats["hit_count"] == 2
+    assert set(stats["hit_categories"]) == {"skill", "preference"}
+    assert read_api.search_memory.call_count == 2
+
+
+def test_generated_skill_filter_preserves_none_search_result():
+    service = MemoryService(config=OgMemConfig())
+    read_api = Mock()
+    read_api.search_memory.return_value = None
+
+    result = service._search_without_generated_skills(
+        read_api,
+        query="review code",
+        ctx=_ctx(),
+        top_k=5,
+        fill_content_for_top_k=2,
+    )
+
+    assert result is None
+
+
+def test_generated_skill_filter_overfetches_before_top_k():
+    service = MemoryService(
+        config=OgMemConfig(
+            retrieval_max_top_k=10,
+            retrieval_candidate_pool_multiplier=3,
+            retrieval_min_candidate_pool_size=4,
+        )
+    )
+    read_api = Mock()
+    read_api.search_memory.return_value = _WorkingSetResult([
+        _PrefetchHit("ctx://acct-test/agents/agent-test/skills/generated/one", .99, "skill", "one",
+                     metadata={"ogmemory_generated": True}),
+        _PrefetchHit("ctx://acct-test/agents/agent-test/skills/generated/two", .98, "skill", "two",
+                     metadata={"ogmemory_generated": True}),
+        _PrefetchHit("ctx://acct-test/users/user-test/memories/preferences/a", .90, "preference", "a"),
+        _PrefetchHit("ctx://acct-test/users/user-test/memories/preferences/b", .80, "preference", "b"),
+    ])
+
+    result = service._search_without_generated_skills(
+        read_api,
+        query="review code",
+        ctx=_ctx(),
+        top_k=2,
+        fill_content_for_top_k=2,
+    )
+
+    assert read_api.search_memory.call_args.kwargs["top_k"] == 6
+    assert [hit.uri for hit in result.hits] == [
+        "ctx://acct-test/users/user-test/memories/preferences/a",
+        "ctx://acct-test/users/user-test/memories/preferences/b",
+    ]
 
 
 def test_get_session_state_runs_rolling_compressor_when_gate_enabled():
@@ -91,6 +219,12 @@ def test_prefetch_populates_topic_buffer_pending_injection():
     read_api = Mock()
     read_api.search_memory.return_value = _PrefetchResult([
         _PrefetchHit(
+            "ctx://acct-test/agents/agent-test/skills/generated/review-code",
+            0.99,
+            "skill",
+            "Generated Agent Skill must not enter compose prefetch",
+        ),
+        _PrefetchHit(
             "ctx://acct-test/users/user-test/memories/preferences/coding_style",
             0.91,
             "preference",
@@ -115,11 +249,41 @@ def test_prefetch_populates_topic_buffer_pending_injection():
     topic = service.get_session_manager().get_topic_buffer("sess-prefetch")
     pending = topic.get_pending_injection()
     assert [hit.uri for hit in pending] == [
+        "ctx://acct-test/agents/agent-test/skills/generated/review-code",
         "ctx://acct-test/users/user-test/memories/preferences/coding_style",
+    ]
+    assert pending[1].abstract == "Use terse engineering prose"
+    read_api.search_memory.assert_called_once()
+
+
+def test_enabled_sedimentation_defensively_excludes_generated_skills_but_keeps_manual():
+    service = MemoryService(config=OgMemConfig(
+        storage_backend="sql", sql_connection_string="postgresql://unused",
+    ))
+    service._cfg.skill_sedimentation_enabled = True
+    read_api = Mock()
+    read_api.search_memory.side_effect = [
+        _WorkingSetResult([
+            _PrefetchHit("ctx://acct-test/users/user-test/memories/profile", .8, "profile", "profile"),
+            _PrefetchHit("ctx://acct-test/users/user-test/memories/custom/one", .85, "custom", "custom"),
+            _PrefetchHit("ctx://acct-test/agents/agent-test/skills/generated/generated", .99, "skill", "generated",
+                         metadata={"ogmemory_generated": True}),
+            _PrefetchHit("ctx://acct-test/agents/agent-test/skills/generated/manual", .9, "skill", "manual"),
+        ]),
+        _WorkingSetResult([]),
+    ]
+    service.get_read_api = Mock(return_value=read_api)
+
+    items, _, _ = service._search_working_set("query", _ctx())
+
+    assert [item["uri"] for item in items] == [
+        "ctx://acct-test/agents/agent-test/skills/generated/manual",
+        "ctx://acct-test/users/user-test/memories/custom/one",
         "ctx://acct-test/users/user-test/memories/profile",
     ]
-    assert pending[0].abstract == "Use terse engineering prose"
-    read_api.search_memory.assert_called_once()
+    search_args = read_api.search_memory.call_args_list[0].kwargs
+    assert search_args["fill_content_for_top_k"] == 0
+    assert "exclude_generated_skills" not in search_args
 
 
 def test_prefetch_noops_when_disabled():
@@ -733,6 +897,15 @@ def test_compose_merges_pending_injection_into_working_set():
     service._read_profile = Mock(return_value="")
     service._collect_archives = Mock(return_value=([], []))
     service._search_working_set = Mock(return_value=([], [], {}))
+    read_api = Mock()
+    read_api.read_memory.return_value = RetrievedBlock(
+        uri="ctx://acct-test/users/user-test/memories/preferences/coding_style",
+        abstract="prefetched memory",
+        overview="Short overview",
+        content_excerpt="# Preference\n\nUse four spaces for indentation.",
+        metadata={"when": "2026-10-02"},
+    )
+    service.get_read_api = Mock(return_value=read_api)
 
     result = service.compose({
         "sessionId": "sess-topic",
@@ -741,7 +914,175 @@ def test_compose_merges_pending_injection_into_working_set():
     })
 
     assert "prefetched memory" in result["retrievedEvidence"]
+    assert "Use four spaces for indentation." in result["retrievedEvidence"]
+    assert "when: 2026-10-02" in result["retrievedEvidence"]
+    assert result["stats"]["evidence_delivery"]["read_count"] == 1
+    read_api.read_memory.assert_called_once_with(
+        "ctx://acct-test/users/user-test/memories/preferences/coding_style", ctx,
+    )
     assert topic.get_pending_injection() is None
+
+
+@pytest.mark.parametrize("condition", ["candidate_cap", "output_budget", "aliases", "new_prefetch",
+                                      "format_failure", "response_failure", "topic_change"])
+def test_compose_confirms_delivered_prefetch_and_resumes_pending(condition):
+    from threading import Thread
+
+    service = MemoryService(config=OgMemConfig(prefetch_enabled=True))
+    _disable_session_persistence(service)
+    ctx = _ctx("delivery")
+    uris = [f"ctx://acct-test/users/user-test/memories/entities/item-{index}" for index in range(17)]
+    blocks = {uri: RetrievedBlock(uri=uri, category="entity", abstract=f"Item {index}",
+                                   content_excerpt=f"Saved detail {index}.") for index, uri in enumerate(uris)}
+    api = SimpleNamespace(read_memory=lambda uri, _: blocks[uri],
+                          search_memory=lambda **_: SearchMemoryResult(hits=[blocks[uri] for uri in uris[15:]]))
+    service.get_read_api = Mock(return_value=api)
+    service._read_profile = Mock(return_value="")
+    service._collect_archives = Mock(return_value=([], []))
+    service._get_session_state = Mock(return_value=SessionWindowState())
+    ordinary = [{"uri": uri + "/content.md", "category": "entity"} for uri in uris[:15]]
+    service._search_working_set = Mock(return_value=(ordinary if condition == "candidate_cap" else [], [], {}))
+    params = {"sessionId": ctx.session_id, "_ctx": ctx, "query": "Find saved item details"}
+    assert service.prefetch(params)["prefetched"] == 2
+    topic = service.get_session_manager().get_topic_buffer(ctx.session_id)
+    if condition == "aliases":
+        topic.set_pending_injection([
+            SeedHit(uri=uris[15] + suffix, score=0.9, category="entity")
+            for suffix in ("", "/content.md", "/.abstract.md", "/.overview.md")
+        ])
+        service._search_working_set.return_value = ([{"uri": uris[15], "category": "entity"}], [], {})
+    original_format = service._format_working_set
+
+    def format_once(*args, **kwargs):
+        service._format_working_set = original_format
+        text = original_format(*args, **kwargs)
+        if condition == "new_prefetch":
+            api.search_memory = lambda **_: SearchMemoryResult(hits=[blocks[uris[14]]])
+            thread = Thread(target=lambda: service.prefetch(params))
+            thread.start()
+            thread.join(3)
+            assert thread.is_alive() is False
+        elif condition == "topic_change":
+            topic.update_topic(TopicDetection(label="changed", confidence=1.0, message_count=1))
+            topic.clear_injected_tracking()
+        elif condition == "format_failure":
+            raise ValueError("render failed after selection")
+        return text
+
+    service._format_working_set = format_once
+    if condition == "response_failure":
+        original_response = service._to_response
+
+        def response_once(*args, **kwargs):
+            service._to_response = original_response
+            raise ValueError("response construction failed")
+
+        service._to_response = response_once
+    first = service.compose({**params, **({"tokenBudget": 55001} if condition == "output_budget" else {})})
+    pending = [hit.uri for hit in topic.get_pending_injection() or []]
+    if condition == "aliases":
+        assert first["retrievedEvidence"].count("Saved detail 15.") == 1
+        assert topic.was_injected(uris[15] + "/.overview.md") is True
+        assert pending == []
+        return
+    if condition == "new_prefetch":
+        assert pending == [uris[14]]
+        assert topic.was_injected(uris[15]) is True
+    else:
+        assert pending == uris[15:]
+        assert topic.was_injected(uris[15]) is False
+    service._search_working_set.return_value = ([], [], {})
+    second = service.compose(params)
+    expected = [14] if condition == "new_prefetch" else [15, 16]
+    for index in expected:
+        assert f"Saved detail {index}." in second["retrievedEvidence"]
+        assert topic.was_injected(uris[index]) is True
+    assert topic.get_pending_injection() is None
+
+
+@pytest.mark.parametrize("condition", ["body_budget", "read_failure", "summary_only"])
+def test_compose_delivers_pending_body_after_budget_or_storage_recovers(condition):
+    from retrieval.context_reader import ContextReader
+
+    service = MemoryService(config=OgMemConfig(prefetch_enabled=True))
+    _disable_session_persistence(service)
+    ctx = _ctx("delivery-recovery")
+    uri = "ctx://acct-test/users/user-test/memories/entities/receiver"
+    content = "Receiver operates at 37 MHz. " * 20 if condition != "summary_only" else ""
+    node = SimpleNamespace(category="entity", owner_space="user:user-test", abstract="Receiver identity",
+                           overview="", content=content, metadata={})
+    fs = SimpleNamespace(read_node=Mock(return_value=node))
+    reader = ContextReader(fs=fs)
+    block = reader.read(uri, ctx)
+    api = SimpleNamespace(read_memory=reader.read, search_memory=lambda **_: SearchMemoryResult(hits=[block]))
+    service.get_read_api = Mock(return_value=api)
+    service._read_profile = Mock(return_value="")
+    service._collect_archives = Mock(return_value=([], []))
+    service._get_session_state = Mock(return_value=SessionWindowState())
+    service._search_working_set = Mock(return_value=([], [], {}))
+    params = {"sessionId": ctx.session_id, "_ctx": ctx, "query": "Receiver frequency"}
+    assert service.prefetch(params)["prefetched"] == 1
+    topic = service.get_session_manager().get_topic_buffer(ctx.session_id)
+    if condition == "read_failure":
+        fs.read_node.side_effect = OSError("temporary storage read failure")
+    first = service.compose({**params, **({"tokenBudget": 55076} if condition == "body_budget" else {})})
+    if condition == "summary_only":
+        assert node.abstract in first["retrievedEvidence"]
+    else:
+        assert [hit.uri for hit in topic.get_pending_injection()] == [uri]
+        source = first["stats"]["evidence_delivery"]["sources"][0]
+        assert source["reason"] == ("read_failed" if condition == "read_failure" else "output_budget")
+        fs.read_node.side_effect = None
+        second = service.compose(params)
+        assert content in second["retrievedEvidence"]
+    assert topic.was_injected(uri) is True
+    assert topic.get_pending_injection() is None
+
+
+def test_compose_hydrates_merged_canonical_candidates_beyond_first_five():
+    from retrieval.context_reader import ContextReader
+
+    service = MemoryService(config=OgMemConfig())
+    _disable_session_persistence(service)
+    ctx = _ctx("sess-full-evidence")
+    uris = [f"ctx://acct-test/users/user-test/memories/entities/item-{index}" for index in range(7)]
+    topic = service.get_session_manager().get_topic_buffer(ctx.session_id)
+    topic.set_pending_injection([
+        SeedHit(uri=uris[2], score=0.8, level=2, abstract="Duplicate index summary"),
+        SeedHit(uri=uris[6], score=0.7, level=2, abstract="Pending index summary"),
+    ])
+    service._read_profile = Mock(return_value="")
+    service._collect_archives = Mock(return_value=([], []))
+    service._get_session_state = Mock(return_value=SessionWindowState())
+    service._search_working_set = Mock(return_value=([
+        {"uri": uri + "/content.md", "abstract": "Index summary", "category": "entity"}
+        for uri in uris[:6]
+    ], [], {}))
+    nodes = {
+        uri: SimpleNamespace(
+            category="entity", owner_space="user:user-test", abstract=f"Identity {index}",
+            overview="Brief overview", content=f"# Item {index}\n\nExact detail {index}.\n",
+            metadata={"when": "2026-10-02"},
+        )
+        for index, uri in enumerate(uris)
+    }
+    fs = SimpleNamespace(read_node=Mock(side_effect=lambda uri, read_ctx: nodes[uri]))
+    reader = ContextReader(fs=fs)
+    service.get_read_api = Mock(return_value=SimpleNamespace(read_memory=reader.read))
+
+    result = service.compose({
+        "sessionId": ctx.session_id, "_ctx": ctx,
+        "messages": [_msg("user", "Retrieve related item details")],
+    })
+
+    assert fs.read_node.call_count == 7
+    for index, uri in enumerate(uris):
+        assert f"Identity {index}" in result["retrievedEvidence"]
+        assert nodes[uri].content in result["retrievedEvidence"]
+        assert uri in result["retrievedEvidence"]
+    stats = result["stats"]["evidence_delivery"]
+    assert stats["read_count"] == 7
+    assert all(source["reason"] == "full_content" for source in stats["sources"])
 
 
 def test_compose_skips_pending_injection_uri_already_in_working_set():
@@ -772,6 +1113,12 @@ def test_compose_skips_pending_injection_uri_already_in_working_set():
             "score": 0.95,
         }
     ], [], {}))
+    read_api = Mock()
+    read_api.read_memory.return_value = RetrievedBlock(
+        uri=duplicate_uri, category="preference", abstract="existing memory",
+        content_excerpt="Use four spaces for indentation.",
+    )
+    service.get_read_api = Mock(return_value=read_api)
 
     result = service.compose({
         "sessionId": "sess-topic-dedupe",
@@ -780,6 +1127,7 @@ def test_compose_skips_pending_injection_uri_already_in_working_set():
     })
 
     assert result["retrievedEvidence"].count("existing memory") == 1
+    read_api.read_memory.assert_called_once_with(duplicate_uri, ctx)
     assert "prefetched duplicate" not in result["retrievedEvidence"]
     assert topic.get_pending_injection() is None
 
@@ -808,6 +1156,12 @@ def test_compose_allows_prefetch_reinjection_after_topic_change():
     service._search_working_set = Mock(return_value=([], [], {}))
     service._get_session_state = Mock(return_value=SessionWindowState())
     service._get_shared_embedder = Mock(return_value=None)
+    read_api = Mock()
+    read_api.read_memory.return_value = RetrievedBlock(
+        uri=reused_uri, category="preference", abstract="prefetched memory for the new topic",
+        content_excerpt="Use four spaces for indentation.",
+    )
+    service.get_read_api = Mock(return_value=read_api)
 
     result = service.compose({
         "sessionId": "sess-topic-reinject",
@@ -816,6 +1170,7 @@ def test_compose_allows_prefetch_reinjection_after_topic_change():
     })
 
     assert "prefetched memory for the new topic" in result["retrievedEvidence"]
+    read_api.read_memory.assert_called_once_with(reused_uri, ctx)
     assert topic.get_current_topic().label == "debugging"
     assert topic.get_pending_injection() is None
 

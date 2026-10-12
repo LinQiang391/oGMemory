@@ -47,11 +47,32 @@ def test_standalone_dockerfile_defines_mcp_env_used_by_default_config():
     assert mcp_envs <= docker_envs
 
 
-def test_standalone_dockerfile_keeps_mcp_dependency_delta_minimal():
+def test_standalone_dockerfile_declares_runtime_dependencies():
     dockerfile = (ROOT / "docker" / "Dockerfile.standalone").read_text(encoding="utf-8")
 
-    assert '"mcp[cli]>=1.28.1,<2"' in dockerfile
+    assert '"mcp[cli]>=2.0.0,<3"' in dockerfile
     assert "libsqlite3-0" not in dockerfile
-    assert "rank-bm25" not in dockerfile
-    assert "nltk" not in dockerfile
-    assert "python-dotenv" not in dockerfile
+    for dependency in ("pydantic", "python-dotenv", "json-repair", "rank-bm25", "nltk"):
+        assert dependency in dockerfile
+
+
+def test_standalone_dockerfile_copies_runtime_skill_package():
+    dockerfile = (ROOT / "docker" / "Dockerfile.standalone").read_text(encoding="utf-8")
+
+    assert "COPY skills/     /opt/ogmem/skills/" in dockerfile
+
+
+def test_standalone_entrypoint_uses_one_process_with_threads():
+    entrypoint = (ROOT / "docker" / "entrypoint-standalone.sh").read_text(encoding="utf-8")
+
+    assert '--workers 1' in entrypoint
+    assert '--worker-class gthread' in entrypoint
+    assert '--threads "${OGMEM_THREADS}"' in entrypoint
+    assert 'OGMEM_THREADS=${OGMEM_THREADS:-${OGMEM_WORKERS:-2}}' in entrypoint
+
+
+def test_mcp_integration_guide_uses_sdk_initialize_result_field():
+    guide = (ROOT / "docs" / "integrations" / "mcp.md").read_text(encoding="utf-8")
+
+    assert "init.serverInfo.name" in guide
+    assert "init.server_info" not in guide

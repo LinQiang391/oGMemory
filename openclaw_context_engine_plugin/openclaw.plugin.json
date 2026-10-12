@@ -53,10 +53,28 @@
         "description": "Max ms to wait for each service to become healthy (default: 60000)",
         "default": 60000
       },
+      "traceTimeoutMs": {
+        "type": "integer",
+        "description": "Max ms for each trace event HTTP attempt (default: 3000)",
+        "default": 3000
+      },
+      "traceCaptureContent": {
+        "type": "boolean",
+        "description": "Whether trace events include redacted prompt/tool/assistant content in addition to size metadata (default: true)",
+        "default": true
+      },
       "commitTokenThreshold": {
         "type": "integer",
         "description": "Pending token threshold to trigger async session commit (default: 20000)",
         "default": 20000
+      },
+      "autoCapture": {
+        "type": "boolean",
+        "description": "Automatically buffer and capture new turns via ingest/afterTurn. Does not disable explicit compact, cleanup of existing buffers, trace uploads or tool-result externalization. Env: OGMEM_AUTO_CAPTURE"
+      },
+      "autoRecall": {
+        "type": "boolean",
+        "description": "Inject memory through assemble (prefetch/compose). When false, pass through current messages. Env: OGMEM_AUTO_RECALL"
       },
       "prefetchEnabled": {
         "type": "boolean",
@@ -98,8 +116,7 @@
       },
       "llmProvider": {
         "type": "string",
-        "description": "LLM provider: openai, mock. Env: CONTEXTENGINE_PROVIDER",
-        "default": "mock"
+        "description": "LLM provider: openai, mock. Default: mock. Env: CONTEXTENGINE_PROVIDER"
       },
       "llmApiKey": {
         "type": "string",
@@ -111,8 +128,19 @@
       },
       "llmModel": {
         "type": "string",
-        "description": "LLM model name (default: gpt-4o-mini). Env: OGMEM_LLM_MODEL",
-        "default": "gpt-4o-mini"
+        "description": "LLM model name (default: gpt-4o-mini). Env: OGMEM_LLM_MODEL"
+      },
+      "llmReasoningEffort": {
+        "type": "string",
+        "description": "Optional model reasoning effort, such as medium, xhigh, or max. Env: LLM_REASONING_EFFORT"
+      },
+      "llmIsReasoningModel": {
+        "type": "boolean",
+        "description": "Optional reasoning-model override. Omit to auto-detect. Env: LLM_IS_REASONING_MODEL"
+      },
+      "llmExtraBody": {
+        "type": "object",
+        "description": "Additional OpenAI-compatible request body fields. Env: LLM_EXTRA_BODY"
       },
       "embeddingProvider": {
         "type": "string",
@@ -128,8 +156,7 @@
       },
       "embeddingModel": {
         "type": "string",
-        "description": "Embedding model name (default: text-embedding-ada-002). Env: OGMEM_EMBEDDING_MODEL",
-        "default": "text-embedding-ada-002"
+        "description": "Embedding model name (default: text-embedding-ada-002). Env: OGMEM_EMBEDDING_MODEL"
       }
     }
   }

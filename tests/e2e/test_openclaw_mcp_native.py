@@ -14,18 +14,36 @@ import pytest
 
 from server.mcp_server import (
     DELETE_MEMORY_TOOL_NAME,
+    DELETE_SKILL_TOOL_NAME,
+    INSTALL_SKILL_TOOL_NAME,
+    LIST_MEMORY_TOOL_NAME,
+    LIST_SKILL_CANDIDATES_TOOL_NAME,
+    LIST_SKILLS_TOOL_NAME,
     QUERY_MEMORY_TOOL_NAME,
     READ_MEMORY_TOOL_NAME,
+    READ_SKILL_TOOL_NAME,
+    SEARCH_CODE_TOOL_NAME,
+    SEARCH_SKILLS_TOOL_NAME,
+    UPDATE_SKILL_TOOL_NAME,
     WRITE_MEMORY_TOOL_NAME,
 )
 
 ROOT = Path(__file__).resolve().parents[2]
 
 MCP_BUSINESS_TOOLS = {
+    LIST_MEMORY_TOOL_NAME,
     QUERY_MEMORY_TOOL_NAME,
     READ_MEMORY_TOOL_NAME,
     WRITE_MEMORY_TOOL_NAME,
     DELETE_MEMORY_TOOL_NAME,
+    SEARCH_SKILLS_TOOL_NAME,
+    LIST_SKILLS_TOOL_NAME,
+    READ_SKILL_TOOL_NAME,
+    SEARCH_CODE_TOOL_NAME,
+    LIST_SKILL_CANDIDATES_TOOL_NAME,
+    INSTALL_SKILL_TOOL_NAME,
+    UPDATE_SKILL_TOOL_NAME,
+    DELETE_SKILL_TOOL_NAME,
 }
 EXPECTED_OPENCLAW_BUSINESS_TOOLS = {f"ogmemory__{name}" for name in MCP_BUSINESS_TOOLS}
 EXPECTED_OPENCLAW_RESOURCE_TOOLS = {
@@ -59,16 +77,25 @@ def test_parse_openclaw_probe_json_ignores_bundle_logs():
   "servers": {
     "ogmemory": {
       "launch": "http://127.0.0.1:8091/mcp",
-      "tools": 4,
+      "tools": 13,
       "resources": true,
       "prompts": true
     }
   },
   "tools": [
+    "ogmemory__ogm_list_memories",
     "ogmemory__ogm_query_memory",
     "ogmemory__ogm_read_memory",
     "ogmemory__ogm_write_memory",
     "ogmemory__ogm_delete_memory",
+    "ogmemory__ogm_search_skills",
+    "ogmemory__ogm_list_skills",
+    "ogmemory__ogm_read_skill",
+    "ogmemory__ogm_list_skill_candidates",
+    "ogmemory__ogm_search_code",
+    "ogmemory__ogm_install_skill",
+    "ogmemory__ogm_update_skill",
+    "ogmemory__ogm_delete_skill",
     "ogmemory__resources_list",
     "ogmemory__resources_read"
   ],

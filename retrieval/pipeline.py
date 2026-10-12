@@ -2,8 +2,8 @@
 
 Runs 4 stages sequentially — errors are propagated, not silently degraded:
   Stage 1  QueryPlanner        — classify query into TypedQuery[]
-  Stage 2  SeedRetriever       — global L0/L1/L2 mixed vector search
-  Stage 3  HierarchicalSearcher — auto-expand L0/L1 to L2 leaves
+  Stage 2  SeedRetriever       — mixed-level search, or direct L2 search
+  Stage 3  HierarchicalSearcher — expand to L2 leaves, or select direct L2 hits
   Stage 4  ResultRanker     — keep only L2, sort, top-k -> RetrievedBlock[]
 
 Returns a pure structured SearchMemoryResult.
@@ -26,8 +26,10 @@ from core.models import (
     TypedQuery,
     SeedHit,
 )
+from retrieval.hotness import blend_hotness
 from retrieval.result_ranker import ResultRanker, _vec_to_leaf
 from retrieval.hierarchical_searcher import HierarchicalSearcher
+from retrieval.candidate_pool import candidate_top_k
 from retrieval.query_planner import QueryPlanner
 from retrieval.seed_retriever import SeedRetriever
 from retrieval.trace import RetrievalTrace, TraceTimer
@@ -95,13 +97,14 @@ class RetrievalPipeline:
         for tq, sr in zip(typed_queries, all_seed_results):
             leaves = self._run_expand(
                 tq, sr, ctx, trace,
-                limit=tq.top_k, mode=mode,
+                limit=candidate_top_k(self.cfg, tq.top_k, fallback_top_k=tq.top_k), mode=mode,
                 score_threshold=score_threshold,
             )
             all_leaf_hits.extend(leaves)
 
         # Stage 4
-        merged_seed = self._merge_seeds(all_seed_results)
+        # Direct mode must not reintroduce candidates rejected by its threshold.
+        merged_seed = self._merge_seeds(all_seed_results) if self.cfg.expand_hierarchy else None
         blocks = self._run_assembly(typed_queries, all_leaf_hits, merged_seed, trace, ctx, fill_content_for_top_k=fill_content_for_top_k)
 
         trace.total_ms = (time.monotonic() - t0) * 1000
@@ -154,6 +157,22 @@ class RetrievalPipeline:
         return result
 
     def _run_expand(self, tq, sr, ctx, trace, *, limit, mode, score_threshold) -> list[LeafHit]:
+        if not self.cfg.expand_hierarchy:
+            with TraceTimer("direct_retrieval") as st:
+                st.input_count = len(sr.initial_candidates)
+                threshold = self.cfg.default_score_threshold if score_threshold is None else score_threshold
+                hits = [hit for hit in self._fallback_l2_from_seed(sr) if hit.score > threshold]
+                # Use the existing candidate pool before local semantic heat.
+                hits.sort(key=lambda hit: hit.score, reverse=True)
+                hits = hits[:limit]
+                if sr.query_vector:
+                    for hit in hits:
+                        hit.score = blend_hotness(hit.score, hit.active_count, hit.updated_at, self.cfg)
+                    hits.sort(key=lambda hit: hit.score, reverse=True)
+                st.output_count = len(hits)
+            trace.add_stage(st)
+            return hits
+
         if not sr.starting_points and not sr.initial_candidates:
             return []
 
@@ -202,6 +221,18 @@ class RetrievalPipeline:
                     if uri:
                         seen_uris.add(uri)
                     all_blocks.append(b)
+
+            final_limit = max((getattr(tq, "top_k", 0) for tq in typed_queries), default=0)
+            if getattr(self.cfg, "global_result_rerank_enabled", False) and final_limit > 0:
+                all_blocks.sort(
+                    key=lambda block: (
+                        getattr(block, "ranking_score", None)
+                        if getattr(block, "ranking_score", None) is not None
+                        else getattr(block, "score", 0.0)
+                    ),
+                    reverse=True,
+                )
+                all_blocks = all_blocks[:final_limit]
 
             st.output_count = len(all_blocks)
         trace.add_stage(st)

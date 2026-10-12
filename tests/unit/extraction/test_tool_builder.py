@@ -603,3 +603,58 @@ def test_parse_fallback_routing_key_for_schema_without_identifier_field():
 
     assert parsed is not None
     assert parsed[2].routing_key == "fallback_key_value"
+
+
+def test_parse_tool_call_rejects_null_required_fields_before_storage(caplog):
+    raw_input = {
+        "routing_key": "null_regression",
+        "abstract": None,
+        "overview": None,
+        "content": None,
+        "confidence": 0.8,
+    }
+
+    with caplog.at_level(logging.WARNING):
+        parsed = parse_tool_call("extract_pattern", raw_input, SchemaRegistry())
+
+    assert parsed is None
+    for name in ("abstract", "overview", "content"):
+        assert f"{name}: required field must not be null" in caplog.text
+    assert raw_input["content"] is None
+
+
+def test_parse_tool_call_preserves_valid_content_and_optional_null():
+    parsed = parse_tool_call(
+        "extract_pattern",
+        {
+            "routing_key": "cycling",
+            "abstract": "Alice cycles daily.",
+            "overview": "Daily cycling routine.",
+            "content": "Alice cycles daily for exercise.",
+            "confidence": 0.8,
+            "when": None,
+        },
+        SchemaRegistry(),
+    )
+
+    assert parsed is not None
+    assert parsed[2].content == "Alice cycles daily for exercise."
+    assert parsed[2].when is None
+
+
+def test_parse_tool_call_fills_null_generated_fields_before_required_validation():
+    raw_input = {
+        "abstract": "Alice cycles daily.",
+        "overview": None,
+        "content": None,
+        "confidence": None,
+    }
+
+    parsed = parse_tool_call("extract_pattern", raw_input, SchemaRegistry())
+
+    assert parsed is not None
+    assert parsed[2].content == raw_input["abstract"]
+    assert parsed[2].overview == raw_input["abstract"]
+    assert parsed[2].confidence == 0.5
+    assert raw_input["content"] is None
+    assert raw_input["confidence"] is None

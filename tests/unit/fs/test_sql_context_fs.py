@@ -16,10 +16,12 @@ from core.errors import (
     NodeNotFoundError,
 )
 from core.models import ContextNode, RelationEdge, RequestContext
+from fs.sql_adapter.sql_context_fs import parse_uri
 
 # ---------------------------------------------------------------------------
 # Fixtures
 # ---------------------------------------------------------------------------
+
 
 def _ctx(account_id="acme", user_id="alice", session_id="s1"):
     return RequestContext(
@@ -63,15 +65,51 @@ def _pref_node(slug="coffee"):
 # Tests
 # ---------------------------------------------------------------------------
 
+
+def test_parse_managed_skill_uri():
+    assert parse_uri("ctx://acme/agents/main/skills/imported/demo") == {
+        "account": "acme",
+        "owner_type": "agents",
+        "owner_id": "main",
+        "category": "skills/imported",
+        "slug": "demo",
+    }
+
+
+def test_parse_legacy_generated_skill_uri():
+    assert parse_uri("ctx://acme/agents/main/skills/demo") == {
+        "account": "acme",
+        "owner_type": "agents",
+        "owner_id": "main",
+        "category": "skills",
+        "slug": "demo",
+    }
+
+
+
+def test_memory_identity_lock_holds_a_session_advisory_lock(mock_sql_fs):
+    fs, conn, cursor = mock_sql_fs
+    directory = "ctx://acme/users/alice/memories/preferences"
+
+    with fs.memory_identity_lock(directory, _ctx()):
+        assert any("pg_try_advisory_lock" in sql for sql in _sql_calls(cursor))
+
+    assert any("pg_advisory_unlock" in sql for sql in _sql_calls(cursor))
+    conn.close.assert_called_once()
+
+
 @pytest.fixture
 def mock_sql_fs():
     """Create SQLContextFS with mocked psycopg2."""
+
     # Mock Json to just return the value (identity wrapper)
     def mock_json(x):
         return x
 
-    with patch("fs.sql_adapter.sql_context_fs.psycopg2") as mock_pg, \
-         patch("fs.sql_adapter.sql_context_fs.Json", mock_json):
+    with (
+        patch("fs.sql_adapter.sql_context_fs.psycopg2") as mock_pg,
+        patch("fs.sql_adapter.sql_context_fs.Json", mock_json),
+    ):
         mock_conn = MagicMock()
         mock_cursor = MagicMock()
         mock_conn.cursor.return_value.__enter__ = lambda s: mock_cursor
@@ -80,6 +118,7 @@ def mock_sql_fs():
 
         # Import after patching
         from fs.sql_adapter.sql_context_fs import SQLContextFS
+
         fs = SQLContextFS.__new__(SQLContextFS)
         fs._connection_string = "host=localhost dbname=test"
         fs._pool_size = 5
@@ -93,7 +132,6 @@ def mock_sql_fs():
 
 
 class TestSQLContextFSWriteNode:
-
     def test_write_new_node(self, mock_sql_fs):
         fs, conn, cursor = mock_sql_fs
         node = _profile_node()
@@ -163,9 +201,51 @@ class TestSQLContextFSWriteNode:
         fs.write_node(node, ctx)
         conn.commit.assert_called_once()
 
+    def test_write_create_only_rejects_existing_uri(self, mock_sql_fs):
+        fs, conn, cursor = mock_sql_fs
+        node = _profile_node()
+        node.metadata["_expected_version"] = 0
+        cursor.rowcount = 0
+        cursor.fetchone.return_value = (4,)
+
+        with pytest.raises(ConcurrentModificationError):
+            fs.write_node(node, _ctx())
+
+        assert any(
+            "ON CONFLICT (uri) DO NOTHING" in call.args[0] for call in cursor.execute.call_args_list
+        )
+        conn.rollback.assert_called_once()
+
+    def test_public_expected_version_zero_uses_legacy_update(self, mock_sql_fs):
+        fs, conn, cursor = mock_sql_fs
+        node = _profile_node()
+        node.metadata["expected_version"] = 0
+        cursor.rowcount = 1
+
+        fs.write_node(node, _ctx())
+
+        sql = cursor.execute.call_args.args[0]
+        params = cursor.execute.call_args.args[1]
+        assert "UPDATE context_nodes SET" in sql
+        assert "WHERE uri = %s AND version = %s" in sql
+        assert params[-1] == 0
+        assert "ON CONFLICT (uri) DO NOTHING" not in sql
+        conn.commit.assert_called_once()
+
+    def test_internal_expected_version_is_not_persisted(self, mock_sql_fs):
+        fs, conn, cursor = mock_sql_fs
+        node = _profile_node()
+        node.metadata["_expected_version"] = 0
+        cursor.rowcount = 1
+
+        fs.write_node(node, _ctx())
+
+        insert_params = cursor.execute.call_args.args[1]
+        persisted_metadata = insert_params[10]
+        assert "_expected_version" not in persisted_metadata
+
 
 class TestSQLContextFSAccess:
-
     def test_session_state_matching_session_allowed(self, mock_sql_fs):
         fs, conn, cursor = mock_sql_fs
         uri = "ctx://acme/sessions/session-1/state"
@@ -188,15 +268,19 @@ class TestSQLContextFSAccess:
 
 
 class TestSQLContextFSReadNode:
-
     def test_read_existing_node(self, mock_sql_fs):
         fs, conn, cursor = mock_sql_fs
         ctx = _ctx()
 
         cursor.fetchone.return_value = (
             "ctx://acme/users/alice/memories/profile",
-            "MEMORY", "profile", 0, "user:alice",
-            "Short abstract", "## Overview", "Profile content",
+            "MEMORY",
+            "profile",
+            0,
+            "user:alice",
+            "Short abstract",
+            "## Overview",
+            "Profile content",
             [],  # relations
             {"tags": ["test"], "version": 1},  # metadata
             "ACTIVE",
@@ -225,8 +309,19 @@ class TestSQLContextFSReadNode:
 
         cursor.fetchone.return_value = (
             "ctx://acme/users/alice/memories/profile",
-            "MEMORY", "profile", 0, "user:alice",
-            "", "", "", [], {}, "BROKEN", None, None, 1,
+            "MEMORY",
+            "profile",
+            0,
+            "user:alice",
+            "",
+            "",
+            "",
+            [],
+            {},
+            "BROKEN",
+            None,
+            None,
+            1,
         )
 
         with pytest.raises(NodeBrokenError):
@@ -255,8 +350,13 @@ class TestSQLContextFSReadNode:
 
         cursor.fetchone.return_value = (
             "ctx://acme/users/alice/memories/profile",
-            "MEMORY", "profile", 0, "user:alice",
-            "abs", "ov", "cont",
+            "MEMORY",
+            "profile",
+            0,
+            "user:alice",
+            "abs",
+            "ov",
+            "cont",
             relations,  # JSONB relations
             {"version": 1},
             "ACTIVE",
@@ -271,7 +371,6 @@ class TestSQLContextFSReadNode:
 
 
 class TestSQLContextFSExists:
-
     def test_exists_active(self, mock_sql_fs):
         fs, conn, cursor = mock_sql_fs
         ctx = _ctx()
@@ -286,6 +385,14 @@ class TestSQLContextFSExists:
 
         assert fs.exists("ctx://acme/users/alice/memories/profile", ctx) is False
 
+    def test_archived_node_version(self, mock_sql_fs):
+        fs, conn, cursor = mock_sql_fs
+        ctx = _ctx()
+        cursor.fetchone.return_value = (4,)
+
+        assert fs.archived_node_version("ctx://acme/users/alice/memories/preferences/pets", ctx) == 4
+        assert "status = 'ARCHIVED'" in _sql_calls(cursor)[-1]
+
     def test_exists_access_denied(self, mock_sql_fs):
         fs, conn, cursor = mock_sql_fs
         ctx = _ctx(account_id="other")
@@ -294,7 +401,6 @@ class TestSQLContextFSExists:
 
 
 class TestSQLContextFSDeleteNode:
-
     def test_delete_existing(self, mock_sql_fs):
         fs, conn, cursor = mock_sql_fs
         ctx = _ctx()
@@ -320,21 +426,21 @@ class TestSQLContextFSDeleteNode:
 
 
 class TestSQLContextFSListChildren:
-
     def test_list_children(self, mock_sql_fs):
         fs, conn, cursor = mock_sql_fs
         ctx = _ctx()
 
         # Return URIs under preferences/
         cursor.fetchall.return_value = [
+            ("ctx://acme/users/alice/memories/preferences/",),
             ("ctx://acme/users/alice/memories/preferences/coffee",),
             ("ctx://acme/users/alice/memories/preferences/tea",),
-            ("ctx://acme/users/alice/memories/preferences/food/sushi",),  # nested, should be excluded
+            (
+                "ctx://acme/users/alice/memories/preferences/food/sushi",
+            ),  # nested, should be excluded
         ]
 
-        children = fs.list_children(
-            "ctx://acme/users/alice/memories/preferences", ctx
-        )
+        children = fs.list_children("ctx://acme/users/alice/memories/preferences", ctx)
 
         # Only immediate children (no nested paths)
         assert len(children) == 2
@@ -346,9 +452,7 @@ class TestSQLContextFSListChildren:
         ctx = _ctx()
         cursor.fetchall.return_value = []
 
-        children = fs.list_children(
-            "ctx://acme/users/alice/memories/preferences", ctx
-        )
+        children = fs.list_children("ctx://acme/users/alice/memories/preferences", ctx)
         assert children == []
 
     def test_list_children_filters_by_account(self, mock_sql_fs):
@@ -370,9 +474,7 @@ class TestSQLContextFSListChildren:
         ctx = _ctx(account_id="other")
 
         with pytest.raises(AccessDeniedError):
-            fs.list_children(
-                "ctx://acme/users/alice/memories/preferences", ctx
-            )
+            fs.list_children("ctx://acme/users/alice/memories/preferences", ctx)
 
     def test_list_node_summaries_uses_summary_columns_and_limit(self, mock_sql_fs):
         fs, conn, cursor = mock_sql_fs
@@ -400,16 +502,18 @@ class TestSQLContextFSListChildren:
         )
 
         assert len(summaries) == 1
+        assert summaries[0].uri.endswith("/coffee")
         assert summaries[0].content == ""
         assert summaries[0].metadata["has_content"] is True
         sql, params = cursor.execute.call_args[0]
         assert " content," not in sql
         assert "POSITION('/' IN SUBSTRING" in sql
+        assert "CHAR_LENGTH(uri) > CHAR_LENGTH(%s)" in sql
+        assert params[2].endswith("/preferences/")
         assert params[-1] == 1
 
 
 class TestSQLContextFSMoveNode:
-
     def test_move_existing(self, mock_sql_fs):
         fs, conn, cursor = mock_sql_fs
         ctx = _ctx()
@@ -452,6 +556,7 @@ class TestSQLContextFSMoveNode:
     def test_move_cascades_to_relations_and_outbox(self, mock_sql_fs):
         """move_node must UPDATE relation_edges and emit DELETE + UPSERT outbox events."""
         import hashlib
+
         fs, conn, cursor = mock_sql_fs
         ctx = _ctx()
         cursor.rowcount = 1  # main node UPDATE matches 1 row
@@ -460,7 +565,7 @@ class TestSQLContextFSMoveNode:
         # fetchone is called for: to_regclass('relation_edges'), to_regclass('outbox_events')
         cursor.fetchone.side_effect = [
             ("relation_edges",),  # to_regclass('relation_edges')
-            ("outbox_events",),   # to_regclass('outbox_events')
+            ("outbox_events",),  # to_regclass('outbox_events')
         ]
 
         new_uri = "ctx://acme/users/alice/memories/preferences/latte"
@@ -471,8 +576,7 @@ class TestSQLContextFSMoveNode:
         # 2) SELECT uri,abstract,... for UPSERT events (re-index)
         cursor.fetchall.side_effect = [
             [(new_uri,)],  # all_new_uris — just the moved node
-            [(new_uri, "abs", "ov", "content",
-              "user:alice", "preference", "MEMORY")],  # moved_rows
+            [(new_uri, "abs", "ov", "content", "user:alice", "preference", "MEMORY")],  # moved_rows
         ]
 
         fs.move_node(old_uri, new_uri, ctx)
@@ -488,41 +592,29 @@ class TestSQLContextFSMoveNode:
 
         # 2) DELETE_CONTEXT: verify correct ids including L2 /content.md
         delete_calls = [
-            c for c in cursor.execute.call_args_list
-            if "DELETE_CONTEXT" in str(c[0][0])
+            c for c in cursor.execute.call_args_list if "DELETE_CONTEXT" in str(c[0][0])
         ]
-        assert len(delete_calls) == 1, (
-            f"Expected 1 DELETE_CONTEXT, got {len(delete_calls)}"
-        )
+        assert len(delete_calls) == 1, f"Expected 1 DELETE_CONTEXT, got {len(delete_calls)}"
         # call[0] = (sql, (event_id, uri, account_id, payload_dict))
         delete_params = delete_calls[0][0][1]  # params tuple
         payload = delete_params[3]  # 4th element = Json(payload)
         assert isinstance(payload, dict), f"Expected dict payload, got {type(payload)}"
         ids = payload["ids_to_delete"]
         assert len(ids) == 3, f"Expected 3 ids (L0/L1/L2), got {len(ids)}"
-        expected_l2 = hashlib.sha256(
-            f"{old_uri}/content.md:2".encode()
-        ).hexdigest()[:16]
+        expected_l2 = hashlib.sha256(f"{old_uri}/content.md:2".encode()).hexdigest()[:16]
         assert expected_l2 in ids, f"L2 id {expected_l2} not in {ids}"
 
         # 3) UPSERT_CONTEXT: verify records with correct new-URI ids
         upsert_calls = [
-            c for c in cursor.execute.call_args_list
-            if "UPSERT_CONTEXT" in str(c[0][0])
+            c for c in cursor.execute.call_args_list if "UPSERT_CONTEXT" in str(c[0][0])
         ]
-        assert len(upsert_calls) == 1, (
-            f"Expected 1 UPSERT_CONTEXT, got {len(upsert_calls)}"
-        )
+        assert len(upsert_calls) == 1, f"Expected 1 UPSERT_CONTEXT, got {len(upsert_calls)}"
         upsert_params = upsert_calls[0][0][1]
         records = upsert_params[3]["records"]
         assert len(records) >= 1, "Expected at least 1 record"
-        expected_new_l2 = hashlib.sha256(
-            f"{new_uri}/content.md:2".encode()
-        ).hexdigest()[:16]
+        expected_new_l2 = hashlib.sha256(f"{new_uri}/content.md:2".encode()).hexdigest()[:16]
         all_ids = [r["id"] for r in records]
-        assert expected_new_l2 in all_ids, (
-            f"New L2 id {expected_new_l2} not in {all_ids}"
-        )
+        assert expected_new_l2 in all_ids, f"New L2 id {expected_new_l2} not in {all_ids}"
 
         # 4) UPSERT metadata must include parent_uri, category, context_type,
         #    has_overview, has_content — matching build_index_records() output.
@@ -550,7 +642,8 @@ class TestSQLContextFSMoveNode:
         cursor.rowcount = 1
 
         cursor.fetchone.side_effect = [
-            ("relation_edges",), ("outbox_events",),
+            ("relation_edges",),
+            ("outbox_events",),
         ]
         new_uri = "ctx://acme/users/alice/memories/preferences/latte"
         cursor.fetchall.side_effect = [
@@ -568,9 +661,12 @@ class TestSQLContextFSMoveNode:
         # so the root to_uri is included (not just children under prefix)
         sql_calls = [str(c[0][0]) for c in cursor.execute.call_args_list]
         select_for_upsert = [
-            s for s in sql_calls
-            if "SELECT uri, abstract" in s and "uri = %s OR uri LIKE %s" in s
+            s for s in sql_calls if "SELECT uri, abstract" in s and "uri = %s OR uri LIKE %s" in s
         ]
         assert len(select_for_upsert) == 1, (
             "Expected SELECT with `uri = %s OR uri LIKE %s` for re-index"
         )
+
+
+def _sql_calls(cursor):
+    return [call.args[0] for call in cursor.execute.call_args_list]

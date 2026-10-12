@@ -66,8 +66,9 @@ def build_mcp_context(
     transport_headers: Mapping[str, Any] | None = None,
     allow_stdio_env_auth: bool = True,
     resolved_identity: ResolvedIdentity | None = None,
+    use_stdio_agent_default: bool = False,
 ) -> RequestContext:
-    """Build the only RequestContext MCP handlers are allowed to use."""
+    """Build an MCP context from argument, header, and an optional stdio default."""
 
     arguments = arguments or {}
     _reject_identity_fields(arguments)
@@ -76,7 +77,19 @@ def build_mcp_context(
     session_id = arguments.get("sessionId") or arguments.get("session_id")
     if session_id:
         params["sessionId"] = session_id
-    agent_id = arguments.get("agentId") or arguments.get("agent_id")
+    normalized_headers = {
+        str(key).lower(): value for key, value in (transport_headers or {}).items()
+    }
+    agent_id = (
+        arguments.get("agentId")
+        or arguments.get("agent_id")
+        or normalized_headers.get("x-agent-id")
+        or (
+            getattr(service, "default_agent_id", None)
+            if allow_stdio_env_auth and use_stdio_agent_default
+            else None
+        )
+    )
     if agent_id:
         params["agentId"] = agent_id
 
@@ -117,7 +130,7 @@ def build_mcp_context(
 
 
 def headers_from_mcp_context(context: Any | None) -> dict[str, str]:
-    """Extract HTTP headers from a FastMCP Context when available."""
+    """Extract HTTP headers from an MCP request context when available."""
 
     request = _request_from_mcp_context(context)
     if request is None:
@@ -129,7 +142,7 @@ def headers_from_mcp_context(context: Any | None) -> dict[str, str]:
 
 
 def has_mcp_http_request(context: Any | None) -> bool:
-    """Return whether a FastMCP Context contains an HTTP request object."""
+    """Return whether an MCP context contains an HTTP request object."""
 
     request = _request_from_mcp_context(context)
     return getattr(request, "headers", None) is not None
@@ -151,6 +164,9 @@ def identity_from_mcp_context(context: Any | None) -> Any | None:
 def _request_from_mcp_context(context: Any | None) -> Any | None:
     if context is None:
         return None
+    request = getattr(context, "request", None)
+    if request is not None:
+        return request
     try:
         return context.request_context.request
     except Exception:

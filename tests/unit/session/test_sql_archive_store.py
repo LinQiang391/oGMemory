@@ -9,21 +9,20 @@ from unittest.mock import MagicMock, patch
 
 import pytest
 
-from core.models import RequestContext
-from session.models import ArchiveEntry, ArchiveWriteResult
-
+from core.models import RequestContext, Role
 
 # ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
 
-def _ctx(account_id="test_account", user_id="test_user"):
+def _ctx(account_id="test_account", user_id="test_user", role=Role.MEMBER):
     return RequestContext(
         account_id=account_id,
         user_id=user_id,
         agent_id="test_agent",
         session_id="test_session",
         trace_id="test_trace",
+        role=role,
     )
 
 
@@ -42,12 +41,15 @@ SAMPLE_MESSAGES = [
 @pytest.fixture
 def mock_store():
     """Create SQLSessionArchiveStore with mocked psycopg2 connection pool."""
-    mock_json = lambda x: x
+    def mock_json(value):
+        return value
 
     with patch("session.sql_archive_store.psycopg2") as mock_pg, \
          patch("session.sql_archive_store.Json", mock_json), \
          patch("session.sql_archive_store._HAS_PSYCOPG2", True):
         mock_conn = MagicMock()
+        mock_conn.autocommit = False
+        mock_conn.get_transaction_status.return_value = 0
         mock_cursor = MagicMock()
         mock_conn.cursor.return_value.__enter__ = lambda s: mock_cursor
         mock_conn.cursor.return_value.__exit__ = MagicMock(return_value=False)
@@ -83,13 +85,14 @@ class TestEnsureTable:
     def test_raises_on_failure(self, mock_store):
         """_ensure_table raises RuntimeError when DDL fails."""
         import fs.sql_adapter.schema as schema_mod
-        schema_mod._schema_ensured = False
+        schema_mod._schema_ensured.clear()
 
         store, conn, cursor = mock_store
         cursor.execute.side_effect = Exception("connection lost")
 
-        with pytest.raises(RuntimeError, match="Failed to ensure schema"):
+        with pytest.raises(RuntimeError, match="Failed to ensure schema: connection lost"):
             store._ensure_table()
+        cursor.execute.assert_called_once()
         conn.rollback.assert_called()
 
 
@@ -313,8 +316,9 @@ class TestListArchivesSince:
         entries = store.list_archives_since(datetime(2025, 4, 1), ctx)
 
         sql = cursor.execute.call_args.args[0]
-        assert "UPPER(COALESCE(metadata->>'status', '')) <> 'MERGED'" in sql
-        assert sql.index("UPPER(COALESCE(metadata->>'status', '')) <> 'MERGED'") < sql.index("LIMIT")
+        assert "metadata->>'archive_status'" in sql
+        assert "metadata->>'status'" in sql
+        assert sql.index("metadata->>'archive_status'") < sql.index("LIMIT")
         assert [entry.archive_id for entry in entries] == ["arc1"]
 
 
@@ -532,6 +536,71 @@ def test_delete_archive_returns_false_when_no_row_deleted(mock_store):
     conn.commit.assert_not_called()
 
 
+def test_admin_session_cleanup_includes_ownerless_legacy_rows(mock_store):
+    store, conn, cur = mock_store
+    ctx = _ctx(account_id="acct-test", role=Role.ADMIN)
+    cur.rowcount = 2
+
+    assert store.delete_session_archives("sess1", ctx) == 2
+
+    sql = cur.execute.call_args.args[0]
+    params = cur.execute.call_args.args[1]
+    assert "COALESCE(owner_user_id, '') = ''" in sql
+    assert "COALESCE(owner_agent_id, '') = ''" in sql
+    assert params == ("acct-test", "sess1", "test_user", "test_agent")
+    conn.commit.assert_called_once()
+
+
+def test_member_session_cleanup_excludes_ownerless_legacy_rows(mock_store):
+    store, conn, cur = mock_store
+    ctx = _ctx(account_id="acct-test", role=Role.MEMBER)
+    cur.rowcount = 1
+
+    assert store.delete_session_archives("sess1", ctx) == 1
+
+    sql = cur.execute.call_args.args[0]
+    assert "COALESCE(owner_user_id" not in sql
+    assert cur.execute.call_args.args[1] == (
+        "acct-test", "sess1", "test_user", "test_agent",
+    )
+
+
+def test_session_owner_lookup_allows_legacy_rows_but_rejects_conflicts(mock_store):
+    store, _conn, cur = mock_store
+    ctx = _ctx(account_id="acct-test", role=Role.ADMIN)
+    cur.fetchall.return_value = [("", ""), ("test_user", "test_agent")]
+
+    assert store.get_session_owner("sess1", ctx) == ("test_user", "test_agent")
+
+    cur.fetchall.return_value = [("user-a", "agent-a"), ("user-b", "agent-b")]
+    with pytest.raises(PermissionError, match="conflicting durable session owners"):
+        store.get_session_owner("sess1", ctx)
+
+
+@pytest.mark.parametrize("failure_point", ["bind_tenant", "execute", "fetchall"])
+def test_session_owner_lookup_rolls_back_before_return_on_db_error(
+    mock_store, failure_point
+):
+    store, conn, cur = mock_store
+    ctx = _ctx(account_id="acct-test", role=Role.ADMIN)
+    error = RuntimeError(f"{failure_point} failed")
+    events = []
+
+    conn.rollback.side_effect = lambda: events.append("rollback")
+    store._return_connection = lambda returned: events.append("return")
+    if failure_point == "bind_tenant":
+        store.bind_tenant = MagicMock(side_effect=error)
+    elif failure_point == "execute":
+        cur.execute.side_effect = [None, error]
+    else:
+        cur.fetchall.side_effect = error
+
+    with pytest.raises(RuntimeError, match=f"{failure_point} failed"):
+        store.get_session_owner("sess1", ctx)
+
+    assert events == ["rollback", "return"]
+
+
 def test_mark_archive_merged_updates_metadata_atomically(mock_store):
     store, conn, cur = mock_store
     ctx = _ctx(account_id="acct-test")
@@ -544,7 +613,7 @@ def test_mark_archive_merged_updates_metadata_atomically(mock_store):
     assert not any("SELECT metadata FROM session_archives" in sql for sql in executed)
     assert any("COALESCE(metadata" in sql and "|| %s::jsonb" in sql for sql in executed)
     update_params = cur.execute.call_args.args[1]
-    assert update_params[0]["status"] == "MERGED"
+    assert update_params[0]["archive_status"] == "MERGED"
     assert update_params[0]["merged_into"] == "merged_001"
     assert update_params[1:] == ("arc001", "sess1", "acct-test")
     conn.commit.assert_called_once()

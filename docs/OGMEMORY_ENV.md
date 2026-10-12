@@ -83,6 +83,7 @@ service:
 
 storage:
   backend: sql                   # agfs / sql
+  dialect: postgresql            # postgresql / opengauss
   connection_string: "host=127.0.0.1 port=5432 dbname=ogmemory user=postgres password=postgres"
   pool_size: 5
 
@@ -163,8 +164,9 @@ cache:
 
 | YAML 路径 | 环境变量 | 默认值 | 必填 | 说明 |
 |-----------|---------|-------|------|------|
-| `storage.backend` | `STORAGE_BACKEND` | `agfs` | 否 | `agfs` 目录存储 / `sql` PostgreSQL 直连存储 |
-| `storage.connection_string` | `SQL_CONNECTION_STRING` | 无 | backend=sql 时**必填** | PostgreSQL libpq DSN，例如 `host=127.0.0.1 port=5432 dbname=ogmemory user=postgres password=postgres` |
+| `storage.backend` | `STORAGE_BACKEND` | `agfs` | 否 | `agfs` 目录存储 / `sql` 数据库直连存储 |
+| `storage.dialect` | `SQL_DIALECT` | `postgresql` | 否 | SQL 方言：`postgresql` / `opengauss`；openGauss 数据库必须使用 `DBCOMPATIBILITY='PG'` |
+| `storage.connection_string` | `SQL_CONNECTION_STRING` | 无 | backend=sql 时**必填** | libpq DSN，例如 `host=127.0.0.1 port=5432 dbname=ogmemory user=postgres password=postgres` |
 | `storage.pool_size` | `SQL_POOL_SIZE` | `5` | 否 | SQL storage 连接池大小 |
 
 ### 服务配置

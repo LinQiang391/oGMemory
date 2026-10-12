@@ -134,7 +134,7 @@ class TestArchiveBuilderBuild:
         """build() should set context_type=SKILL for skill category."""
         plan = WritePlan(
             action="create",
-            target_uri="ctx://test-account/agents/agent-001/skills/code_review",
+            target_uri="ctx://test-account/agents/agent-001/skills/generated/code_review",
             merged_fields={},
             relation_edges=[],
         )
@@ -186,7 +186,7 @@ class TestArchiveBuilderBuild:
         """build() should set owner_space for agent scope."""
         plan = WritePlan(
             action="create",
-            target_uri="ctx://test-account/agents/agent-001/skills/code_review",
+            target_uri="ctx://test-account/agents/agent-001/skills/generated/code_review",
             merged_fields={},
             relation_edges=[],
         )

@@ -16,6 +16,7 @@ from index.outbox_worker import (
     WorkerResult,
     create_upsert_event,
 )
+from providers.token_tracker import TokenTracker
 
 
 # Mock VectorIndex for testing
@@ -66,6 +67,16 @@ class FailingMockVectorIndex(MockVectorIndex):
 
     def upsert(self, records: list[IndexRecord]) -> None:
         raise RuntimeError("Vector index down!")
+
+
+def test_instance_can_disable_class_batch_claim_capability():
+    class Store:
+        supports_batch_claim = True
+
+        def __init__(self):
+            self.supports_batch_claim = False
+
+    assert OutboxWorker._supports_batch_claim(Store()) is False
 
 
 class TestCreateUpsertEvent:
@@ -615,6 +626,7 @@ class TestOutboxWorkerRunOnce:
         ]
         event = create_upsert_event("ctx://test/users/u1/memories/profile", records)
         event.retry_count = 3  # At max retry
+        event.payload["failure_reason"] = "embedding unavailable"
         outbox_store.list_pending.return_value = [(event.uri, event)]
 
         # Run polling cycle
@@ -628,11 +640,23 @@ class TestOutboxWorkerRunOnce:
 
         # Verify event was moved to DLQ
         outbox_store.move_to_dlq.assert_called_once()
+        assert event.payload["failure_reason"] == "Embedding failed!"
 
     def test_run_once_handles_multiple_accounts(self):
         """Test run_once processes events from multiple accounts."""
         vector_index = MockVectorIndex()
-        embedder = MockEmbedder()
+
+        class TrackedEmbedder(MockEmbedder):
+            def __init__(self):
+                super().__init__()
+                self.token_tracker = TokenTracker(model="embedding-test")
+
+            def embed_texts(self, texts):
+                embeddings = super().embed_texts(texts)
+                self.token_tracker.record_embed(len(texts) * 10)
+                return embeddings
+
+        embedder = TrackedEmbedder()
         worker = OutboxWorker(vector_index, embedder)
 
         # Mock outbox store
@@ -661,6 +685,9 @@ class TestOutboxWorkerRunOnce:
         assert stats["processed"] == 2
         assert stats["succeeded"] == 2
         assert outbox_store.list_pending.call_count == 2
+        assert embedder.call_count == 1
+        assert embedder.token_tracker.scoped_snapshot("account1").embed_tokens == 10
+        assert embedder.token_tracker.scoped_snapshot("account2").embed_tokens == 10
 
     def test_run_once_skips_acquired_events(self):
         """Test run_once skips events already locked by another worker."""
@@ -790,6 +817,111 @@ class TestPostUpsertLivenessCheck:
                 self.move_to_dlq = kwargs.pop("move_to_dlq", Mock())
 
         return MockOutboxStore()
+
+    def test_sql_batch_processing_holds_uri_lock_through_ack(self):
+        vector_index = MockVectorIndex()
+        worker = OutboxWorker(vector_index, MockEmbedder())
+        event = self._make_event()
+
+        class MockBatchClaimStore:
+            supports_batch_claim = True
+
+            def __init__(self):
+                self.locked = False
+                self.lock_entries = 0
+
+            def processing_lock(self, node_uri):
+                store = self
+
+                class Lock:
+                    def __enter__(self):
+                        assert node_uri == event.uri
+                        store.locked = True
+                        store.lock_entries += 1
+
+                    def __exit__(self, *_args):
+                        store.locked = False
+
+                return Lock()
+
+            def is_event_current(self, event_id):
+                assert self.locked
+                assert event_id == event.event_id
+                return True
+
+            def claim_batch(self, worker_id="default"):
+                return [(event.uri, event)]
+
+            def mark_done(self, claimed_event, node_uri):
+                assert self.locked
+                assert claimed_event is event
+                assert node_uri == event.uri
+
+            def increment_retry(self, event, node_uri, next_retry_at):
+                raise AssertionError("successful event must not retry")
+
+            def move_to_dlq(self, event, node_uri):
+                raise AssertionError("successful event must not enter DLQ")
+
+        outbox_store = MockBatchClaimStore()
+
+        stats = worker.run_once(outbox_store, ["test"])
+
+        assert stats["succeeded"] == 1
+        assert outbox_store.lock_entries == 1
+        assert outbox_store.locked is False
+
+    def test_sql_batch_processing_retries_processing_lock_timeout(self):
+        worker = OutboxWorker(MockVectorIndex(), MockEmbedder())
+        event = self._make_event()
+
+        class MockBatchClaimStore:
+            supports_batch_claim = True
+
+            def __init__(self):
+                self.retry_calls = 0
+                self.release_calls = 0
+
+            def claim_batch(self, worker_id="default"):
+                return [(event.uri, event)]
+
+            def processing_lock(self, _node_uri):
+                class Lock:
+                    def __enter__(self):
+                        raise TimeoutError("lock busy")
+
+                    def __exit__(self, *_args):
+                        raise AssertionError("unacquired lock must not exit")
+
+                return Lock()
+
+            def increment_retry(self, claimed_event, node_uri, next_retry_at):
+                assert claimed_event is event
+                assert node_uri == event.uri
+                assert next_retry_at is not None
+                self.retry_calls += 1
+
+            def release(self, claimed_event, node_uri):
+                assert claimed_event is event
+                assert node_uri == event.uri
+                self.release_calls += 1
+
+            def move_to_dlq(self, _event, _node_uri):
+                raise AssertionError("first lock timeout must not enter DLQ")
+
+        outbox_store = MockBatchClaimStore()
+
+        stats = worker.run_once(outbox_store, ["test"])
+
+        assert stats == {
+            "processed": 1,
+            "succeeded": 0,
+            "failed": 1,
+            "moved_to_dlq": 0,
+            "skipped": 0,
+        }
+        assert outbox_store.retry_calls == 1
+        assert outbox_store.release_calls == 1
 
     def test_liveness_db_error_triggers_failure_not_ack(self):
         """Post-upsert liveness check DB error should cause event to fail/retry,
@@ -1127,14 +1259,26 @@ class TestEnsureTableRaisesOnFailure:
 
     def test_ensure_table_raises_on_ddl_error(self):
         """_ensure_table must raise on DDL failure, not swallow it silently."""
+        from psycopg2.extensions import TRANSACTION_STATUS_IDLE
+
+        from fs.sql_adapter.schema import _SCHEMA_SQL
+
         with patch("commit.sql_outbox_store.psycopg2"), \
              patch("commit.sql_outbox_store.Json", lambda x: x), \
              patch("commit.sql_outbox_store._HAS_PSYCOPG2", True):
             mock_conn = MagicMock()
+            mock_conn.get_transaction_status.return_value = TRANSACTION_STATUS_IDLE
+            mock_conn.autocommit = False
             mock_cursor = MagicMock()
             mock_conn.cursor.return_value.__enter__ = lambda s: mock_cursor
             mock_conn.cursor.return_value.__exit__ = MagicMock(return_value=False)
-            mock_cursor.execute.side_effect = RuntimeError("DDL failed")
+            mock_cursor.fetchone.return_value = None
+
+            def execute(statement):
+                if statement == _SCHEMA_SQL:
+                    raise RuntimeError("DDL failed")
+
+            mock_cursor.execute.side_effect = execute
 
             from commit.sql_outbox_store import SQLOutboxStore
 
@@ -1150,3 +1294,4 @@ class TestEnsureTableRaisesOnFailure:
                 store._ensure_table()
 
             mock_conn.rollback.assert_called_once()
+            assert any(call.args[0] == _SCHEMA_SQL for call in mock_cursor.execute.call_args_list)

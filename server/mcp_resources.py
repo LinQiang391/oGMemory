@@ -6,6 +6,7 @@ from dataclasses import dataclass
 from typing import Any
 from urllib.parse import quote, unquote, urlparse
 
+from core.memory_names import is_safe_memory_key
 from core.models import ContextNode, RequestContext
 from server.mcp_security import (
     UNTRUSTED_DATA_NOTICE,
@@ -58,6 +59,8 @@ class ParsedOgMemoryUri:
     memory_type: str | None = None
     memory_id: str | None = None
     owner_scope: str | None = None
+    skill_source: str | None = None
+    skill_path: str | None = None
 
 
 def parse_ogmemory_uri(uri: str) -> ParsedOgMemoryUri:
@@ -71,6 +74,36 @@ def parse_ogmemory_uri(uri: str) -> ParsedOgMemoryUri:
         return ParsedOgMemoryUri(kind="status")
     if parts == ["types"]:
         return ParsedOgMemoryUri(kind="types")
+    if parts == ["skills"]:
+        return ParsedOgMemoryUri(kind="collection", memory_type="skill")
+    if len(parts) >= 4 and parts[:2] == ["skills", "imported"]:
+        skill_name = unquote(parts[2])
+        skill_path = "/".join(unquote(part) for part in parts[3:])
+        if not skill_name or not skill_path:
+            raise ValueError("Skill name and package file path must not be empty")
+        return ParsedOgMemoryUri(
+            kind="skill_file",
+            memory_type="skill",
+            memory_id=skill_name,
+            skill_source="imported",
+            skill_path=skill_path,
+        )
+    skill_source = None
+    skill_name = None
+    if len(parts) == 2 and parts[0] == "skills":
+        skill_source, skill_name = "generated", parts[1]
+    elif len(parts) == 3 and parts[0] == "skills":
+        skill_source, skill_name = parts[1], parts[2]
+    if skill_source in {"generated", "imported"} and skill_name is not None:
+        memory_id = unquote(skill_name)
+        if not memory_id:
+            raise ValueError("Skill name must not be empty")
+        return ParsedOgMemoryUri(
+            kind="item",
+            memory_type="skill",
+            memory_id=memory_id,
+            skill_source=skill_source,
+        )
     if len(parts) in (2, 3, 4) and parts[0] == "memories":
         memory_type = parts[1]
         if memory_type not in MEMORY_TYPES:
@@ -101,8 +134,10 @@ def external_to_internal_uri(uri: str, ctx: RequestContext) -> str:
     parsed = parse_ogmemory_uri(uri)
     if parsed.kind != "item" or not parsed.memory_type or not parsed.memory_id:
         raise ValueError(f"URI does not reference a single memory: {uri}")
+    if parsed.memory_type != "skill" and not is_safe_memory_key(parsed.memory_id):
+        raise ValueError("Invalid memory id")
     spec = MEMORY_TYPES[parsed.memory_type]
-    memory_id = quote(parsed.memory_id, safe="")
+    memory_id = parsed.memory_id
 
     if parsed.memory_type == "profile":
         if parsed.memory_id != "self":
@@ -112,7 +147,12 @@ def external_to_internal_uri(uri: str, ctx: RequestContext) -> str:
     if parsed.memory_type == "skill":
         if not ctx.agent_id:
             raise ValueError("agent_id is required for skill memories")
-        return f"ctx://{ctx.account_id}/agents/{ctx.agent_id}/skills/{memory_id}"
+        if parsed.skill_source not in {"generated", "imported"}:
+            raise ValueError("skill source is required")
+        return (
+            f"ctx://{ctx.account_id}/agents/{ctx.agent_id}/skills/"
+            f"{parsed.skill_source}/{quote(memory_id, safe='')}"
+        )
 
     if parsed.memory_type == "pattern" and parsed.owner_scope == "agent":
         if not ctx.agent_id:
@@ -131,6 +171,9 @@ def external_to_internal_uri_candidates(uri: str, ctx: RequestContext) -> list[s
     primary = external_to_internal_uri(uri, ctx)
     parsed = parse_ogmemory_uri(uri)
     candidates = [primary]
+    encoded_id = quote(parsed.memory_id, safe="") if parsed.memory_id else ""
+    if parsed.memory_type != "skill" and encoded_id != parsed.memory_id:
+        candidates.append(f"{primary.rsplit('/', 1)[0]}/{encoded_id}")
     if (
         parsed.kind == "item"
         and parsed.memory_type == "pattern"
@@ -138,10 +181,11 @@ def external_to_internal_uri_candidates(uri: str, ctx: RequestContext) -> list[s
         and ctx.agent_id
         and parsed.memory_id
     ):
-        memory_id = quote(parsed.memory_id, safe="")
-        legacy_agent_uri = f"ctx://{ctx.account_id}/agents/{ctx.agent_id}/memories/patterns/{memory_id}"
+        legacy_agent_uri = f"ctx://{ctx.account_id}/agents/{ctx.agent_id}/memories/patterns/{parsed.memory_id}"
         if legacy_agent_uri not in candidates:
             candidates.append(legacy_agent_uri)
+        if encoded_id != parsed.memory_id:
+            candidates.append(f"{legacy_agent_uri.rsplit('/', 1)[0]}/{encoded_id}")
     return candidates
 
 
@@ -154,9 +198,13 @@ def internal_to_external_uri(uri: str, *, category: str = "") -> str:
     if len(parts) < 6:
         raise ValueError(f"Unsupported internal URI: {uri}")
 
+    if "/skills/generated/" in clean_uri or "/skills/imported/" in clean_uri:
+        source = parts[-2]
+        memory_id = unquote(parts[-1])
+        return f"ogmemory://skills/{source}/{quote(memory_id, safe='')}"
     if "/skills/" in clean_uri:
         memory_id = unquote(parts[-1])
-        return f"ogmemory://memories/skill/{quote(memory_id, safe='')}"
+        return f"ogmemory://skills/generated/{quote(memory_id, safe='')}"
 
     if "/memories/profile" in clean_uri:
         return "ogmemory://memories/profile/self"
@@ -225,7 +273,7 @@ def render_types_resource(service: Any) -> dict[str, Any]:
                 "owner": spec.owner,
                 "writable_type": spec.public_type not in {"profile"},
                 "write_tool_enabled": write_enabled,
-                "deletable_type": spec.public_type not in {"profile"},
+                "deletable_type": spec.public_type not in {"profile", "skill"},
                 "delete_tool_enabled": delete_enabled,
             }
             for spec in MEMORY_TYPES.values()
@@ -242,53 +290,104 @@ def render_resource(service: Any, uri: str, ctx: RequestContext) -> dict[str, An
         return render_types_resource(service)
     if parsed.kind == "collection" and parsed.memory_type:
         return render_collection_resource(service, parsed.memory_type, ctx)
+    if parsed.kind == "skill_file" and parsed.memory_id and parsed.skill_path:
+        try:
+            payload = service.read_managed_skill_file(
+                ctx, parsed.memory_id, parsed.skill_path
+            )
+            payload["untrusted_data_notice"] = UNTRUSTED_DATA_NOTICE
+            return _truncate_payload(
+                payload, _configured_max_response_chars(service)
+            )
+        except Exception as exc:
+            raise_not_found_or_not_visible(exc)
+            raise
     if parsed.kind == "item":
         return render_item_resource(service, uri, ctx)
     raise ValueError(f"Unsupported resource URI: {uri}")
 
 
-def render_collection_resource(service: Any, memory_type: str, ctx: RequestContext) -> dict[str, Any]:
+def render_collection_resource(
+    service: Any,
+    memory_type: str,
+    ctx: RequestContext,
+) -> dict[str, Any]:
     spec = MEMORY_TYPES[memory_type]
     limit = int(getattr(service._cfg, "mcp_collection_limit", 50))
     memories: list[dict[str, Any]] = []
 
     try:
-        context_fs = service._get_context_fs()
-        if memory_type == "profile":
-            internal_uri = f"ctx://{ctx.account_id}/users/{ctx.user_id}/memories/profile"
-            if context_fs.exists(internal_uri, ctx):
-                memories.append(_node_summary(context_fs.read_node(internal_uri, ctx)))
-        elif memory_type == "skill":
-            if ctx.agent_id:
-                base_uri = f"ctx://{ctx.account_id}/agents/{ctx.agent_id}/skills"
-                memories.extend(_list_node_summaries(context_fs, base_uri, ctx, limit))
-        elif memory_type == "pattern":
-            user_base = f"ctx://{ctx.account_id}/users/{ctx.user_id}/memories/patterns"
-            memories.extend(_list_node_summaries(context_fs, user_base, ctx, limit))
-            if ctx.agent_id and len(memories) < limit:
-                agent_base = f"ctx://{ctx.account_id}/agents/{ctx.agent_id}/memories/patterns"
-                memories.extend(
-                    _list_node_summaries(context_fs, agent_base, ctx, limit - len(memories))
-                )
+        if memory_type == "skill":
+            published = service.list_published_skills(ctx, limit=min(limit, 100))
+            memories.extend(
+                {
+                    "uri": (
+                        f"ogmemory://skills/"
+                        f"{row.get('source') or 'generated'}/"
+                        f"{quote(row['name'], safe='')}"
+                    ),
+                    "type": "skill",
+                    "id": row["name"],
+                    "source": row.get("source") or "generated",
+                    "abstract": row.get("description", ""),
+                    "updated_at": row.get("updated_at", ""),
+                    "has_content": True,
+                }
+                for row in published.get("skills", [])
+            )
+            collection_truncated = bool(published.get("truncated", False))
+            next_cursor = published.get("next_cursor")
         else:
-            owner_path = "agents" if spec.owner == "agent" else "users"
-            owner_id = ctx.agent_id if spec.owner == "agent" else ctx.user_id
-            if owner_id:
-                base_uri = f"ctx://{ctx.account_id}/{owner_path}/{owner_id}/memories/{spec.directory}"
-                memories.extend(_list_node_summaries(context_fs, base_uri, ctx, limit))
+            collection_truncated = False
+            next_cursor = None
+            context_fs = service._get_context_fs()
+            if memory_type == "profile":
+                internal_uri = f"ctx://{ctx.account_id}/users/{ctx.user_id}/memories/profile"
+                if context_fs.exists(internal_uri, ctx):
+                    memories.append(_node_summary(context_fs.read_node(internal_uri, ctx)))
+            elif memory_type == "pattern":
+                user_base = f"ctx://{ctx.account_id}/users/{ctx.user_id}/memories/patterns"
+                memories.extend(_list_node_summaries(context_fs, user_base, ctx, limit))
+                if ctx.agent_id and len(memories) < limit:
+                    agent_base = f"ctx://{ctx.account_id}/agents/{ctx.agent_id}/memories/patterns"
+                    memories.extend(
+                        _list_node_summaries(context_fs, agent_base, ctx, limit - len(memories))
+                    )
+            else:
+                owner_path = "agents" if spec.owner == "agent" else "users"
+                owner_id = ctx.agent_id if spec.owner == "agent" else ctx.user_id
+                if owner_id:
+                    base_uri = f"ctx://{ctx.account_id}/{owner_path}/{owner_id}/memories/{spec.directory}"
+                    memories.extend(_list_node_summaries(context_fs, base_uri, ctx, limit))
     except Exception as exc:
         raise_not_found_or_not_visible(exc)
 
     payload = {
-        "uri": f"ogmemory://memories/{memory_type}",
+        "uri": "ogmemory://skills" if memory_type == "skill" else f"ogmemory://memories/{memory_type}",
         "type": memory_type,
         "memories": memories,
+        "truncated": collection_truncated,
         "untrusted_data_notice": UNTRUSTED_DATA_NOTICE,
     }
+    if next_cursor:
+        payload["next_cursor"] = next_cursor
     return _truncate_collection_payload(payload, _configured_max_response_chars(service))
 
 
 def render_item_resource(service: Any, uri: str, ctx: RequestContext) -> dict[str, Any]:
+    parsed = parse_ogmemory_uri(uri)
+    if parsed.memory_type == "skill" and parsed.memory_id:
+        try:
+            source = parsed.skill_source or "generated"
+            node = service.read_published_skill(ctx, parsed.memory_id, source=source)
+            return _truncate_payload(
+                _node_detail(node),
+                _configured_max_response_chars(service),
+            )
+        except Exception as exc:
+            raise_not_found_or_not_visible(exc)
+            raise
+
     last_exc: Exception | None = None
     try:
         context_fs = service._get_context_fs()
@@ -359,7 +458,9 @@ def _validate_public_uri_text(uri: str) -> None:
         raise ValueError("URI must be a non-empty string")
     if uri.startswith("ctx://"):
         raise ValueError("Internal ctx:// URIs are not accepted")
-    if "\\" in uri or ".." in uri or ".." in unquote(uri):
+    if "\\" in uri or any(
+        unquote(part) in {".", ".."} for part in urlparse(uri).path.split("/")
+    ):
         raise ValueError("Invalid URI")
     lowered = uri.lower()
     if "%2f" in lowered or "%5c" in lowered:
@@ -395,9 +496,17 @@ def _truncate_payload(payload: dict[str, Any], max_chars: int) -> dict[str, Any]
     truncated = bool(payload.get("truncated", False))
     result: dict[str, Any] = {}
     for key, value in payload.items():
-        if isinstance(value, str) and key in {"abstract", "overview", "content"}:
-            if len(value) > remaining:
-                result[key] = value[: max(0, remaining)]
+        if isinstance(value, str) and key in {
+            "abstract",
+            "overview",
+            "content",
+            "content_base64",
+        }:
+            field_budget = remaining
+            if key == "content_base64":
+                field_budget -= field_budget % 4
+            if len(value) > field_budget:
+                result[key] = value[: max(0, field_budget)]
                 truncated = True
                 remaining = 0
             else:
@@ -411,7 +520,7 @@ def _truncate_payload(payload: dict[str, Any], max_chars: int) -> dict[str, Any]
 
 def _truncate_collection_payload(payload: dict[str, Any], max_chars: int) -> dict[str, Any]:
     remaining = max_chars
-    truncated = False
+    truncated = bool(payload.get("truncated", False))
     result = dict(payload)
     truncated_memories: list[dict[str, Any]] = []
     for memory in payload.get("memories", []):

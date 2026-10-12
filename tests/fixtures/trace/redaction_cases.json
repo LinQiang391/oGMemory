@@ -1,0 +1,122 @@
+[
+  {
+    "name": "secret key field",
+    "text": {"api_key": "sk-fixture-secret"},
+    "plaintext": "sk-fixture-secret",
+    "placeholder": "{{api_key_1}}"
+  },
+  {
+    "name": "bearer token",
+    "text": "Authorization: Bearer bearer-fixture-token",
+    "plaintext": "bearer-fixture-token",
+    "placeholder": "{{token_1}}"
+  },
+  {
+    "name": "OpenAI API key",
+    "text": "leaked sk-proj-abcdefghijklmnopqrstuvwxyz1234567890",
+    "plaintext": "sk-proj-abcdefghijklmnopqrstuvwxyz1234567890",
+    "placeholder": "{{api_key_1}}"
+  },
+  {
+    "name": "GitHub token",
+    "text": "token ghp_abcdefghijklmnopqrstuvwxyz123456",
+    "plaintext": "ghp_abcdefghijklmnopqrstuvwxyz123456",
+    "placeholder": "{{token_1}}"
+  },
+  {
+    "name": "Slack token",
+    "text": "bot xoxb-123456789012-123456789012-abcdefghijklmnopqrstuvwx",
+    "plaintext": "xoxb-123456789012-123456789012-abcdefghijklmnopqrstuvwx",
+    "placeholder": "{{token_1}}"
+  },
+  {
+    "name": "Slack xox variant token",
+    "text": "client xoxc-123456789012-123456789012-abcdefghijklmnopqrstuvwx",
+    "plaintext": "xoxc-123456789012-123456789012-abcdefghijklmnopqrstuvwx",
+    "placeholder": "{{token_1}}"
+  },
+  {
+    "name": "Slack app token",
+    "text": "app xapp-1-A1234567890-B1234567890-abcdef1234567890abcdef1234567890",
+    "plaintext": "xapp-1-A1234567890-B1234567890-abcdef1234567890abcdef1234567890",
+    "placeholder": "{{token_1}}"
+  },
+  {
+    "name": "JWT token",
+    "text": "jwt eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJzdWIiOiIxMjM0NTY3ODkwIn0.signaturetokenvalue",
+    "plaintext": "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJzdWIiOiIxMjM0NTY3ODkwIn0.signaturetokenvalue",
+    "placeholder": "{{token_1}}"
+  },
+  {
+    "name": "multi cookie header",
+    "text": "Cookie: sid=secret1; refresh=secret2",
+    "plaintext": ["secret1", "secret2"],
+    "placeholder": ["{{cookie_1}}", "{{cookie_2}}"]
+  },
+  {
+    "name": "email",
+    "text": "Contact alice.fixture@example.com",
+    "plaintext": "alice.fixture@example.com",
+    "placeholder": "{{email_1}}"
+  },
+  {
+    "name": "Chinese phone number",
+    "text": "Call 13800138000",
+    "plaintext": "13800138000",
+    "placeholder": "{{phone_1}}"
+  },
+  {
+    "name": "E.164 US phone number",
+    "text": "Call +1 415-555-1212",
+    "plaintext": "+1 415-555-1212",
+    "placeholder": "{{phone_1}}"
+  },
+  {
+    "name": "E.164 Chinese phone number",
+    "text": "Call +86 13800138000",
+    "plaintext": "+86 13800138000",
+    "placeholder": "{{phone_1}}"
+  },
+  {
+    "name": "Chinese identity card",
+    "text": "身份证号11010519491231002X",
+    "plaintext": "11010519491231002X",
+    "placeholder": "{{id_card_1}}"
+  },
+  {
+    "name": "passport",
+    "text": "护照E12345678",
+    "plaintext": "E12345678",
+    "placeholder": "{{passport_1}}"
+  },
+  {
+    "name": "bank card",
+    "text": "Card 6222020202020202020",
+    "plaintext": "6222020202020202020",
+    "placeholder": "{{bank_card_1}}"
+  },
+  {
+    "name": "IPv4",
+    "text": "Server 203.0.113.42",
+    "plaintext": "203.0.113.42",
+    "placeholder": "{{ipv4_1}}"
+  },
+  {
+    "name": "IPv6",
+    "text": "Server ::ffff:192.0.2.128",
+    "plaintext": "::ffff:192.0.2.128",
+    "placeholder": "{{ipv6_1}}"
+  },
+  {
+    "name": "credential-bearing PostgreSQL URL",
+    "text": "Database postgresql://dbuser:s3cr3t@db.example.com:5432/app",
+    "plaintext": "postgresql://dbuser:s3cr3t@db.example.com:5432/app",
+    "placeholder": "{{connection_string_1}}"
+  },
+  {
+    "name": "credential-bearing AMQP URL",
+    "text": "Queue amqp://user:s3cr3t@mq.example.com/vhost",
+    "plaintext": "amqp://user:s3cr3t@mq.example.com/vhost",
+    "placeholder": "{{connection_string_1}}"
+  }
+]

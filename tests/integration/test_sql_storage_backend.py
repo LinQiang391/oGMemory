@@ -23,6 +23,10 @@ from providers.relation_store.sql_relation_store import SQLRelationStore
 from providers.unified_config import OgMemConfig
 from providers.vector_index import OpenGaussVectorIndex
 from server.memory_service import MemoryService
+from server.mcp_resources import (
+    external_to_internal_uri_candidates,
+    internal_to_external_uri,
+)
 from service.api import MemoryWriteAPI
 from session.sql_archive_store import SQLSessionArchiveStore
 
@@ -244,6 +248,35 @@ def test_sql_context_fs_roundtrip_via_write_api(sql_dsn, sql_ctx, cleanup_sql_ac
 
     node = fs.read_node(uri, sql_ctx)
     assert "SQL storage" in node.content
+
+
+@pytest.mark.parametrize("directory,category,slug", [
+    ("entities", "entity", "李雷"),
+    ("preferences", "preference", "coffee%20shop"),
+])
+def test_sql_memory_uri_write_read_delete(
+    sql_dsn, sql_ctx, cleanup_sql_account, directory, category, slug,
+):
+    fs = SQLContextFS(connection_string=sql_dsn)
+    uri = f"ctx://{sql_ctx.account_id}/users/{sql_ctx.user_id}/memories/{directory}/{slug}"
+    fs.write_node(
+        ContextNode(
+            uri=uri, context_type="MEMORY", category=category, level=0,
+            owner_space=f"user:{sql_ctx.user_id}", abstract="Stored memory", overview="",
+            content="Stored memory", metadata={},
+        ),
+        sql_ctx,
+    )
+    public_uri = internal_to_external_uri(uri, category=category)
+    existing_uri = next(
+        candidate for candidate in external_to_internal_uri_candidates(public_uri, sql_ctx)
+        if fs.exists(candidate, sql_ctx)
+    )
+
+    assert existing_uri == uri
+    assert fs.read_node(existing_uri, sql_ctx).content == "Stored memory"
+    fs.delete_node(existing_uri, sql_ctx)
+    assert not fs.exists(uri, sql_ctx)
 
 
 def test_sql_relation_store_roundtrip(sql_dsn, sql_ctx, cleanup_sql_account):

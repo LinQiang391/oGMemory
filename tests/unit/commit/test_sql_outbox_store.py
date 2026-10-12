@@ -1,7 +1,7 @@
 """Unit tests for SQLOutboxStore."""
 
-from datetime import datetime, timezone
 import json
+from datetime import UTC, datetime
 from unittest.mock import MagicMock, patch
 
 import pytest
@@ -12,7 +12,8 @@ from core.models import OutboxEvent
 @pytest.fixture
 def mock_sql_outbox_store():
     """Create SQLOutboxStore with mocked psycopg2."""
-    mock_json = lambda x: x
+    def mock_json(value):
+        return value
 
     with patch("commit.sql_outbox_store.psycopg2") as mock_pg, \
          patch("commit.sql_outbox_store.Json", mock_json), \
@@ -65,7 +66,7 @@ def test_insert_event_sends_notify(mock_sql_outbox_store):
 
 def test_claim_batch_returns_claimed_events(mock_sql_outbox_store):
     store, _, conn, cursor = mock_sql_outbox_store
-    created_at = datetime(2026, 4, 17, 10, 0, tzinfo=timezone.utc)
+    created_at = datetime(2026, 4, 17, 10, 0, tzinfo=UTC)
     cursor.fetchall.return_value = [
         (
             "evt-2",
@@ -87,9 +88,142 @@ def test_claim_batch_returns_claimed_events(mock_sql_outbox_store):
     assert event.event_id == "evt-2"
     assert event.status == "PROCESSING"
     sql, params = cursor.execute.call_args.args
-    assert "FOR UPDATE SKIP LOCKED" in sql
+    assert "earlier.account_id = candidate.account_id" in sql
+    assert "earlier.uri = candidate.uri" in sql
+    assert "earlier.seq < candidate.seq" in sql
+    assert "earlier.status IN ('PENDING', 'PROCESSING')" in sql
+    assert "FOR UPDATE OF candidate SKIP LOCKED" in sql
     assert "LIMIT %s" in sql
     assert params == (42, 50, "worker-1")
+    conn.commit.assert_called_once()
+
+
+def test_list_recent_returns_live_and_failed_tasks(mock_sql_outbox_store):
+    store, _, conn, cursor = mock_sql_outbox_store
+    cursor.fetchall.return_value = [
+        (
+            "evt-3",
+            "UPSERT_DIRECTORY",
+            "ctx://acme/users/alice/memories/events/",
+            {"filters": {"owner_space": "user:alice"}},
+            "FAILED",
+            3,
+            datetime(2026, 8, 31, 8, 0, tzinfo=UTC),
+            None,
+        )
+    ]
+
+    tasks = store.list_recent("acme", limit=25)
+
+    assert tasks[0][1].event_id == "evt-3"
+    assert tasks[0][1].status == "FAILED"
+    sql, params = cursor.execute.call_args.args
+    assert "status IN ('PENDING', 'PROCESSING', 'FAILED')" in sql
+    assert "ORDER BY created_at DESC" in sql
+    assert params == ("acme", 25)
+    conn.rollback.assert_called_once()
+
+
+def test_list_recent_rolls_back_failed_query(mock_sql_outbox_store):
+    store, _, conn, cursor = mock_sql_outbox_store
+    cursor.execute.side_effect = RuntimeError("query failed")
+
+    with pytest.raises(RuntimeError, match="query failed"):
+        store.list_recent("acme")
+
+    conn.rollback.assert_called_once()
+
+
+def test_get_event_scopes_lookup_to_account(mock_sql_outbox_store):
+    store, _, conn, cursor = mock_sql_outbox_store
+    cursor.fetchone.return_value = (
+        "evt-failed",
+        "UPSERT_CONTEXT",
+        "ctx://acme/users/alice/memories/profile",
+        {"failure_reason": "embedding unavailable"},
+        "FAILED",
+        5,
+        datetime(2026, 8, 31, 8, 0, tzinfo=UTC),
+        None,
+    )
+
+    event = store.get_event("acme", "evt-failed")
+
+    assert event is not None
+    assert event.event_id == "evt-failed"
+    assert cursor.execute.call_args.args[1] == ("acme", "evt-failed")
+    conn.rollback.assert_called_once()
+
+
+def test_retry_failed_requeues_and_notifies_worker(mock_sql_outbox_store):
+    store, _, conn, cursor = mock_sql_outbox_store
+    event = OutboxEvent(
+        event_id="evt-failed",
+        event_type="UPSERT_CONTEXT",
+        uri="ctx://acme/users/alice/memories/profile",
+        payload={"records": [], "failure_reason": "embedding unavailable"},
+        status="FAILED",
+        retry_count=5,
+    )
+    cursor.fetchone.return_value = (
+        event.event_id,
+        event.event_type,
+        event.uri,
+        {"records": []},
+        "PENDING",
+        0,
+        datetime(2026, 8, 31, 8, 0, tzinfo=UTC),
+        None,
+    )
+
+    retried = store.retry_failed("acme", event)
+
+    assert retried is not None
+    assert retried.status == "PENDING"
+    assert retried.retry_count == 0
+    update_sql, update_params = cursor.execute.call_args_list[0].args
+    assert "status = 'PENDING'" in update_sql
+    assert "status = 'FAILED'" in update_sql
+    assert update_params == ({"records": []}, "acme", "evt-failed")
+    assert cursor.execute.call_count == 2
+    conn.commit.assert_called_once()
+
+
+def test_move_to_dlq_persists_failure_reason(mock_sql_outbox_store):
+    store, _, conn, cursor = mock_sql_outbox_store
+    event = OutboxEvent(
+        event_id="evt-failed",
+        event_type="UPSERT_CONTEXT",
+        uri="ctx://acme/users/alice/memories/profile",
+        payload={"failure_reason": "embedding unavailable"},
+        status="PENDING",
+    )
+
+    store.move_to_dlq(event, event.uri)
+
+    sql, params = cursor.execute.call_args.args
+    assert "payload = %s" in sql
+    assert params == (event.payload, "evt-failed")
+    assert event.status == "FAILED"
+    conn.commit.assert_called_once()
+
+
+def test_increment_retry_persists_failure_reason(mock_sql_outbox_store):
+    store, _, conn, cursor = mock_sql_outbox_store
+    event = OutboxEvent(
+        event_id="evt-retry",
+        event_type="UPSERT_CONTEXT",
+        uri="ctx://acme/users/alice/memories/profile",
+        payload={"failure_reason": "temporary embedding failure"},
+        status="PENDING",
+    )
+
+    store.increment_retry(event, event.uri)
+
+    sql, params = cursor.execute.call_args.args
+    assert "payload = %s" in sql
+    assert params == (event.payload, None, "evt-retry")
+    assert event.retry_count == 1
     conn.commit.assert_called_once()
 
 
@@ -122,6 +256,63 @@ def test_open_listener_connection_sets_autocommit_and_listens(
     assert conn is listener_conn
     listener_conn.set_session.assert_called_once_with(autocommit=True)
     listener_cursor.execute.assert_called_once_with(f"LISTEN {store.notify_channel}")
+
+
+def test_processing_lock_uses_dedicated_session_advisory_lock(
+    mock_sql_outbox_store,
+):
+    store, mock_pg, pooled_conn, _ = mock_sql_outbox_store
+    lock_conn = MagicMock()
+    lock_cursor = MagicMock()
+    lock_conn.closed = 0
+    lock_conn.cursor.return_value.__enter__ = lambda s: lock_cursor
+    lock_conn.cursor.return_value.__exit__ = MagicMock(return_value=False)
+    lock_cursor.fetchone.return_value = (True,)
+    mock_pg.connect.return_value = lock_conn
+
+    with store.processing_lock("ctx://acme/users/alice/memories/profile"):
+        assert lock_cursor.execute.call_count == 1
+
+    assert lock_conn is not pooled_conn
+    mock_pg.connect.assert_called_once_with(
+        store._connection_string,
+        connect_timeout=5,
+    )
+    lock_conn.set_session.assert_called_once_with(autocommit=True)
+    assert lock_cursor.execute.call_count == 2
+    lock_sql, lock_params = lock_cursor.execute.call_args_list[0].args
+    unlock_sql, unlock_params = lock_cursor.execute.call_args_list[1].args
+    assert lock_sql == "SELECT pg_try_advisory_lock(%s)"
+    assert unlock_sql == "SELECT pg_advisory_unlock(%s)"
+    assert lock_params == unlock_params
+    lock_conn.close.assert_called_once()
+
+
+def test_processing_lock_times_out_without_unlocking_unowned_lock(
+    mock_sql_outbox_store,
+):
+    store, mock_pg, _, _ = mock_sql_outbox_store
+    lock_conn = MagicMock()
+    lock_cursor = MagicMock()
+    lock_conn.closed = 0
+    lock_conn.cursor.return_value.__enter__ = lambda s: lock_cursor
+    lock_conn.cursor.return_value.__exit__ = MagicMock(return_value=False)
+    lock_cursor.fetchone.return_value = (False,)
+    mock_pg.connect.return_value = lock_conn
+
+    with patch(
+        "commit.sql_outbox_store.time.monotonic",
+        side_effect=[0.0, 6.0],
+    ):
+        with pytest.raises(TimeoutError, match="URI processing lock"):
+            with store.processing_lock("ctx://acme/users/alice/memories/profile"):
+                raise AssertionError("lock body must not run")
+
+    assert lock_cursor.execute.call_count == 1
+    assert lock_cursor.execute.call_args.args[0] == (
+        "SELECT pg_try_advisory_lock(%s)"
+    )
+    lock_conn.close.assert_called_once()
 
 
 def test_is_event_current_commits_read_transaction(mock_sql_outbox_store):

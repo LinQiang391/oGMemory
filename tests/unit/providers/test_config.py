@@ -112,7 +112,9 @@ def test_create_vector_index_returns_in_memory_index():
 
     index = cfg.create_vector_index()
 
-    assert isinstance(index, config_module.InMemoryVectorIndex)
+    from providers.vector_index import InMemoryVectorIndex
+
+    assert isinstance(index, InMemoryVectorIndex)
     assert index._dimension == 8
 
 
@@ -125,7 +127,9 @@ def test_create_vector_index_requires_connection_string_for_opengauss():
 
 def test_create_vector_index_builds_opengauss_index(monkeypatch: pytest.MonkeyPatch):
     ctor = Mock(name="OpenGaussVectorIndex")
-    monkeypatch.setattr(config_module, "OpenGaussVectorIndex", ctor)
+    import providers.vector_index.opengauss_index as opengauss
+
+    monkeypatch.setattr(opengauss, "OpenGaussVectorIndex", ctor)
     cfg = config_module.ProviderConfig(
         vector_db_type="opengauss",
         opengauss_connection_string="postgres://db",
@@ -142,6 +146,17 @@ def test_create_vector_index_builds_opengauss_index(monkeypatch: pytest.MonkeyPa
         table_name="vectors",
         pool_size=9,
     )
+
+
+def test_create_vector_index_routes_registered_provider(monkeypatch: pytest.MonkeyPatch):
+    from providers.vector_index import factory, register_vector_provider
+
+    monkeypatch.setattr(factory, "_PROVIDERS", dict(factory._PROVIDERS))
+    sentinel = object()
+    cfg = config_module.ProviderConfig(vector_db_type="custom")
+    register_vector_provider("custom", lambda config: sentinel)
+
+    assert cfg.create_vector_index() is sentinel
 
 
 def test_create_llm_uses_openai_factory(monkeypatch: pytest.MonkeyPatch):
@@ -170,6 +185,9 @@ def test_create_llm_uses_openai_factory(monkeypatch: pytest.MonkeyPatch):
         temperature=0.1,
         max_tokens=42,
         json_mode=False,  # Default llm_json_mode
+        reasoning_effort=None,
+        is_reasoning_model=None,
+        extra_body={},
     )
 
 
@@ -190,6 +208,7 @@ def test_create_llm_uses_cached_factory_when_enabled(monkeypatch: pytest.MonkeyP
     cfg.create_llm()
 
     cached_llm.assert_called_once()
+    assert cached_llm.call_args.kwargs["json_mode"] is False
     openai_llm.assert_not_called()
 
 

@@ -22,18 +22,33 @@ logging.basicConfig(
     format="%(asctime)s [%(name)s] %(levelname)s %(message)s",
     stream=sys.stderr,
 )
+from core.logging_config import configure_third_party_loggers
+
+# APScheduler emits a start/finish pair for every interval job at INFO.  The
+# index scheduler reports the useful outcome itself, so keep the framework's
+# normal execution chatter out of the service log while preserving warnings
+# and errors (missed/failed jobs).
+logging.getLogger("apscheduler.executors.default").setLevel(logging.WARNING)
+logging.getLogger("apscheduler.scheduler").setLevel(logging.WARNING)
+configure_third_party_loggers()
 logger = logging.getLogger("index-service")
 
 
 def main():
-    from providers.unified_config import get_config
-    from providers.config import ProviderConfig
     from pyagfs import AGFSClient
-    from fs.agfs_adapter.agfs_context_fs import AGFSContextFS
+
     from commit.outbox_store import OutboxStore
+    from fs.agfs_adapter.agfs_context_fs import AGFSContextFS
+    from providers.config import ProviderConfig
+    from providers.unified_config import get_config
     from service.index_service import init_index_service
 
     cfg = get_config()
+    if cfg.retrieval_hybrid_enabled:
+        raise RuntimeError(
+            "hybrid retrieval is unsupported by the AGFS standalone index service; "
+            "run the SQL-backed MemoryService so every outbox event dual-writes"
+        )
     provider_cfg = ProviderConfig.from_ogmem_config(cfg)
 
     embedder = provider_cfg.create_embedder()
@@ -57,6 +72,20 @@ def main():
         json_mode=getattr(cfg, 'llm_json_mode', False),
     )
 
+    usage_pool = None
+    if cfg.sql_connection_string:
+        from fs.sql_adapter.model_usage_store import SQLModelUsageStore
+        from fs.sql_adapter.pool import SharedConnectionPool
+
+        usage_pool = SharedConnectionPool(
+            cfg.sql_connection_string, pool_size=cfg.sql_pool_size, dialect=cfg.sql_dialect,
+        )
+        usage_store = SQLModelUsageStore(usage_pool)
+        for provider in (llm, embedder):
+            tracker = getattr(provider, 'token_tracker', None)
+            if tracker is not None:
+                tracker.set_usage_store(usage_store)
+
     service = init_index_service(
         outbox_store=outbox_store,
         embedder=embedder,
@@ -72,6 +101,8 @@ def main():
     def shutdown(signum, frame):
         logger.info("Received signal %d, stopping...", signum)
         service.stop(wait=True)
+        if usage_pool is not None:
+            usage_pool.close_all()
         sys.exit(0)
 
     signal.signal(signal.SIGTERM, shutdown)
@@ -80,10 +111,18 @@ def main():
     service.start()
     logger.info("IndexService running (Ctrl+C to stop)")
 
+    last_stats = None
     while True:
         time.sleep(60)
         stats = service.get_aggregated_stats()
-        logger.info("Stats: %s", stats)
+        if last_stats is not None and stats != last_stats:
+            # Report only meaningful changes at INFO (new work, failures, or
+            # worker lifecycle changes).  The full idle heartbeat remains
+            # available at DEBUG for troubleshooting.
+            logger.info("IndexService stats changed: %s", stats)
+        else:
+            logger.debug("IndexService heartbeat: %s", stats)
+        last_stats = stats
 
 
 if __name__ == "__main__":

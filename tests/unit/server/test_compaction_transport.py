@@ -12,7 +12,7 @@ from server.memory_service import MemoryService
 
 
 def _make_service() -> MemoryService:
-    return MemoryService(
+    service = MemoryService(
         config=OgMemConfig(
             role_control_enabled=False,
             account_id="acct-test",
@@ -20,6 +20,8 @@ def _make_service() -> MemoryService:
             agent_id="agent-test",
         )
     )
+    service._get_context_fs = Mock(return_value=None)
+    return service
 
 
 def test_prepare_compaction_http_route_returns_prepare_token(monkeypatch):

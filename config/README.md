@@ -23,7 +23,7 @@ This directory holds all configuration files, templates, and environment variabl
 
 ### Quick start (recommended)
 ```bash
-ogmem onboard   # Interactive wizard generates ogmem.yaml and .env for you
+ogmem onboard   # Interactive wizard generates config/ogmem.yaml
 ```
 
 ### Local development (manual)
@@ -47,8 +47,108 @@ cp config/deploy.env.reference deploy/deploy.env
 
 Priority per field: YAML value > environment variable > code default
 
+### Hierarchical retrieval expansion
+
+`retrieval.expand_hierarchy` defaults to `true`, preserving hierarchical
+retrieval. Set it to `false` to search only L2 content. This skips roots,
+hierarchical expansion, and child searches entirely, including empty-result
+fallbacks. L0 abstracts and L1 overviews do not participate in search. Existing
+ranking, top-k limits, access scope, optional content filling, and public
+URI/read behavior still apply.
+
+```yaml
+retrieval:
+  expand_hierarchy: false
+```
+
+If the YAML field is omitted, `OGMEM_RETRIEVAL_EXPAND_HIERARCHY=false` provides
+the same setting. Priority is YAML > environment > `true`. The flag accepts
+booleans or `true`/`false`, `yes`/`no`, and `1`/`0`; invalid values fail
+configuration loading. It applies to the whole service instance across HTTP,
+MCP, and internal retrieval callers, with no per-user or per-request override.
+Restart every worker after changing it. Skipping expansion removes tree-search
+work but can lose results discovered through L0/L1 summaries; measure recall
+and ranking in both modes on your workload.
+
 ## Mode annotations in ogmem.reference.yaml
 
 - `[all]` — applies to all deployment modes
 - `[local]` — local development only
 - `[docker]` — Docker deployment (uses `${ENV_VAR}` from deploy.env)
+
+## Re-running local onboarding
+
+Local onboarding requires the managed HTTP service to be stopped first:
+
+```bash
+ogmem stop local
+ogmem onboard --mode local
+```
+
+When a local service is running, the wizard exits without changing configuration
+or installing dependencies. `ogmem start local` also refuses a second launch,
+even if the saved port or model has changed. Stop the managed process first.
+
+With an existing configuration, interactive onboarding offers **Use existing
+configuration**, **Modify configuration**, or **Exit**. Use existing starts with
+the saved file after confirmation. Modify uses existing settings as defaults
+and preserves fields outside the wizard, including `memory.after_turn_threshold`,
+identity, LLM tuning, and custom sections. Non-interactive onboarding updates
+the configuration only when the local service is stopped.
+
+Changed YAML is backed up to `config/ogmem.yaml.bak-<timestamp>` before atomic
+replacement; unchanged YAML is not rewritten. Invalid YAML is rejected.
+Formatting/comments may change; the backup preserves the original text. Backups
+may contain credentials and are written with owner-only permissions.
+
+Local lifecycle commands record only PID, process start identity, and port in
+`.ogmem_data/local-runtime.json`. They do not save configuration snapshots or
+launch environments, or automatically restart/roll back services. Startup
+failure terminates the failed child and reports failure. Stop verifies the
+recorded process, even when saved YAML has changed or is invalid, and does not
+kill an unrelated listener based on the newly configured HTTP port.
+
+### Configuration path and separate databases
+
+Local onboarding and startup resolve the configuration path consistently:
+explicit `start --config` > `OGMEM_CONFIG` in the process environment >
+`OGMEM_CONFIG` in the project's `config/.env` > project `config/ogmem.yaml` >
+existing `/etc/ogmem/config.yaml`.
+Relative selected paths are resolved against the caller's working directory;
+`~` and paths containing spaces are supported. Onboarding may create a new
+selected file, and backups are placed beside that file. It does not update the
+project's default YAML when another file has been selected.
+
+```bash
+OGMEM_CONFIG=/path/to/custom.yaml ogmem onboard --mode local
+OGMEM_CONFIG=/path/to/custom.yaml ogmem start local --daemon
+```
+
+Existing `storage.connection_string` and `vector_db.connection_string` are
+preserved separately. Interactive modification offers masked connection input
+(Enter keeps the existing value), plus a choice to use the SQL connection for
+the vector database. Non-interactive callers can set `--db-connection` and
+`--vector-db-connection` independently. On first setup, an omitted vector
+connection defaults to the SQL connection; a previously configured vector
+connection is retained. Each distinct required database is checked before saving.
+
+### Local service status
+
+`ogmem status` checks the managed Local service at its recorded HTTP port.
+SQL storage does not require AGFS. When the live health response identifies
+AGFS storage, status also checks the reported AGFS endpoint. Healthy required
+services return exit code 0; stopped or unhealthy services return 1. A project's
+local process record takes precedence over unrelated Docker containers.
+
+### Embedding provider
+
+`embedding.provider` selects an implementation/protocol, not necessarily the
+service vendor. For OpenAI-compatible APIs, use `openai`. Local onboarding maps
+`zhipu` and `dashscope` to `openai`, preserving their endpoint, model, key and
+dimension. Other supported adapters are `openai-cached`, `volcengine`, `st`,
+and `mock`; unsupported names are rejected before configuration is saved.
+
+In non-interactive onboarding, a different Embedding vendor uses its own default
+endpoint and requires `--embedding-api-key` (except local `st`/`mock` adapters).
+Specify `--embedding-base-url` for a custom endpoint. The LLM key is reused only
+when the selected providers are the same.

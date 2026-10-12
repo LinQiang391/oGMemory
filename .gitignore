@@ -16,6 +16,7 @@ eggs/
 .eggs/
 lib/
 !cli/lib/
+!deepseek-harness-plugin/lib/
 lib64/
 parts/
 sdist/
@@ -60,7 +61,9 @@ $RECYCLE.BIN/
 *.log
 
 # ── 环境变量 & 密钥（绝不提交）───────────────────────────────
+.env
 .env.*
+!.env.example
 !config/env.example
 *.pem
 *.key
@@ -68,6 +71,9 @@ $RECYCLE.BIN/
 *.pfx
 secrets/
 credentials/
+
+# Generated Agent connection exports (may contain service credentials)
+/ogmem-client-config/
 
 # Config
 config.json
@@ -103,6 +109,7 @@ ipython_config.py
 # ── OpenClaw Plugin ─────────────────────────────────────────────
 openclaw_context_engine_plugin/node_modules/
 openclaw_context_engine_plugin/package-lock.json
+deepseek-harness-plugin/node_modules/
 
 # AGFS 测试数据（不纳入版本控制）
 .agfs_data/
@@ -120,6 +127,7 @@ agfs/agfs-server
 .chroma_data/
 chroma_db/
 .venv/
+.venv-deepagents/
 .DS_Store
 *.DS_Store
 .omc/
@@ -168,3 +176,10 @@ docs/prd/
 
 # Local verification artifacts
 .tmp/
+opencode-verification/
+
+# pre-commit 本地隔离环境（由 setup-pre-commit.sh 创建，不提交）
+.pre-commit-venv/
+
+# Private backups written by local onboarding
+/config/ogmem.yaml.bak-*

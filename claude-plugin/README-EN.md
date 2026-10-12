@@ -24,6 +24,33 @@ Shared code: `scripts/ogm_plugin_request.py` (`base_api_url`, `http_plugin_heade
 
   If your server has no key-based auth, leave it unset. **Do not commit secrets.**
 
+### Automatic capture and recall
+
+`OGMEM_AUTO_CAPTURE` and `OGMEM_AUTO_RECALL` are independent environment
+switches, both enabled by default, matching the OpenClaw switch names.
+To recall existing memory without automatically writing turns:
+
+```bash
+export OGMEM_AUTO_CAPTURE=false
+export OGMEM_AUTO_RECALL=true
+claude
+```
+
+Disabling capture skips transcript reads and `/api/v1/after_turn` on Stop and
+PreCompact, as well as PostToolUse session-message writes. The Stop wrapper
+creates no temporary file or detached capture worker. No ingest offset is
+created or advanced, and no after-turn retry is attempted. Re-enabling capture
+resumes from the last successful offset, so conversations from the disabled
+period may be imported later.
+
+Disabling recall skips automatic UserPromptSubmit compose and context injection.
+Values `1`, `true`, and `yes` enable a switch (case-insensitive, whitespace
+trimmed); other explicit values disable it. Restart Claude after changing them.
+
+Trace uploads continue, including message content unless
+`OGMEM_TRACE_CAPTURE_CONTENT=0` selects metadata only. Explicit
+`/og-add-history`, `/og-compose`, and MCP tools remain available.
+
 - Unit tests: `pytest tests/unit/claude_plugin/test_plugin_scripts.py -q` (from repo root).
 
 ## Skills (slash commands in Claude Code)

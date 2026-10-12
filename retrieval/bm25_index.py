@@ -6,9 +6,12 @@ Uses rank_bm25 library with English tokenization (NLTK).
 
 from __future__ import annotations
 
+from core.models import IndexRecord
+
 import logging
 import threading
 from dataclasses import dataclass
+from collections.abc import Iterable
 
 from rank_bm25 import BM25Okapi
 
@@ -50,6 +53,31 @@ class Bm25Hit:
     text: str
     score: float
     metadata: dict
+
+
+@dataclass(frozen=True)
+class Bm25Document:
+    """Canonical document for lexical indexing."""
+
+    id: str
+    text: str
+    metadata: dict
+
+
+def build_bm25_document(record: IndexRecord) -> Bm25Document:
+    """Preserve canonical node metadata when indexing an IndexRecord."""
+    return Bm25Document(
+        id=record.id,
+        text=record.text,
+        metadata={
+            **dict(record.metadata or {}),
+            **dict(record.filters or {}),
+            "uri": record.uri,
+            "level": record.level,
+        },
+    )
+
+
 
 
 class Bm25Index:
@@ -124,6 +152,25 @@ class Bm25Index:
             self._metas.append(metadata or {})
             self._tokenized.append(_tokenize(text))
             self._bm25 = BM25Okapi(self._tokenized)
+
+    def bulk_upsert(self, documents: Iterable[Bm25Document]) -> None:
+        """Insert or update a batch with one index rebuild."""
+        prepared = list(documents)
+        if not prepared:
+            return
+        with self._lock:
+            positions = {doc_id: i for i, doc_id in enumerate(self._ids)}
+            for document in prepared:
+                position = positions.get(document.id)
+                if position is None:
+                    positions[document.id] = len(self._ids)
+                    self._ids.append(document.id)
+                    self._texts.append(document.text)
+                    self._metas.append(dict(document.metadata or {}))
+                else:
+                    self._texts[position] = document.text
+                    self._metas[position] = dict(document.metadata or {})
+            self._rebuild()
 
     def delete(self, doc_ids: list[str]) -> None:
         """Remove documents by ID."""

@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import json
+import threading
+import time
 from pathlib import Path
 from unittest.mock import Mock, patch
 
@@ -26,7 +28,11 @@ def ctx() -> RequestContext:
 
 @pytest.fixture
 def service() -> MemoryService:
-    return MemoryService(config=OgMemConfig())
+    service = MemoryService(config=OgMemConfig(session_state_bridge_enabled=False))
+    # These lifecycle tests intentionally exercise legacy in-memory writers.
+    # Durable first-turn reads are covered with real storage in recovery tests.
+    service._get_context_fs = Mock(return_value=None)
+    return service
 
 
 def _seed_buffer(service: MemoryService, ctx: RequestContext, session_id: str = "sess-compact"):
@@ -137,6 +143,166 @@ def test_prepare_compaction_advances_watermark_when_only_assistant_messages(serv
     assert buf.extraction_summary == ""
 
 
+def test_after_turn_deduplicates_completed_client_request(service: MemoryService, ctx: RequestContext):
+    service._cfg.session_state_bridge_enabled = True
+    service._cfg.after_turn_threshold = 10_000
+    manager = service.get_session_manager()
+    manager.save_session_state = Mock(return_value=True)
+    params = {
+        "sessionId": "sess-idempotent",
+        "clientRequestId": "pending-1",
+        "messages": [{"role": "user", "content": "remember once"}],
+        "_ctx": ctx,
+    }
+
+    first = service.after_turn(params)
+    replay = service.after_turn(params)
+
+    assert first["status"] == "accumulating"
+    assert first["client_request_id"] == "pending-1"
+    assert replay == {
+        "ok": True,
+        "status": "duplicate",
+        "client_request_id": "pending-1",
+    }
+    assert len(manager.get_or_create("sess-idempotent").messages) == 1
+    assert manager.save_session_state.call_count == 2
+
+
+def test_after_turn_retries_until_idempotency_state_is_durable(
+    service: MemoryService,
+    ctx: RequestContext,
+):
+    service._cfg.session_state_bridge_enabled = True
+    service._cfg.after_turn_threshold = 10_000
+    manager = service.get_session_manager()
+    manager.save_session_state = Mock(side_effect=[False, True])
+    params = {
+        "sessionId": "sess-idempotent-save",
+        "clientRequestId": "pending-save-1",
+        "messages": [{"role": "user", "content": "remember once"}],
+        "_ctx": ctx,
+    }
+
+    first = service.after_turn(params)
+    replay = service.after_turn(params)
+
+    assert first == {
+        "ok": False,
+        "status": "failed",
+        "error": "idempotency state unavailable",
+        "retryable": True,
+        "client_request_id": "pending-save-1",
+    }
+    assert replay == {
+        "ok": True,
+        "status": "duplicate",
+        "client_request_id": "pending-save-1",
+    }
+    assert len(manager.get_or_create("sess-idempotent-save").messages) == 1
+
+
+def test_after_turn_does_not_complete_replay_while_original_request_is_processing(
+    service: MemoryService,
+    ctx: RequestContext,
+):
+    service._cfg.session_state_bridge_enabled = True
+    service._cfg.after_turn_threshold = 1
+    service._write_api = Mock()
+    manager = service.get_session_manager()
+    manager.save_session_state = Mock(return_value=True)
+    manager.add_message("sess-idempotent-overlap", "user", "remember once", ctx)
+    buffer = manager.get_or_create("sess-idempotent-overlap")
+    buffer.claim_incremental_extraction()
+
+    replay = service.after_turn({
+        "sessionId": "sess-idempotent-overlap",
+        "clientRequestId": "pending-overlap-1",
+        "messages": [{"role": "user", "content": "remember once"}],
+        "forceExtract": True,
+        "wait": True,
+        "_ctx": ctx,
+    })
+
+    assert replay == {
+        "ok": False,
+        "status": "processing",
+        "retryable": True,
+        "pending_tokens": buffer.pending_tokens,
+        "client_request_id": "pending-overlap-1",
+    }
+    assert buffer.request_completed("pending-overlap-1") is False
+    manager.save_session_state.assert_not_called()
+
+
+def test_after_turn_claims_client_request_before_processing(
+    service: MemoryService,
+    ctx: RequestContext,
+):
+    service._cfg.session_state_bridge_enabled = True
+    service._cfg.after_turn_threshold = 10_000
+    manager = service.get_session_manager()
+    save_started = threading.Event()
+    release_save = threading.Event()
+
+    def save_session_state(_session_id, _ctx):
+        save_started.set()
+        assert release_save.wait(timeout=2)
+        return True
+
+    manager.save_session_state = Mock(side_effect=save_session_state)
+    params = {
+        "sessionId": "sess-idempotent-claim",
+        "clientRequestId": "pending-claim-1",
+        "messages": [{"role": "user", "content": "remember once"}],
+        "_ctx": ctx,
+    }
+    first_result = []
+    first = threading.Thread(target=lambda: first_result.append(service.after_turn(params)))
+    first.start()
+    assert save_started.wait(timeout=2)
+
+    replay = service.after_turn(params)
+    release_save.set()
+    first.join(timeout=2)
+
+    assert replay == {
+        "ok": False,
+        "status": "processing",
+        "retryable": True,
+        "client_request_id": "pending-claim-1",
+    }
+    assert first_result[0]["status"] == "accumulating"
+    assert len(manager.get_or_create("sess-idempotent-claim").messages) == 1
+
+
+def test_after_turn_uses_in_memory_idempotency_when_state_bridge_is_disabled(
+    service: MemoryService,
+    ctx: RequestContext,
+):
+    service._cfg.after_turn_threshold = 10_000
+    manager = service.get_session_manager()
+    manager.save_session_state = Mock(return_value=False)
+    params = {
+        "sessionId": "sess-idempotent-memory-only",
+        "clientRequestId": "pending-memory-only-1",
+        "messages": [{"role": "user", "content": "remember once"}],
+        "_ctx": ctx,
+    }
+
+    first = service.after_turn(params)
+    replay = service.after_turn(params)
+
+    assert first["status"] == "accumulating"
+    assert replay == {
+        "ok": True,
+        "status": "duplicate",
+        "client_request_id": "pending-memory-only-1",
+    }
+    assert len(manager.get_or_create("sess-idempotent-memory-only").messages) == 1
+    manager.save_session_state.assert_not_called()
+
+
 def test_prepare_compaction_does_not_advance_watermark_or_issue_token_when_write_fails(service: MemoryService, ctx: RequestContext):
     buf = _seed_buffer(service, ctx)
     buf.extraction_watermark = 1
@@ -192,6 +358,7 @@ def test_after_turn_uses_configured_threshold_before_env(
 ):
     monkeypatch.setenv("OGMEM_AFTER_TURN_THRESHOLD", "1")
     service = MemoryService(config=OgMemConfig(after_turn_threshold=999999))
+    service._get_context_fs = Mock(return_value=None)
     service.get_write_api = Mock(
         side_effect=AssertionError("after_turn should still be accumulating")
     )
@@ -755,7 +922,9 @@ def test_dispose_no_pending_messages_removes_session_when_context_build_fails(se
 
     result = service.dispose({"sessionId": "sess-compact"})
 
-    assert result == {"disposed": True, "flushed": False, "reason": "no_pending_messages"}
+    assert result["disposed"] is True
+    assert result["flushed"] is False
+    assert result["reason"] == "no_pending_messages"
     assert not mgr.has_session("sess-compact")
 
 
@@ -879,6 +1048,27 @@ def test_wait_until_idle_reports_in_progress_without_removing_session(service: M
     assert mgr.has_session("sess-compact")
     service.drain_outbox_sync.assert_not_called()
     buf.end_extraction()
+
+
+def test_wait_until_idle_reports_dispose_in_progress(service: MemoryService, ctx: RequestContext):
+    mgr = service.get_session_manager()
+    buf = mgr.get_or_create("sess-compact", ctx=ctx)
+    with buf.extraction_lock:
+        buf.dispose_in_progress = True
+    service.drain_outbox_sync = Mock()
+
+    result = service.wait_until_idle({
+        "sessionId": "sess-compact",
+        "_ctx": ctx,
+        "timeoutSeconds": 0.01,
+    })
+
+    assert result["idle"] is False
+    assert result["reason"] == "dispose_in_progress_timeout"
+    assert result["dispose_in_progress"] is True
+    assert result["extraction_in_progress"] is False
+    assert mgr.has_session("sess-compact")
+    service.drain_outbox_sync.assert_not_called()
 
 
 def test_wait_until_idle_drains_when_live_session_is_gone(service: MemoryService, ctx: RequestContext):

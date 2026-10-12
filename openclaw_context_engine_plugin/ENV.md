@@ -25,6 +25,19 @@ These are only needed when `mode=local`.
 | `CONTEXTENGINE_PORT` | `contextEnginePort` | `8090` | Local ContextEngine HTTP port. |
 | `CONTEXTENGINE_PROJECT_ROOT` | `projectRoot` | plugin parent directory | oG-Memory project root used as the working directory for `python server/app.py`. |
 
+## Automatic Capture and Recall
+
+| Variable | Config key | Default | Description |
+| --- | --- | --- | --- |
+| `OGMEM_AUTO_CAPTURE` | `autoCapture` | `true` | Allow automatic buffering/capture through `ingest` and `afterTurn`. |
+| `OGMEM_AUTO_RECALL` | `autoRecall` | `true` | Allow `assemble` to call prefetch/compose and inject memory. |
+
+Explicit JSON `false` overrides the environment. These settings are read when the
+plugin registers; restart the Gateway or use a new local CLI process after changes.
+`autoCapture=false` is not a global write ban: explicit compact, existing-buffer
+cleanup, trace upload and tool-result externalization retain their own behavior.
+See the evaluation procedure in [README.md](README.md#evaluation-phase-control).
+
 ## Compose and Prefetch
 
 | Variable | Config key | Default | Description |

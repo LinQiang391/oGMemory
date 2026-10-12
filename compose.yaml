@@ -1,0 +1,97 @@
+# Core oGMemory stack. See deploy/compose/README_zh.md before first use.
+services:
+  opengauss:
+    image: ${OPENGAUSS_IMAGE:-swr.cn-north-4.myhuaweicloud.com/kunpeng-ai/opengauss-distributed:0328}
+    platform: linux/arm64
+    privileged: true # Required by the current official quickstart database image.
+    restart: unless-stopped
+    environment:
+      GS_PASSWORD: ${OG_DB_PASSWORD:?Set OG_DB_PASSWORD in .env}
+      GS_USER_PASSWORD: ${OG_DB_PASSWORD:?Set OG_DB_PASSWORD in .env}
+    volumes:
+      - opengauss-data:/var/lib/opengauss
+    healthcheck:
+      test: ["CMD-SHELL", "su - omm -c \"gsql -d postgres -p 5432 -c 'SELECT 1;'\" >/dev/null 2>&1"]
+      interval: 5s
+      timeout: 5s
+      retries: 120
+      start_period: 30s
+    networks: [memory]
+
+  ogmemory:
+    image: ${OGMEM_IMAGE:-ogmemory/standalone:compose-local}
+    build:
+      context: .
+      dockerfile: docker/Dockerfile.compose
+      extra_hosts:
+        - "host.docker.internal:host-gateway"
+      args:
+        GO_BASE_IMAGE: ${GO_BASE_IMAGE:-golang:1.25-bookworm}
+        PYTHON_BASE_IMAGE: ${PYTHON_BASE_IMAGE:-python:3.11-slim-bookworm}
+        GOPROXY: ${GOPROXY:-https://goproxy.cn,direct}
+        GOSUMDB: ${GOSUMDB:-sum.golang.org}
+        DEBIAN_MIRROR: ${DEBIAN_MIRROR:-https://mirrors.ustc.edu.cn/debian}
+        DEBIAN_SECURITY_MIRROR: ${DEBIAN_SECURITY_MIRROR:-https://mirrors.ustc.edu.cn/debian-security}
+        PIP_INDEX_URL: ${PIP_INDEX_URL:-https://mirrors.aliyun.com/pypi/simple/}
+        HTTP_PROXY: ${HTTP_PROXY:-}
+        HTTPS_PROXY: ${HTTPS_PROXY:-}
+        NO_PROXY: ${NO_PROXY:-localhost,127.0.0.1,opengauss,ogmemory,host.docker.internal}
+    platform: linux/arm64
+    init: true
+    restart: unless-stopped
+    stop_grace_period: 30s
+    depends_on:
+      opengauss:
+        condition: service_healthy
+        restart: true
+    ports:
+      - "${PUBLISH_IP:-127.0.0.1}:${OGMEM_HTTP_HOST_PORT:-8090}:8090"
+      - "${PUBLISH_IP:-127.0.0.1}:${OGMEM_MCP_HOST_PORT:-8091}:8091"
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    environment:
+      HTTP_PROXY: ${HTTP_PROXY:-}
+      HTTPS_PROXY: ${HTTPS_PROXY:-}
+      NO_PROXY: ${NO_PROXY:-localhost,127.0.0.1,opengauss,ogmemory,host.docker.internal}
+      OGMEM_CONFIG: /etc/ogmem/config.yaml
+      OPENGAUSS_HOST: opengauss
+      OPENGAUSS_PORT: "5432"
+      OPENGAUSS_DBNAME: postgres
+      OPENGAUSS_USER: gaussdb
+      OPENGAUSS_PASSWORD: ${OG_DB_PASSWORD:?Set OG_DB_PASSWORD in .env}
+      LLM_PROVIDER: ${LLM_PROVIDER:-openai}
+      LLM_BASE_URL: ${LLM_BASE_URL:?Set LLM_BASE_URL in .env}
+      LLM_MODEL: ${LLM_MODEL:?Set LLM_MODEL in .env}
+      LLM_EXTRA_BODY: "${LLM_EXTRA_BODY:-{}}"
+      LLM_API_KEY: ${LLM_API_KEY:?Set LLM_API_KEY in .env}
+      EMBEDDING_PROVIDER: ${EMBEDDING_PROVIDER:-openai}
+      EMBEDDING_BASE_URL: ${EMBEDDING_BASE_URL:?Set EMBEDDING_BASE_URL in .env}
+      EMBEDDING_MODEL: ${EMBEDDING_MODEL:?Set EMBEDDING_MODEL in .env}
+      EMBEDDING_API_KEY: ${EMBEDDING_API_KEY:?Set EMBEDDING_API_KEY in .env}
+      EMBEDDING_DIMENSION: ${EMBEDDING_DIMENSION:?Set EMBEDDING_DIMENSION in .env}
+      OG_ACCOUNT_ID: ${OG_ACCOUNT_ID:-compose-account}
+      OG_USER_ID: ${OG_USER_ID:-compose-user}
+      OG_AGENT_ID: ${OG_AGENT_ID:-compose-agent}
+      OG_ROOT_API_KEY: ${OG_ROOT_API_KEY:?Set OG_ROOT_API_KEY in .env}
+      OG_TENANT_API_KEY: ${OG_TENANT_API_KEY:?Set OG_TENANT_API_KEY in .env}
+      OGMEM_MCP_ENABLED: ${OGMEM_MCP_ENABLED:-true}
+      OGMEM_MCP_ALLOWED_HOSTS: ${OGMEM_MCP_ALLOWED_HOSTS:-localhost,127.0.0.1,ogmemory,host.docker.internal}
+      OGMEM_AFTER_TURN_THRESHOLD: ${OGMEM_AFTER_TURN_THRESHOLD:-200}
+    volumes:
+      - ./deploy/compose/ogmemory.yaml:/etc/ogmem/config.yaml:ro
+      - agfs-data:/data/agfs
+    healthcheck:
+      test: ["CMD", "python3", "/opt/ogmem/scripts/check_deployment.py", "--local"]
+      interval: 30s
+      timeout: 10s
+      retries: 5
+      start_period: 30s
+    networks: [memory]
+
+networks:
+  memory:
+    driver: bridge
+
+volumes:
+  agfs-data:
+  opengauss-data:

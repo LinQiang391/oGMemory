@@ -8,21 +8,19 @@ from __future__ import annotations
 
 import os
 from dataclasses import dataclass, field
-from typing import Literal, TYPE_CHECKING
+from typing import TYPE_CHECKING, Any, Literal
 
+from core.interfaces import VectorIndex
 from providers.embedder import Embedder, MockEmbedder, get_openai_embedder
 from providers.llm import LLM, MockLLM, get_openai_llm
-from providers.vector_index import InMemoryVectorIndex, OpenGaussVectorIndex
-from providers.vector_index.chroma_index import ChromaVectorIndex
-from core.interfaces import VectorIndex
 
 if TYPE_CHECKING:
-    from providers.unified_config import OgMemConfig
-    from providers.unified_config import SecretCommandSpec
+    from providers.unified_config import OgMemConfig, SecretCommandSpec
 
 
 ProviderType = Literal["mock", "openai", "openai-cached", "st", "volcengine"]
-VectorDbType = Literal["memory", "opengauss", "chroma"]
+# Open string type allows names supplied through the vector provider registry.
+VectorDbType = str
 
 
 @dataclass
@@ -52,6 +50,9 @@ class ProviderConfig:
     llm_temperature: float = 0.7
     llm_max_tokens: int = 4096
     llm_json_mode: bool = False
+    llm_reasoning_effort: str | None = None
+    llm_is_reasoning_model: bool | None = None
+    llm_extra_body: dict[str, Any] = field(default_factory=dict)
 
     # Vector database configuration
     vector_db_type: VectorDbType = "chroma"
@@ -115,9 +116,12 @@ class ProviderConfig:
             llm_temperature=cfg.llm_temperature,
             llm_max_tokens=cfg.llm_max_tokens,
             llm_json_mode=getattr(cfg, 'llm_json_mode', False),
+            llm_reasoning_effort=cfg.llm_reasoning_effort,
+            llm_is_reasoning_model=cfg.llm_is_reasoning_model,
+            llm_extra_body=dict(cfg.llm_extra_body),
             embedding_provider=cfg.embedding_provider,
             st_model=cfg.st_model,
-            vector_db_type=cfg.vector_db_type,  # type: ignore
+            vector_db_type=cfg.vector_db_type,
             opengauss_connection_string=cfg.opengauss_connection_string,
             opengauss_dimension=cfg.opengauss_dimension,
             opengauss_table_name=cfg.opengauss_table_name,
@@ -210,29 +214,9 @@ class ProviderConfig:
 
     def create_vector_index(self) -> VectorIndex:
         """Create a VectorIndex instance based on configuration."""
-        if self.vector_db_type == "memory":
-            return InMemoryVectorIndex(dimension=self.opengauss_dimension)
+        from providers.vector_index import create_vector_index
 
-        if self.vector_db_type == "opengauss":
-            if not self.opengauss_connection_string:
-                raise ValueError(
-                    "OPENGAUSS_CONNECTION_STRING is required when vector_db_type='opengauss'"
-                )
-            return OpenGaussVectorIndex(
-                connection_string=self.opengauss_connection_string,
-                dimension=self.opengauss_dimension,
-                table_name=self.opengauss_table_name,
-                pool_size=self.opengauss_pool_size,
-            )
-
-        if self.vector_db_type == "chroma":
-            return ChromaVectorIndex(
-                collection_name=self.chroma_collection_name,
-                persist_directory=self.chroma_persist_directory,
-                dimension=self.embedding_dimension,
-            )
-
-        raise ValueError(f"Unknown vector_db_type: {self.vector_db_type}")
+        return create_vector_index(self)
 
     def create_llm(self) -> LLM:
         """Create an LLM instance based on configuration."""
@@ -248,6 +232,10 @@ class ProviderConfig:
                     model=self.openai_llm_model,
                     temperature=self.llm_temperature,
                     max_tokens=self.llm_max_tokens,
+                    json_mode=self.llm_json_mode,
+                    reasoning_effort=self.llm_reasoning_effort,
+                    is_reasoning_model=self.llm_is_reasoning_model,
+                    extra_body=self.llm_extra_body,
                     cache_max_size=self.cache_max_size,
                 )
             return OpenAILLM(
@@ -257,6 +245,9 @@ class ProviderConfig:
                 temperature=self.llm_temperature,
                 max_tokens=self.llm_max_tokens,
                 json_mode=self.llm_json_mode,
+                reasoning_effort=self.llm_reasoning_effort,
+                is_reasoning_model=self.llm_is_reasoning_model,
+                extra_body=self.llm_extra_body,
             )
 
         raise ValueError(f"Unknown provider type: {self.provider}")
@@ -273,6 +264,10 @@ class ProviderConfig:
             openai_llm_model=self.openai_llm_model,
             llm_temperature=self.llm_temperature,
             llm_max_tokens=self.llm_max_tokens,
+            llm_json_mode=self.llm_json_mode,
+            llm_reasoning_effort=self.llm_reasoning_effort,
+            llm_is_reasoning_model=self.llm_is_reasoning_model,
+            llm_extra_body=dict(self.llm_extra_body),
             openai_embedding_model=self.openai_embedding_model,
             openai_embedding_base_url=self.openai_embedding_base_url,
             openai_embedding_api_key=self.openai_embedding_api_key,

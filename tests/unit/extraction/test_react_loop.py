@@ -9,9 +9,14 @@ from unittest.mock import Mock, patch
 
 import pytest
 
+from core.errors import ExtractionIncompleteError
 from core.models import CandidateMemory, ContextNode, RequestContext
+from extraction.extraction_react_loop import (
+    ExtractionReActLoop,
+    ExtractionReActResult,
+    ExtractionTrace,
+)
 from extraction.prefetch import PrefetchResult
-from extraction.extraction_react_loop import ExtractionReActLoop, ExtractionReActResult, ExtractionTrace
 from server.internal_tool_usage import InternalToolUsageTracker
 
 # ---------------------------------------------------------------------------
@@ -72,7 +77,7 @@ def _make_llm():
     llm = Mock()
     llm._queue = []
     def _call(messages, tools=None, tool_choice="auto"):
-        return llm._queue.pop(0) if llm._queue else ([], "")
+        return llm._queue.pop(0) if llm._queue else ([], "[]")
     llm.complete_with_tools_messages = _call
     return llm
 
@@ -136,14 +141,14 @@ class TestLoopControl:
         assert "ctx://acme/p" in result.read_uris
 
     def test_max_iterations_exhausted(self):
-        """Loop keeps getting tool calls → exhausts max_iterations → empty."""
+        """Repeated tool calls cannot extend extraction indefinitely."""
         llm = _make_llm()
         for _ in range(5):
             llm._queue.append(([{"name": "read", "input": {"uri": "ctx://x"}, "id": "1"}], ""))
 
-        result = _make_loop(llm=llm, max_iterations=3).run("conv", _ctx())
-        assert result.candidates == []
-        assert result.iterations >= 3
+        with pytest.raises(ExtractionIncompleteError, match="max_iterations"):
+            _make_loop(llm=llm, max_iterations=3).run("conv", _ctx())
+        assert len(llm._queue) == 1
 
     def test_state_reset_between_runs(self):
         """run() resets read_files so second run doesn't leak first run's state."""
@@ -168,6 +173,36 @@ class TestLoopControl:
         result = _make_loop(llm=llm).run("conv", _ctx(), prefetch)
         assert "ctx://acme/p" in result.read_uris
 
+    def test_unread_existing_file_refetch_uris_are_deduplicated(self):
+        """Multiple candidates targeting the same existing URI are refetched once."""
+        fs = _make_fs(exists=True)
+        loop = _make_loop(fs=fs)
+        candidates = [
+            CandidateMemory(
+                category="profile",
+                owner_scope="user",
+                routing_key="same",
+                abstract="a",
+                overview="o",
+                content="c",
+                confidence=0.9,
+            ),
+            CandidateMemory(
+                category="profile",
+                owner_scope="user",
+                routing_key="same",
+                abstract="a2",
+                overview="o2",
+                content="c2",
+                confidence=0.9,
+            ),
+        ]
+
+        refetch_uris = loop._check_unread_existing_files(candidates, _ctx())
+
+        assert refetch_uris == ["ctx://acme/test/uri"]
+        fs.exists.assert_called_once_with("ctx://acme/test/uri", _ctx())
+
     def test_internal_tool_usage_records_round_and_tool_tokens(self):
         """Internal oGMem ReAct tool calls are attributed to the current session."""
         llm = _make_llm()
@@ -183,7 +218,7 @@ class TestLoopControl:
                 },
             }
         ], ""))
-        llm._queue.append(([], ""))
+        llm._queue.append(([], "[]"))
         tracker = InternalToolUsageTracker()
 
         _make_loop(llm=llm, internal_tool_usage_tracker=tracker).run("conv", _ctx())
@@ -205,10 +240,64 @@ class TestLoopControl:
             return [], "I think the user likes Python"  # content but not JSON
 
         llm.complete_with_tools_messages = _track
-        result = _make_loop(llm=llm, max_iterations=5).run("conv", _ctx())
+        with pytest.raises(ExtractionIncompleteError, match="no_valid_output"):
+            _make_loop(llm=llm, max_iterations=5).run("conv", _ctx())
 
+    @pytest.mark.parametrize(
+        "content",
+        [
+            '{"operations": [{"name": "unknown_tool", "input": {}}]}',
+            '{"message": "no extraction operation"}',
+        ],
+    )
+    def test_content_without_valid_candidates_is_invalid(self, content):
+        llm = _make_llm()
+
+        def _track(messages, tools=None, tool_choice="auto"):
+            return [], content
+
+        llm.complete_with_tools_messages = _track
+        with pytest.raises(ExtractionIncompleteError, match="no_valid_output"):
+            _make_loop(llm=llm, max_iterations=5).run("conv", _ctx())
+
+    @pytest.mark.parametrize("content", ["[]", '{"operations": []}', '{"tool_calls": []}'])
+    def test_explicit_empty_output_completes(self, content):
+        llm = _make_llm()
+        llm._queue.append(([], content))
+        result = _make_loop(llm=llm).run("conv", _ctx())
         assert result.candidates == []
         assert result.iterations == 1
+
+    def test_empty_json_fragment_does_not_hide_final_operations(self):
+        llm = _make_llm()
+        llm._queue.append(([], "Tool calls: []\nFinal operations: " + _extract_json()))
+        result = _make_loop(llm=llm).run("conv", _ctx())
+        assert len(result.candidates) == 1
+
+    @pytest.mark.parametrize(
+        "content",
+        [
+            "```json\n{\"operations\": [{\"name\": \"extract_profile\", \"input\": {\"routing_key\": \"tea\", \"abstract\": \"a\", \"overview\": \"o\", \"content\": \"c\", \"confidence\": 0.9}}]}\n```",
+            "Result:\n{\"operations\": [{\"name\": \"extract_profile\", \"input\": {\"routing_key\": \"tea\", \"abstract\": \"a\", \"overview\": \"o\", \"content\": \"c\", \"confidence\": 0.9}}]}",
+            "{\"operations\": [{\"name\": \"extract_profile\", \"input\": {\"routing_key\": \"tea\", \"abstract\": \"a\", \"overview\": \"o\", \"content\": \"c\", \"confidence\": 0.9}}],}",
+            "Result:\n[{\"name\": \"extract_profile\", \"input\": {\"routing_key\": \"tea\", \"abstract\": \"a\", \"overview\": \"o\", \"content\": \"c\", \"confidence\": 0.9}}, {\"name\": \"extract_profile\", \"input\": {\"routing_key\": \"coffee\", \"abstract\": \"a\", \"overview\": \"o\", \"content\": \"c\", \"confidence\": 0.9}}]",
+            "See [1]. Result: [{\"name\": \"extract_profile\", \"input\": {\"routing_key\": \"tea\", \"abstract\": \"a\", \"overview\": \"o\", \"content\": \"c\", \"confidence\": 0.9}}]",
+        ],
+    )
+    def test_content_json_is_sanitized_before_parse(self, content, caplog):
+        llm = _make_llm()
+
+        def _track(messages, tools=None, tool_choice="auto"):
+            return [], content
+
+        llm.complete_with_tools_messages = _track
+        result = _make_loop(llm=llm, max_iterations=3).run("conv", _ctx())
+
+        expected_keys = ["tea", "coffee"] if "coffee" in content else ["tea"]
+        assert [candidate.routing_key for candidate in result.candidates] == expected_keys
+        assert result.candidates[0].routing_key == "tea"
+        assert result.iterations == 1
+        assert "could not be parsed as extraction operations" not in caplog.text
 
 
 # ---------------------------------------------------------------------------
@@ -243,9 +332,8 @@ class TestToolDisable:
             return ([], "")  # neither tools nor content
 
         llm.complete_with_tools_messages = _track
-        result = _make_loop(llm=llm, max_iterations=5).run("conv", _ctx())
-        assert result.candidates == []
-        assert result.iterations == 1
+        with pytest.raises(ExtractionIncompleteError, match="no_valid_output"):
+            _make_loop(llm=llm, max_iterations=5).run("conv", _ctx())
 
 
 # ---------------------------------------------------------------------------
@@ -253,6 +341,29 @@ class TestToolDisable:
 # ---------------------------------------------------------------------------
 
 class TestSafetyRefetch:
+
+    def test_final_iteration_refetch_retains_draft_in_model_context(self):
+        llm = _make_llm()
+        original = _extract_json(routing_key="before-read")
+        revised = _extract_json(routing_key="after-read")
+        requests = []
+
+        def respond(messages, **kwargs):
+            from copy import deepcopy
+            requests.append(deepcopy(messages))
+            return [], original if len(requests) == 1 else revised
+
+        llm.complete_with_tools_messages = respond
+        result = _make_loop(llm=llm, fs=_make_fs(exists=True), max_iterations=1).run("conv", _ctx())
+        assert result.candidates[0].routing_key == "after-read"
+        assert len(requests) == 2
+        assert {"role": "assistant", "content": original} in requests[1]
+
+    def test_timeout_discards_recorded_drafts(self):
+        llm = _make_llm()
+        llm._queue.append(([{"name": "extract_profile", "input": _extract_input(), "id": "1"}], ""))
+        with pytest.raises(ExtractionIncompleteError, match="timeout"):
+            _make_loop(llm=llm, timeout_seconds=-1).run("conv", _ctx())
     """_check_unread_existing_files + _did_safety_reread guard."""
 
     def test_refetch_triggered_for_unread_existing(self):
@@ -264,6 +375,20 @@ class TestSafetyRefetch:
 
         result = _make_loop(llm=llm, fs=fs).run("conv", _ctx())
         assert any(it.safety_check_triggered for it in result.trace.iterations)
+
+    def test_refetch_tool_call_ids_fit_openai_limit(self):
+        """Auto-refetch call IDs stay within the OpenAI 64-character limit."""
+        loop = _make_loop(fs=_make_fs())
+        messages = []
+        long_uri = "ctx://acme/users/alice/memories/entities/" + ("very_long_name_" * 8)
+
+        loop._add_refetch_results(messages, [long_uri], _ctx())
+
+        assistant_msg = next(m for m in messages if m.get("tool_calls"))
+        tool_msg = next(m for m in messages if m.get("role") == "tool")
+        call_id = assistant_msg["tool_calls"][0]["id"]
+        assert len(call_id) <= 64
+        assert tool_msg["tool_call_id"] == call_id
 
     def test_refetch_only_once(self):
         """_did_safety_reread prevents refetch from firing repeatedly."""
@@ -313,9 +438,9 @@ class TestErrorHandling:
         assert "error" in result.tools_used[0]["result"]
         assert len(result.candidates) == 1
 
-    def test_llm_exception_returns_empty(self):
-        """LLM throws on first call → empty result, no crash."""
+    def test_llm_exception_fails_extraction(self):
+        """An API failure must not be reported as a successful empty extraction."""
         llm = _make_llm()
         llm.complete_with_tools_messages = Mock(side_effect=RuntimeError("API down"))
-        result = _make_loop(llm=llm).run("conv", _ctx())
-        assert result.candidates == []
+        with pytest.raises(ExtractionIncompleteError, match="no_valid_output"):
+            _make_loop(llm=llm).run("conv", _ctx())

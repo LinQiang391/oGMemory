@@ -18,15 +18,22 @@ from unittest.mock import Mock
 
 import pytest
 
+from core.errors import LLMOutputTruncatedError, ToolCallProtocolError
 from core.models import RequestContext, CandidateMemory
-from extraction.tools import Extractor, _Span
-from extraction.tool_builder import build_extraction_tools, build_tool_to_category
 from extraction.schemas.registry import SchemaRegistry
+from extraction.tool_builder import build_extraction_tools, build_tool_to_category
+from extraction.tools import Extractor, _PreparedSpan, _Span
 from providers.llm.mock_llm import MockLLM
 
 
 class TestExtractorEmptyResults:
     """Tests for Extractor with no tool calls."""
+
+    def test_default_lazy_react_timeout_is_long_enough_for_slow_tool_extraction(self):
+        """Default ReAct timeout gives slow tool-calling extraction room to finish."""
+        extractor = Extractor(MockLLM())
+
+        assert extractor._react_timeout_seconds == 180.0
 
     def test_extract_empty_when_no_tool_calls(self):
         """LLM returns no tool calls → empty result."""
@@ -122,12 +129,17 @@ class TestExtractorPhase2PromptDedupe:
     def test_duplicate_prompt_sha_only_calls_tools_once(self, caplog):
         """Duplicate spans that build the same prompt run one tool-calling request."""
         llm = Mock()
-        llm.complete_json.return_value = {
+        span_response = {
             "spans": [
                 {"start": 0, "end": 0, "reason": "event", "categories": ["event"]},
                 {"start": 0, "end": 0, "reason": "profile", "categories": ["profile"]},
             ]
         }
+        llm.complete_json.side_effect = lambda _prompt, schema: (
+            {"operations": []}
+            if "operations" in schema.get("properties", {})
+            else span_response
+        )
         llm.complete_with_tools.return_value = []
         extractor = Extractor(llm, prompt_manager=self._make_prompt_manager())
         ctx = RequestContext(
@@ -146,7 +158,7 @@ class TestExtractorPhase2PromptDedupe:
 
         assert result == []
         assert llm.complete_with_tools.call_count == 2  # dual-run: 2 calls per unique span
-        assert "Phase 2 duplicate prompt skipped" in caplog.text
+        assert "Phase 2 profile spans coalesced" in caplog.text
 
     def test_duplicate_prompt_merges_categories_for_lazy_prefetch(self):
         """Deduped lazy spans keep categories from skipped duplicate prompts."""
@@ -210,12 +222,17 @@ class TestExtractorPhase2PromptDedupe:
     def test_distinct_prompt_sha_calls_tools_for_each_span(self):
         """Different focused contexts are not dropped by prompt dedupe."""
         llm = Mock()
-        llm.complete_json.return_value = {
+        span_response = {
             "spans": [
                 {"start": 0, "end": 0, "reason": "first", "categories": ["event"]},
                 {"start": 8, "end": 8, "reason": "second", "categories": ["event"]},
             ]
         }
+        llm.complete_json.side_effect = lambda _prompt, schema: (
+            {"operations": []}
+            if "operations" in schema.get("properties", {})
+            else span_response
+        )
         llm.complete_with_tools.return_value = []
         extractor = Extractor(llm, prompt_manager=self._make_prompt_manager())
         ctx = RequestContext(
@@ -234,6 +251,202 @@ class TestExtractorPhase2PromptDedupe:
 
         assert result == []
         assert llm.complete_with_tools.call_count == 4  # dual-run: 2 spans × 2 runs
+
+
+class TestExtractorToolCallFallback:
+    """Tests for native-first extraction with one JSON fallback per span."""
+
+    @staticmethod
+    def _ctx() -> RequestContext:
+        return RequestContext(
+            account_id="test-account",
+            user_id="user-123",
+            agent_id="agent-456",
+            session_id="session-789",
+            trace_id="trace-abc",
+        )
+
+    @staticmethod
+    def _preference(routing_key: str = "coffee", confidence: float = 0.9) -> dict:
+        return {
+            "tool": "extract_preference",
+            "input": {
+                "routing_key": routing_key,
+                "abstract": f"Likes {routing_key}",
+                "overview": f"Preference for {routing_key}",
+                "content": f"User likes {routing_key}",
+                "confidence": confidence,
+            },
+        }
+
+    @staticmethod
+    def _prepared() -> _PreparedSpan:
+        return _PreparedSpan(
+            span=_Span(start=0, end=0, message_ids=["msg-1"]),
+            prompt="Extract memory from this conversation",
+            prompt_sha="a" * 64,
+        )
+
+    def test_two_native_successes_do_not_call_json_fallback(self):
+        llm = Mock()
+        llm.complete_with_tools.return_value = [self._preference()]
+        extractor = Extractor(llm)
+
+        result = extractor._structure_prepared_span_dual(
+            self._prepared(), self._ctx(), archive_id=None
+        )
+
+        assert len(result) == 1
+        assert llm.complete_with_tools.call_count == 2
+        llm.complete_json.assert_not_called()
+
+    def test_one_native_success_skips_json_fallback(self):
+        llm = Mock()
+        llm.complete_with_tools.side_effect = [
+            [self._preference("coffee")],
+            ToolCallProtocolError("empty native result"),
+        ]
+        llm.complete_json.return_value = {
+            "operations": [self._preference("tea")]
+        }
+        extractor = Extractor(llm)
+
+        result = extractor._structure_prepared_span_dual(
+            self._prepared(), self._ctx(), archive_id=None
+        )
+
+        assert len(result) == 1
+        assert result[0].routing_key == "coffee"
+        llm.complete_json.assert_not_called()
+
+    def test_two_protocol_failures_use_only_one_json_fallback(self):
+        llm = Mock()
+        llm.complete_with_tools.side_effect = ToolCallProtocolError("empty native result")
+        llm.complete_json.return_value = {
+            "operations": [self._preference("coffee")]
+        }
+        extractor = Extractor(llm)
+
+        result = extractor._structure_prepared_span_dual(
+            self._prepared(), self._ctx(), archive_id="archive-1"
+        )
+
+        assert len(result) == 1
+        assert result[0].provenance_ids
+        assert llm.complete_with_tools.call_count == 2
+        llm.complete_json.assert_called_once()
+
+    def test_json_fallback_allows_empty_operations(self):
+        llm = Mock()
+        llm.complete_with_tools.side_effect = ToolCallProtocolError("empty native result")
+        llm.complete_json.return_value = {"operations": []}
+        extractor = Extractor(llm)
+
+        result = extractor._structure_prepared_span_dual(
+            self._prepared(), self._ctx(), archive_id=None
+        )
+
+        assert result == []
+        llm.complete_json.assert_called_once()
+
+    @pytest.mark.parametrize(
+        "operation",
+        [
+            {"tool": "unknown_tool", "input": {}},
+            {"tool": "extract_preference", "input": {"routing_key": "coffee"}},
+        ],
+    )
+    def test_json_fallback_rejects_invalid_operations(self, operation):
+        llm = Mock()
+        llm.complete_with_tools.side_effect = ToolCallProtocolError("empty native result")
+        llm.complete_json.return_value = {"operations": [operation]}
+        extractor = Extractor(llm)
+
+        with pytest.raises(
+            ToolCallProtocolError,
+            match="JSON fallback contained no schema-valid extraction operation",
+        ):
+            extractor._structure_prepared_span_dual(
+                self._prepared(), self._ctx(), archive_id=None
+            )
+        llm.complete_json.assert_called_once()
+
+    @pytest.mark.parametrize("error_type", [ToolCallProtocolError, LLMOutputTruncatedError])
+    def test_multiple_spans_keep_native_concurrency_and_fallback_once_per_failed_span(self, error_type):
+        llm = Mock()
+
+        def complete_with_tools(*, prompt, **_kwargs):
+            if prompt == "failed span":
+                raise error_type("incomplete native result")
+            return [self._preference("tea")]
+
+        llm.complete_with_tools.side_effect = complete_with_tools
+        llm.complete_json.return_value = {
+            "operations": [self._preference("coffee")]
+        }
+        extractor = Extractor(llm)
+        prepared = [
+            _PreparedSpan(
+                span=_Span(start=0, end=0, message_ids=["msg-1"]),
+                prompt="failed span",
+                prompt_sha="a" * 64,
+            ),
+            _PreparedSpan(
+                span=_Span(start=1, end=1, message_ids=["msg-2"]),
+                prompt="successful span",
+                prompt_sha="b" * 64,
+            ),
+        ]
+        extractor._prepare_unique_spans = Mock(return_value=prepared)
+
+        result = extractor._structure_spans(
+            spans=[item.span for item in prepared],
+            messages=[{"role": "user", "content": "memory"}],
+            language="en",
+            session_time=None,
+            session_summary="",
+            tool_stats_text="",
+            ctx=self._ctx(),
+            archive_id=None,
+        )
+
+        assert {candidate.routing_key for candidate in result} == {"coffee", "tea"}
+        assert llm.complete_with_tools.call_count == 4
+        llm.complete_json.assert_called_once()
+
+    def test_real_api_errors_are_not_hidden_when_both_native_runs_fail(self):
+        llm = Mock()
+        llm.complete_with_tools.side_effect = RuntimeError("rate limited")
+        extractor = Extractor(llm)
+
+        with pytest.raises(RuntimeError, match="rate limited"):
+            extractor._structure_prepared_span_dual(
+                self._prepared(), self._ctx(), archive_id=None
+            )
+
+        llm.complete_json.assert_not_called()
+
+    def test_fallback_candidates_still_use_public_confidence_filter(self):
+        llm = Mock()
+        llm.complete_json.side_effect = [
+            {
+                "spans": [
+                    {"start": 0, "end": 0, "reason": "preference", "categories": ["preference"]}
+                ]
+            },
+            {"operations": [self._preference("coffee", confidence=0.3)]},
+        ]
+        llm.complete_with_tools.side_effect = ToolCallProtocolError("empty native result")
+        extractor = Extractor(llm)
+
+        result = extractor.extract(
+            [{"role": "user", "content": "I like coffee."}],
+            self._ctx(),
+            archive_id="archive-1",
+        )
+
+        assert result == []
+        assert llm.complete_json.call_count == 2
 
 
 class TestExtractorSinglePreference:
@@ -475,11 +688,11 @@ class TestExtractorToolMapping:
     """Tests for tool name to category mapping."""
 
     def test_all_tool_names_mapped(self):
-        """Tool names match tool_to_category keys exactly."""
+        """Schema extraction tools have fixed category mappings; edits use their read target."""
         registry = SchemaRegistry()
         tools = build_extraction_tools(registry)
         tool_to_category = build_tool_to_category(registry)
-        tool_names = {t["name"] for t in tools}
+        tool_names = {t["name"] for t in tools if t["name"].startswith("extract_")}
         mapped_names = set(tool_to_category.keys())
 
         assert tool_names == mapped_names, (

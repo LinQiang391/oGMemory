@@ -150,7 +150,7 @@ class CandidateMemory:
     """
     category: str  # Same as ContextNode.category
     owner_scope: str  # "user" | "agent"
-    routing_key: str  # slug or event_id candidate value
+    routing_key: str  # Stable logical key; occurrence nodes receive an allocated event ID
     abstract: str
     overview: str
     content: str
@@ -164,6 +164,19 @@ class CandidateMemory:
     attributed_speaker: str | None = None  # Who said this ('user' or speaker name)
     attribution_basis: str | None = None  # self_first_person | self_named | other_named
     provenance_ids: list[str] = field(default_factory=list)
+    object_name: str = ""  # Source name of the entity being matched
+    scope_ref: str = ""  # Identity namespace distinguishing subjects, not evidence provenance
+    target_uri: str = ""  # URI of the existing node selected for an update
+    expected_version: int | None = None  # Version read from target_uri for the update
+    legacy_routing_key: str = ""  # Previous validator's key for existing-node lookup
+    title: str = ""  # Source-grounded label for an event or case
+    complete_occurrence_context: bool = False  # Internal full snapshot: null context clears old metadata.
+    write_operation_id: str = ""  # Internal durable batch receipt; never an extraction-tool argument.
+    source_occurrence_id: str = ""  # Internal accepted source partition; never a tool argument.
+    verified_routing_aliases: list[str] = field(default_factory=list)
+    verified_object_aliases: list[str] = field(default_factory=list)
+    source_contexts: list[str] = field(default_factory=list)  # Internal complete extraction-span evidence.
+    node_draft_indices: list[int] = field(default_factory=list)  # Contributors in the durable draft checkpoint.
 
 
 class WriteAction:
@@ -299,7 +312,7 @@ class SeedResult:
 
 @dataclass
 class LeafHit:
-    """L2 node produced by HierarchicalSearcher after recursive expansion."""
+    """L2 node produced by hierarchy expansion or direct L2 retrieval."""
     uri: str
     score: float
     level: int = 2
@@ -313,6 +326,7 @@ class LeafHit:
     hierarchy_path: list[str] = field(default_factory=list)
     active_count: int = 0
     updated_at: str | None = None
+    metadata: dict[str, Any] = field(default_factory=dict)
 
 
 @dataclass
@@ -321,6 +335,7 @@ class RetrievedBlock:
     uri: str
     level_hit: str = "L2"
     score: float = 0.0
+    ranking_score: float | None = field(default=None, repr=False, compare=False)
     category: str = ""
     owner_space: str = ""
     abstract: str | None = None
@@ -330,6 +345,7 @@ class RetrievedBlock:
     has_overview: bool = False
     has_content: bool = False
     match_reason: str = ""
+    metadata: dict[str, Any] = field(default_factory=dict)
 
 
 @dataclass
@@ -348,11 +364,25 @@ class RetrievalConfig:
     max_top_k: int = 50
     default_top_k: int = 10
     global_search_topk: int = 30
+    candidate_pool_enabled: bool = False
+    candidate_pool_multiplier: int = 3
+    min_candidate_pool_size: int = 15
+    result_ranker_strategy: str = "semantic"
+    global_result_rerank_enabled: bool = False
+    owner_scope_filter_enabled: bool = False
     max_convergence_rounds: int = 3
     score_propagation_alpha: float = 0.5
     hotness_alpha: float = 0.2
     hotness_half_life_days: float = 7.0
     default_score_threshold: float = 0.0
+    # Appended to preserve the legacy positional constructor.
+    hybrid_enabled: bool = False
+    vector_top_k: int = 100
+    lexical_top_k: int = 50
+    rrf_k: int = 60
+    semantic_weight: float = 1.0
+    lexical_weight: float = 1.0
+    expand_hierarchy: bool = True
 
 
 # ---------------------------------------------------------------------------
