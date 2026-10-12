@@ -2891,6 +2891,9 @@ class MemoryService:
             try:
                 from extraction.schemas.registry import SchemaRegistry
                 schema_registry = SchemaRegistry()
+                if self._cfg.agent_memory_enabled:
+                    for category in ("case", "tool", "skill"):
+                        schema_registry.register(replace(schema_registry.get(category), enabled=False))
                 if self._cfg.skill_sedimentation_enabled:
                     schema_registry.unregister("skill")
                 logger.info("SchemaRegistry initialized for dynamic tool generation")
@@ -3024,6 +3027,7 @@ internal_tool_usage_tracker=self._internal_tool_usage,
             vector_index = self._get_shared_vector_index()
 
             cfg = RetrievalConfig(
+                include_agent_memories=self._cfg.agent_memory_enabled,
                 expand_hierarchy=getattr(self._cfg, "retrieval_expand_hierarchy", True),
                 max_top_k=getattr(self._cfg, "retrieval_max_top_k", 50),
                 default_top_k=getattr(self._cfg, "retrieval_default_top_k", 10),
@@ -4763,12 +4767,13 @@ internal_tool_usage_tracker=self._internal_tool_usage,
         from server.agent_memory import process_trace_memory
 
         fs = self._get_context_fs()
-        process_trace_memory(
-            event, trace_store=self._get_trace_event_store(),
-            outbox=self._get_outbox_store(fs), fs=fs, llm=self.get_llm(),
-            directory_summary_enabled=self._cfg.directory_summary_enabled,
-            vector_index=self._get_shared_vector_index(), embedder=self._get_shared_embedder(),
-        )
+        with request_usage_scope(RequestContext(**event.payload["context"])):
+            process_trace_memory(
+                event, trace_store=self._get_trace_event_store(),
+                outbox=self._get_outbox_store(fs), fs=fs, llm=self.get_llm(),
+                directory_summary_enabled=self._cfg.directory_summary_enabled,
+                vector_index=self._get_shared_vector_index(), embedder=self._get_shared_embedder(),
+            )
 
     def finalize_session_trace(self, params: dict) -> dict:
         """Finalize the turn-end-bounded turn containing ``stopEventIndex``."""
@@ -4808,7 +4813,7 @@ internal_tool_usage_tracker=self._internal_tool_usage,
                 session_id=session_id,
                 stop_event_index=stop_event_index,
             )
-            if ctx.agent_id and finalized.get("uri"):
+            if self._cfg.agent_memory_enabled and ctx.agent_id and finalized.get("uri"):
                 from server.agent_memory import trace_memory_event
 
                 outbox = self._get_outbox_store(self._get_context_fs())

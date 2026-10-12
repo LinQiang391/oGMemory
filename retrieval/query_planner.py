@@ -98,6 +98,15 @@ class QueryPlanner:
                 "resource_type requires context_type=RESOURCE",
             )
 
+        if not context_type_override and categories:
+            groups = [(ContextType.MEMORY.value, [c for c in categories if c != "skill"])]
+            # ArchiveBuilder stores legacy tools and patterns as SKILL nodes.
+            groups.append((ContextType.SKILL.value,
+                           [c for c in categories if c in {"skill", "tool", "pattern"}]))
+            return [self._make_query(query, kind, ctx, categories=selected,
+                                     top_k=effective_top_k, resource_type=None)
+                    for kind, selected in groups if selected]
+
         # Try semantic decomposition for complex queries
         sub_queries = self._decompose(query)
         if len(sub_queries) > 1:
@@ -129,6 +138,11 @@ class QueryPlanner:
         matched_types = self._classify(query)
 
         if len(matched_types) == 1:
+            if (self.config.include_agent_memories and matched_types[0] == ContextType.SKILL.value
+                    and ctx.agent_id and not categories):
+                return [self._make_query(query, kind, ctx, categories=None,
+                                         top_k=effective_top_k, resource_type=None)
+                        for kind in (ContextType.SKILL.value, ContextType.MEMORY.value)]
             return [
                 self._make_query(
                     query, matched_types[0], ctx,

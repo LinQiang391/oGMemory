@@ -22,7 +22,7 @@ def unit_memory():
 @pytest.mark.parametrize("directory,kind", [("tools", "tool_memory"), ("tool_units", "tool_evidence")])
 def test_public_tool_summary_matches_its_uri(unit_memory, directory, kind):
     _, node, _, _ = unit_memory
-    node = replace(node, uri=node.uri.replace("/tools/", f"/{directory}/"))
+    node = replace(node, uri=f"{node.uri.rsplit('/', 2)[0]}/{directory}/search")
     summary = _node_summary(node)
     assert summary["type"] == kind
     assert summary["uri"] == f"ogmemory://memories/{kind}/search"
@@ -33,7 +33,7 @@ def test_public_tool_filter_selects_requested_directory_before_limit(unit_memory
     ctx, node, _, _ = unit_memory
     other = "tool_evidence" if kind == "tool_memory" else "tool_memory"
     directories = {"tool_memory": "tools", "tool_evidence": "tool_units"}
-    hits = [RetrievedBlock(uri=node.uri.replace("/tools/", f"/{directories[t]}/"),
+    hits = [RetrievedBlock(uri=f"{node.uri.rsplit('/', 2)[0]}/{directories[t]}/search",
                           category="tool", score=score) for t, score in [(other, 0.95), (kind, 0.9)]]
     service = _FakeService()
 

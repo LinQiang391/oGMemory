@@ -9,6 +9,7 @@ import pytest
 from core.errors import AccessDeniedError, ValidationError
 from core.models import (
     ArchiveRef,
+    ContextNode,
     RequestContext,
     RetrievedBlock,
     Role,
@@ -1134,6 +1135,83 @@ def test_compose_merges_pending_injection_into_working_set():
     read_api.read_memory.assert_called_once_with(
         "ctx://acct-test/users/user-test/memories/preferences/coding_style", ctx,
     )
+    assert topic.get_pending_injection() is None
+
+
+def test_compose_delivers_mixed_memories_and_confirms_each_tool_unit():
+    from retrieval.context_reader import ContextReader
+
+    service = MemoryService(config=OgMemConfig(prefetch_enabled=True))
+    _disable_session_persistence(service)
+    ctx = _ctx("mixed-tool-units")
+    user_uri = "ctx://acct-test/users/user-test/memories/preferences/portability"
+    tool_uri = "ctx://acct-test/agents/agent-test/memories/tools/read-file"
+    user_content = "The project must support Windows and Linux."
+    units = [
+        {"key": "relative-path", "title": "Relative path resolution",
+         "content": "read_file resolves relative paths against its process working directory.",
+         "grounding": []},
+        {"key": "line-range", "title": "Line range interpretation",
+         "content": "read_file accepts one-based line numbers and includes the requested end line.",
+         "grounding": []},
+    ]
+    nodes = {
+        user_uri: ContextNode(
+            uri=user_uri, context_type="MEMORY", category="preference", level=2,
+            owner_space="user:user-test", abstract="Cross-platform compatibility",
+            overview="", content=user_content,
+        ),
+        tool_uri: ContextNode(
+            uri=tool_uri, context_type="MEMORY", category="tool", level=2,
+            owner_space="agent:agent-test", abstract="read_file usage",
+            overview="Path resolution and line ranges",
+            content="\n\n".join(unit["content"] for unit in units),
+            metadata={"agent_memory_version": 1,
+                      "structured_fields": {"tool_name": "read_file", "units": units}},
+        ),
+    }
+    reader = ContextReader(fs=SimpleNamespace(read_node=lambda uri, _: nodes[uri]))
+    tool_hits = [
+        RetrievedBlock(uri=tool_uri, score=0.9, category="tool",
+                       abstract=unit["title"], metadata={"unit_key": unit["key"]})
+        for unit in units
+    ]
+    user_hit = RetrievedBlock(uri=user_uri, score=0.92, category="preference",
+                              abstract="Cross-platform compatibility")
+
+    def search_memory(**kwargs):
+        if kwargs.get("categories") == ["session_summary"]:
+            return SearchMemoryResult()
+        if kwargs["top_k"] == 5:
+            return SearchMemoryResult(hits=tool_hits)
+        return SearchMemoryResult(hits=[user_hit, tool_hits[0]])
+
+    service.get_read_api = Mock(return_value=SimpleNamespace(
+        read_memory=reader.read, search_memory=search_memory,
+    ))
+    service._read_profile = Mock(return_value="")
+    service._collect_archives = Mock(return_value=([], []))
+    service._get_session_state = Mock(return_value=SessionWindowState())
+    params = {"sessionId": ctx.session_id, "_ctx": ctx,
+              "query": "Read a relative source path and its requested line range"}
+
+    assert service.prefetch(params)["prefetched"] == 2
+    result = service.compose(params)
+
+    evidence = result["retrievedEvidence"]
+    assert evidence.count(user_content) == 1
+    topic = service.get_session_manager().get_topic_buffer(ctx.session_id)
+    for unit in units:
+        assert evidence.count(unit["content"]) == 1
+        assert f"unit_key: {unit['key']}" in evidence
+        assert topic.was_injected(tool_uri, {"unit_key": unit["key"]}) is True
+    assert user_uri in evidence
+    assert tool_uri in evidence
+    delivery = result["stats"]["evidence_delivery"]
+    assert delivery["read_count"] == 3
+    assert delivery["delivered_units"] == [
+        {"uri": tool_uri, "unit_key": unit["key"]} for unit in units
+    ]
     assert topic.get_pending_injection() is None
 
 

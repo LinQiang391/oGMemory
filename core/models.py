@@ -386,6 +386,7 @@ class RetrievalConfig:
     semantic_weight: float = 1.0
     lexical_weight: float = 1.0
     expand_hierarchy: bool = True
+    include_agent_memories: bool = False
 
 
 # ---------------------------------------------------------------------------
