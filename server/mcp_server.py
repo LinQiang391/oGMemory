@@ -125,7 +125,8 @@ _SKILL_MCP_INSTRUCTIONS = (
 _SKILL_WRITE_MCP_INSTRUCTIONS = (
     f" Use {INSTALL_SKILL_TOOL_NAME} or {UPDATE_SKILL_TOOL_NAME} only when the user asks "
     "to install or replace an imported Skill package. Pass exactly one of data, "
-    "archive_base64, or path; path is resolved on the MCP server."
+    "archive_base64, or path; server-local path imports require trusted stdio. "
+    "For HTTP or SSE, upload the package using data or archive_base64."
 )
 _SKILL_DELETE_MCP_INSTRUCTIONS = (
     f" Use {DELETE_SKILL_TOOL_NAME} only when the user explicitly asks to delete a published "
@@ -502,7 +503,7 @@ def create_mcp_server(
             ] = None,
             path: Annotated[
                 str | None,
-                Field(description="Server-local SKILL.md, ZIP, or Skill directory path; use one input form."),
+                Field(description="Server-local SKILL.md, ZIP, or Skill directory path for trusted stdio only; use one input form."),
             ] = None,
             agent_id: Annotated[
                 str | None,
@@ -537,7 +538,7 @@ def create_mcp_server(
             ] = None,
             path: Annotated[
                 str | None,
-                Field(description="Server-local replacement SKILL.md, ZIP, or Skill directory path; use one input form."),
+                Field(description="Server-local replacement SKILL.md, ZIP, or Skill directory path for trusted stdio only; use one input form."),
             ] = None,
             agent_id: Annotated[
                 str | None,
