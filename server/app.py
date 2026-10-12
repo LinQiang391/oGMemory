@@ -25,21 +25,11 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from flask import Flask, jsonify, request
 from werkzeug.exceptions import RequestEntityTooLarge
 
-from core.errors import AccessDeniedError, NodeNotFoundError, ValidationError
+from core.errors import AccessDeniedError, NodeNotFoundError
 from core.logging_config import configure_third_party_loggers
-from features.tool_result_externalization.store_base import (
-    ArtifactNotVisibleError,
-    ArtifactStoreUnavailableError,
-    ToolResultExternalizationDisabledError,
-)
 from perf.recorder import SpanEvent, clocks, get_recorder
 from providers.unified_config import get_config
 from server.auth import AuthenticationError, AuthorizationError, ControlPlaneDisabledError
-from server.mcp_security import with_untrusted_data_notice
-from server.mcp_tools import (
-    bound_tool_result_collection_response,
-    bound_tool_result_read_response,
-)
 from server.memory_service import MemoryService
 from server.memory_viewer import create_memory_viewer_blueprint
 from session.session_manager import SessionOperationInProgress
@@ -66,36 +56,6 @@ _perf_emit_warned = False  # log first perf failure as WARNING, subsequent as DE
 _MAX_TRACE_EVENT_BODY_BYTES = 64 * 1024
 _MAX_TRACE_EVENT_DEPTH = 64
 _MAX_TRACE_EVENT_NODES = 5_000
-_CODE_MEMORY_CANONICAL_FACADES = frozenset(
-    {
-        "register_code_workspace",
-        "sync_code_workspace",
-        "refresh_code_resource",
-        "upsert_code_resource",
-        "search_code_resources",
-        "read_focused_code_snippet",
-        "edit_code_file",
-    }
-)
-
-
-def _query_bool(value, *, default: bool = False) -> bool:
-    if value is None:
-        return default
-    normalized = str(value).strip().lower()
-    if normalized in {"1", "true", "yes", "on"}:
-        return True
-    if normalized in {"0", "false", "no", "off", ""}:
-        return False
-    raise ValueError("boolean query parameter is invalid")
-
-
-def _jsonify_tool_result_read(payload: dict):
-    """Preserve pagination metadata before a potentially large content field."""
-    return app.response_class(
-        app.json.dumps(payload, sort_keys=False),
-        mimetype="application/json",
-    )
 
 
 def _trace_event_shape_ok(value: object) -> bool:
@@ -154,17 +114,6 @@ def _build_authenticated_context(params: dict):
     return svc.build_context(params, identity=identity)
 
 
-def _json_object_body() -> dict:
-    """Decode an adapter request only when its JSON root is an object."""
-
-    params = request.get_json(force=True, silent=True)
-    if params is None:
-        raise ValueError("request body must be a JSON object")
-    if not isinstance(params, dict):
-        raise ValueError("request body must be a JSON object")
-    return params
-
-
 def _error_response(exc: Exception):
     from core.errors import ConcurrentModificationError
 
@@ -174,34 +123,15 @@ def _error_response(exc: Exception):
         return jsonify({"error": str(exc)}), 401
     if isinstance(exc, ControlPlaneDisabledError):
         return jsonify({"error": str(exc)}), 503
-    if isinstance(exc, ArtifactStoreUnavailableError):
-        return jsonify({
-            "ok": False,
-            "error": "tool_result_artifact_store_unavailable",
-            "retryable": True,
-        }), 503
-    if isinstance(exc, (
-        FileNotFoundError,
-        NodeNotFoundError,
-        ArtifactNotVisibleError,
-        ToolResultExternalizationDisabledError,
-    )):
+    if isinstance(exc, FileNotFoundError):
         return jsonify({"error": str(exc)}), 404
     if isinstance(exc, FileExistsError):
         return jsonify({"error": str(exc)}), 409
     if isinstance(exc, ConcurrentModificationError):
         return jsonify({"error": str(exc)}), 409
-    if isinstance(exc, SessionOperationInProgress):
-        return jsonify({
-            "ok": False,
-            "status": 409,
-            "error_code": "session_operation_in_progress",
-            "conflict_type": exc.conflict_type,
-            "retryable": exc.retryable,
-        }), 409
-    if isinstance(exc, (ValueError, ValidationError)):
+    if isinstance(exc, ValueError):
         return jsonify({"error": str(exc)}), 400
-    if isinstance(exc, (AuthorizationError, PermissionError, AccessDeniedError)):
+    if isinstance(exc, AuthorizationError | PermissionError):
         return jsonify({"error": str(exc)}), 403
     return jsonify({"error": str(exc)}), 500
 
@@ -233,11 +163,6 @@ def _lifecycle_result_response(result: dict):
 
 @app.errorhandler(RequestEntityTooLarge)
 def _handle_request_entity_too_large(exc: RequestEntityTooLarge):
-    return _error_response(exc)
-
-
-@app.errorhandler(SessionOperationInProgress)
-def _handle_session_operation_in_progress(exc: SessionOperationInProgress):
     return _error_response(exc)
 
 
@@ -676,19 +601,6 @@ def handle_ingest_batch():
         return _error_response(exc)
 
 
-@app.route("/api/v1/govern_first_view_tool_result", methods=["POST"])
-def handle_govern_first_view_tool_result():
-    """Rewrite a trusted adapter ToolResult before its first model request."""
-    params = request.get_json(force=True, silent=True) or {}
-    try:
-        ctx = _build_authenticated_context(params)
-        params["_ctx"] = ctx
-        return jsonify(_get_service().govern_first_view_tool_result(params))
-    except Exception as exc:
-        logger.error("first-view tool-result governance failed: %s", exc, exc_info=True)
-        return _error_response(exc)
-
-
 @app.route("/api/v1/compact", methods=["POST"])
 def handle_compact():
     params = request.get_json(force=True, silent=True) or {}
@@ -770,127 +682,6 @@ def handle_bootstrap():
             after = rec.snapshot_tokens()
             tokens, cost, source = rec.finalize_tokens(after, before)
             _emit_perf_stage("bootstrap", params, before, started_at, wall_start, cpu_start, False, f"{type(exc).__name__}: {exc}", tokens, cost, source)
-        return _error_response(exc)
-
-
-@app.route("/api/v1/resources/code/refresh", methods=["POST"])
-def handle_code_resource_refresh():
-    """Accept deterministic refresh or missing-file cleanup for one code file."""
-    try:
-        params = _json_object_body()
-        ctx = _build_authenticated_context(params)
-        params["_ctx"] = ctx
-        return jsonify(_get_service().refresh_code_resource(params))
-    except Exception as exc:
-        logger.error(
-            "code resource refresh failed type=%s",
-            type(exc).__name__,
-        )
-        return _error_response(exc)
-
-
-@app.route("/api/v1/resources/code/sync/registrations", methods=["POST"])
-def handle_code_workspace_registration():
-    """Register a code workspace without returning its local path."""
-    try:
-        params = _json_object_body()
-        ctx = _build_authenticated_context(params)
-        params["_ctx"] = ctx
-        return jsonify(_get_service().register_code_workspace(params))
-    except Exception as exc:
-        logger.error("code workspace registration failed type=%s", type(exc).__name__)
-        return _error_response(exc)
-
-
-@app.route("/api/v1/resources/code/sync", methods=["POST"])
-def handle_code_workspace_sync():
-    """Run an explicit registered-workspace sync through its canonical service."""
-    try:
-        params = _json_object_body()
-        ctx = _build_authenticated_context(params)
-        params["_ctx"] = ctx
-        return jsonify(_get_service().sync_code_workspace(params))
-    except Exception as exc:
-        logger.error("code workspace sync failed type=%s", type(exc).__name__)
-        return _error_response(exc)
-
-
-@app.route("/api/v1/resources/code/upsert", methods=["POST"])
-def handle_code_resource_upsert():
-    """Refresh one code path through the existing lifecycle facade."""
-    try:
-        params = _json_object_body()
-        ctx = _build_authenticated_context(params)
-        params["_ctx"] = ctx
-        return jsonify(_get_service().upsert_code_resource(params))
-    except Exception as exc:
-        logger.error("code resource upsert failed type=%s", type(exc).__name__)
-        return _error_response(exc)
-
-
-@app.route("/api/v1/resources/code/search", methods=["POST"])
-def handle_code_resource_search():
-    """Search only imported code resources through active retrieval."""
-    try:
-        params = _json_object_body()
-        ctx = _build_authenticated_context(params)
-        params["_ctx"] = ctx
-        return jsonify(_get_service().search_code_resources(params))
-    except Exception as exc:
-        logger.error("code resource search failed type=%s", type(exc).__name__)
-        return _error_response(exc)
-
-
-@app.route("/api/v1/resources/code/snippet", methods=["POST"])
-def handle_code_resource_snippet():
-    """Return bounded evidence for one exact imported code URI."""
-    try:
-        params = _json_object_body()
-        ctx = _build_authenticated_context(params)
-        params["_ctx"] = ctx
-        return jsonify(_get_service().read_focused_code_snippet(params))
-    except Exception as exc:
-        logger.error("code resource snippet failed type=%s", type(exc).__name__)
-        return _error_response(exc)
-
-
-@app.route("/api/v1/tool_output_original", methods=["POST"])
-def handle_tool_output_original():
-    """Return the current agent's stored original tool output."""
-    params = request.get_json(force=True, silent=True) or {}
-    try:
-        ctx = _build_authenticated_context(params)
-        params["_ctx"] = ctx
-        result = _get_service().read_tool_output_original(params)
-        return jsonify(with_untrusted_data_notice(result))
-    except Exception as exc:
-        logger.error("tool_output_original failed: %s", exc, exc_info=True)
-        return _error_response(exc)
-
-
-@app.route("/api/v1/filter_read", methods=["POST"])
-def handle_filter_read():
-    """Filter a complete Read result and return a bounded replacement."""
-    params = request.get_json(force=True, silent=True) or {}
-    try:
-        ctx = _build_authenticated_context(params)
-        params["_ctx"] = ctx
-        return jsonify(_get_service().filter_read(params))
-    except Exception as exc:
-        logger.error("filter_read failed: %s", exc, exc_info=True)
-        return _error_response(exc)
-
-
-@app.route("/api/v1/filter_bash", methods=["POST"])
-def handle_filter_bash():
-    """Filter supported Bash output without executing the command."""
-    params = request.get_json(force=True, silent=True) or {}
-    try:
-        ctx = _build_authenticated_context(params)
-        params["_ctx"] = ctx
-        return jsonify(_get_service().filter_bash(params))
-    except Exception as exc:
-        logger.error("filter_bash failed: %s", exc, exc_info=True)
         return _error_response(exc)
 
 
@@ -1345,19 +1136,6 @@ def handle_get_session(session_id):
     return jsonify(result)
 
 
-@app.route("/api/v1/sessions/<session_id>", methods=["DELETE"])
-def handle_delete_session(session_id):
-    """Delete one Agent Session and all of its oGMemory-owned resources."""
-    try:
-        params = request.get_json(force=False, silent=True) or {}
-        params["sessionId"] = session_id
-        svc = _get_service()
-        params["_ctx"] = _build_authenticated_context(params)
-        return _lifecycle_result_response(svc.delete_session(params))
-    except Exception as exc:
-        return _error_response(exc)
-
-
 @app.route("/api/v1/sessions/<session_id>/commit", methods=["POST"])
 def handle_commit_session(session_id):
     """Commit session: archive + extract memories."""
@@ -1368,101 +1146,6 @@ def handle_commit_session(session_id):
     params["_ctx"] = ctx
     result = svc.commit_session_buffer(params)
     return _lifecycle_result_response(result)
-
-
-@app.route("/api/v1/sessions/<session_id>/tool-results", methods=["GET"])
-def handle_list_tool_results(session_id):
-    """List verified tool-result artifacts without reading their bodies."""
-    try:
-        params = {key: value for key, value in request.args.items()}
-        params["sessionId"] = session_id
-        svc = _get_service()
-        if not getattr(svc._cfg, "tool_result_externalization_enabled", False):
-            raise ToolResultExternalizationDisabledError(
-                "tool-result externalization is disabled"
-            )
-        params["_ctx"] = _build_authenticated_context(params)
-        payload = svc.list_tool_result_artifacts(params)
-        payload = bound_tool_result_collection_response(
-            payload,
-            "artifacts",
-            svc._cfg.tool_result_http_max_response_chars,
-        )
-        return jsonify(payload)
-    except Exception as exc:
-        return _error_response(exc)
-
-
-@app.route(
-    "/api/v1/sessions/<session_id>/tool-results/<artifact_id>",
-    methods=["GET"],
-)
-def handle_read_tool_result(session_id, artifact_id):
-    """Read a bounded UTF-8 byte range from one artifact."""
-    try:
-        params = {key: value for key, value in request.args.items()}
-        params.update({"sessionId": session_id, "artifactId": artifact_id})
-        svc = _get_service()
-        if not getattr(svc._cfg, "tool_result_externalization_enabled", False):
-            raise ToolResultExternalizationDisabledError(
-                "tool-result externalization is disabled"
-            )
-        full = _query_bool(params.pop("full", None))
-        response_limit = svc._cfg.tool_result_http_max_response_chars
-        requested_length = response_limit if full else int(
-            params.get("length_bytes", svc._cfg.tool_result_read_default_bytes)
-        )
-        if requested_length < 1:
-            raise ValueError("length_bytes must be positive")
-        params["length_bytes"] = min(
-            response_limit if full else requested_length,
-            response_limit,
-        )
-        if full:
-            params["offset_bytes"] = 0
-        params["_ctx"] = _build_authenticated_context(params)
-        payload = svc.read_tool_result_artifact(params)
-        payload = bound_tool_result_read_response(payload, response_limit)
-        payload = svc.attest_tool_result_source(payload, params["_ctx"])
-        return _jsonify_tool_result_read(payload)
-    except Exception as exc:
-        return _error_response(exc)
-
-
-@app.route("/api/v1/sessions/<session_id>/tool-results/search", methods=["POST"])
-def handle_search_tool_results(session_id):
-    """Search bounded relevant chunks without injecting complete artifacts."""
-    try:
-        params = request.get_json(force=True, silent=True) or {}
-        params["sessionId"] = session_id
-        svc = _get_service()
-        if not getattr(svc._cfg, "tool_result_externalization_enabled", False):
-            raise ToolResultExternalizationDisabledError(
-                "tool-result externalization is disabled"
-            )
-        top_k = int(params.get("top_k", svc._cfg.tool_result_search_top_k))
-        if top_k < 1 or top_k > 20:
-            raise ValueError("top_k must be between 1 and 20")
-        response_limit = svc._cfg.tool_result_http_max_response_chars
-        max_chars = int(params.get("max_chars", 20_000))
-        if max_chars < 1:
-            raise ValueError("max_chars must be positive")
-        params["top_k"] = top_k
-        params["max_chars"] = min(max_chars, response_limit)
-        params["_ctx"] = _build_authenticated_context(params)
-        payload = svc.search_tool_result_artifacts(params)
-        payload = bound_tool_result_collection_response(
-            payload,
-            "results",
-            response_limit,
-        )
-        payload["results"] = [
-            svc.attest_tool_result_source(row, params["_ctx"])
-            for row in payload.get("results", [])
-        ]
-        return jsonify(payload)
-    except Exception as exc:
-        return _error_response(exc)
 
 
 @app.route("/api/v1/sessions/<session_id>/context", methods=["GET"])
@@ -1481,8 +1164,6 @@ def handle_get_session_context(session_id):
 # Generic dispatch endpoint (for forward-compat with new methods)
 @app.route("/api/v1/call/<method>", methods=["POST"])
 def handle_call(method: str):
-    if method == "delete_session" or method in _CODE_MEMORY_CANONICAL_FACADES:
-        return jsonify({"error": f"unknown method: {method}"}), 404
     svc = _get_service()
     handler = getattr(svc, method, None)
     if handler is None or not callable(handler):

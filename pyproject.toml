@@ -90,7 +90,6 @@ packages = [
     "server",
     "session",
     "skills",
-    "features",
     "scene",
 ]
 
@@ -109,7 +108,6 @@ include = [
     "/server",
     "/session",
     "/skills",
-    "/features",
     "/scene",
 ]
 

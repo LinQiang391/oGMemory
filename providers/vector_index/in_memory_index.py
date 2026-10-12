@@ -180,7 +180,7 @@ class InMemoryVectorIndex(VectorIndex):
                         return False
                 elif record.level != expected:
                     return False
-            elif key in ("account_id", "owner_space", "resource_type"):
+            elif key in ("account_id", "owner_space"):
                 actual = record.filters.get(key)
                 if isinstance(expected, list):
                     if actual not in expected:
@@ -322,8 +322,6 @@ class InMemoryVectorIndex(VectorIndex):
             filters["context_type"] = query.context_type
         if query.categories:
             filters["category"] = query.categories
-        if query.resource_type:
-            filters["resource_type"] = query.resource_type
 
         # Generate mock vector from query text
         query_vector = self._mock_vector(query.text)

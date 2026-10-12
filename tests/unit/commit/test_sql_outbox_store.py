@@ -323,25 +323,3 @@ def test_is_event_current_commits_read_transaction(mock_sql_outbox_store):
 
     conn.commit.assert_called_once()
     conn.rollback.assert_not_called()
-
-
-def test_build_delete_event_contains_complete_record_ids(mock_sql_outbox_store):
-    store, _, _, _ = mock_sql_outbox_store
-    uri = "ctx://acme/resources/chunk-a"
-
-    event = store.build_delete_event(uri)
-
-    assert event.event_type == "DELETE_CONTEXT"
-    assert len(event.payload["ids_to_delete"]) == 3
-
-
-def test_is_event_current_can_match_event_and_node_uri(mock_sql_outbox_store):
-    store, _, conn, cursor = mock_sql_outbox_store
-    cursor.fetchone.return_value = (1,)
-
-    assert store.is_event_current("evt-1", "ctx://acme/resources/chunk-a") is True
-
-    sql, params = cursor.execute.call_args.args
-    assert "event_id = %s AND uri = %s" in sql
-    assert params == ("evt-1", "ctx://acme/resources/chunk-a")
-    conn.commit.assert_called_once()

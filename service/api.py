@@ -733,8 +733,6 @@ class ReadAPI:
         include_debug: bool = False,
         mode: str = RetrieverMode.QUICK,
         fill_content_for_top_k: int = 0,
-        context_type: str | None = None,
-        resource_type: str | None = None,
     ) -> SearchMemoryResult:
         if not (query or "").strip():
             raise CoreValidationError("query", "query must not be empty")
@@ -755,8 +753,6 @@ class ReadAPI:
             score_threshold=score_threshold,
             mode=mode,
             fill_content_for_top_k=fill_content_for_top_k,
-            context_type=context_type,
-            resource_type=resource_type,
         )
 
         if not include_debug:

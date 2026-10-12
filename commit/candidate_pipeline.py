@@ -4,6 +4,7 @@ Runs all CandidateExtractor implementations in parallel and aggregates results.
 """
 
 from concurrent.futures import ThreadPoolExecutor, as_completed
+from typing import Callable
 
 from core.candidate_dedup import merge_duplicate_event_sources
 from core.interfaces import CandidateExtractor
@@ -63,15 +64,9 @@ class CandidatePipeline:
             List of CandidateMemory from all extractors
         """
         if parallel:
-            return self._extract_parallel(
-                messages, ctx, session_time, session_summary, tool_stats_text,
-                archive_id,
-            )
+            return self._extract_parallel(messages, ctx, session_time, session_summary, tool_stats_text, archive_id)
         else:
-            return self._extract_serial(
-                messages, ctx, session_time, session_summary, tool_stats_text,
-                archive_id,
-            )
+            return self._extract_serial(messages, ctx, session_time, session_summary, tool_stats_text, archive_id)
 
     def _extract_parallel(
         self,
@@ -101,9 +96,8 @@ class CandidatePipeline:
             # Submit all extraction jobs
             futures = {
                 executor.submit(
-                    self._call_extractor,
-                    extractor, messages, ctx, session_time, session_summary,
-                    tool_stats_text, archive_id,
+                    extractor.extract, messages, ctx, session_time,
+                    session_summary, tool_stats_text, archive_id,
                 ): extractor
                 for extractor in self._extractors
             }
@@ -151,8 +145,8 @@ class CandidatePipeline:
 
         for extractor in self._extractors:
             try:
-                candidates = self._call_extractor(
-                    extractor, messages, ctx, session_time,
+                candidates = extractor.extract(
+                    messages, ctx, session_time,
                     session_summary, tool_stats_text, archive_id,
                 )
                 all_candidates.extend(candidates)
@@ -171,26 +165,6 @@ class CandidatePipeline:
     def _validate_candidates(candidates, ctx):
         return [validate_candidate(validate_attribution(candidate, user_id=ctx.user_id if ctx else None))
                 for candidate in candidates]
-
-    @staticmethod
-    def _call_extractor(
-        extractor,
-        messages,
-        ctx,
-        session_time,
-        session_summary,
-        tool_stats_text,
-        archive_id,
-    ):
-        """Call one extractor through the stable candidate-extraction contract."""
-        return extractor.extract(
-            messages,
-            ctx,
-            session_time,
-            session_summary,
-            tool_stats_text,
-            archive_id,
-        )
 
     def filter_by_confidence(
         self,

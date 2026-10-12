@@ -39,10 +39,6 @@ Use `remote` when oG-Memory is already running.
           "traceCaptureContent": true,
           "prefetchEnabled": true,
           "prefetchTopK": 5,
-          "toolResultExternalizationEnabled": false,
-          "toolResultFirstViewExternalizationEnabled": true,
-          "toolResultFirstViewMinChars": 20000,
-          "semanticTurnMode": "user_message",
           "compactTakeoverEnabled": true,
           "summaryMaxChars": 4000,
           "shortTermIndexMode": "sync"
@@ -52,27 +48,6 @@ Use `remote` when oG-Memory is already running.
   }
 }
 ```
-
-`toolResultExternalizationEnabled=false` preserves the original OpenClaw
-message and lifecycle path. Enable it only when the oGMemory server's
-`tool_result_externalization.enabled` setting is also enabled.
-
-With first-view externalization enabled, OpenClaw's trusted tool-result
-middleware sends each result at or above `toolResultFirstViewMinChars` to
-oGMemory before its first model request. oGMemory persists the complete result
-as an owner/session/Turn/tool-call-bound Artifact and returns a bounded
-multiresolution stub. The stub retains deterministic synopsis, key facts,
-selected evidence, critical records and exact byte ranges; callers can search
-Artifact indexes and recall only the precise matching fragments when more
-detail is required. Store, transport or identity failures fail open and retain
-the original result.
-
-For OpenClaw 2026.6.10, keep `semanticTurnMode=user_message`. The final
-`afterTurn()` carries the complete user-to-terminal-assistant delta and
-`prePromptMessageCount`. oGMemory's owner-bound HMAC Turn Ledger validates that
-ordered delta, provides stable source identities across retries/restarts and
-reuses any first-view Artifact without duplicating it. Individual results
-below the configured single-result threshold remain inline.
 
 ### Local Mode
 
@@ -93,10 +68,6 @@ Use `local` when the OpenClaw gateway should start AGFS and ContextEngine.
           "agfsServerDir": "/path/to/oG-Memory/agfs",
           "agfsDataDir": "/path/to/ogmem-data",
           "contextEnginePort": 8090,
-          "toolResultExternalizationEnabled": false,
-          "toolResultFirstViewExternalizationEnabled": true,
-          "toolResultFirstViewMinChars": 20000,
-          "semanticTurnMode": "user_message",
           "llmProvider": "openai",
           "llmApiKey": "sk-...",
           "llmBaseUrl": "https://api.openai.com/v1",
@@ -173,22 +144,9 @@ Main lifecycle behavior:
 | OpenClaw method | oG-Memory calls | Behavior |
 | --- | --- | --- |
 | `assemble()` | optional `/prefetch`, then `/compose` | Stages quick retrieval hits, then returns layered messages for Profile, Archive History, Session State, and Working Set. |
-| `afterTurn()` | `/after_turn` | Sends completed turn messages for extraction, persistence and trusted tool-result identity reconciliation. |
+| `afterTurn()` | `/after_turn` | Sends completed turn messages for incremental extraction and persistence. |
 | `compact()` | `/prepare_compaction`, then `/compact` when takeover is enabled | Runs pre-compaction extraction, validates a one-time prepare token, commits/archive synchronously, and returns a compact summary. |
-| `dispose()` | none | Releases per-run resources without ending the memory session. The `/dispose` call runs on every OpenClaw `session_end`; only an explicit `reason=deleted` additionally deletes the oGMemory Session and its tool-result Artifacts. |
-
-When Artifact persistence is unavailable, an attested `after_turn` checkpoint is
-sent once and retried at most once. After that retry fails, the adapter
-uses the server-issued, owner- and checkpoint-bound HMAC fallback token to
-persist that checkpoint's original messages through the default SessionBuffer
-and memory-extraction path. The fallback applies only to that failed checkpoint;
-later checkpoints continue attempting normal externalization. If the oGMemory
-service itself is unreachable, no authorized fallback can be completed.
-
-Session lifecycle conflicts use typed HTTP 409 responses. A transient
-`session_replaced` conflict is retried only when the server explicitly marks it
-retryable. A `session_deleting` conflict is never replayed, preventing a stale
-`after_turn` checkpoint from recreating a Session after explicit deletion.
+| `dispose()` | none | Releases per-run resources without ending the memory session. The `/dispose` call runs on OpenClaw's `session_end` event. |
 
 `compactTakeoverEnabled=false` keeps OpenClaw responsible for final compact generation, but the plugin still calls `prepare_compaction` so oG-Memory can extract the delta before OpenClaw compacts the local transcript.
 
@@ -201,8 +159,6 @@ openclaw_context_engine_plugin/
 ├── process.js               # Local-mode health checks, port probing, process helpers
 ├── compact.test.js          # Node tests for config, prefetch, and compact takeover behavior
 ├── trace.test.js            # Node tests for trace hooks, redaction, and upload behavior
-├── source-identity.test.js  # Trusted lifecycle identity and fail-open tests
-├── first-view-externalization.test.js # Tool-result middleware tests
 ├── openclaw.plugin.json     # Plugin manifest and config schema
 ├── package.json
 ├── ENV.md                   # Environment variable reference

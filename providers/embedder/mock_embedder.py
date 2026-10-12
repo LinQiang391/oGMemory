@@ -9,6 +9,7 @@ from typing import Final
 
 from core.interfaces import Embedder
 
+
 # Fixed embedding dimension for mock (matches common small models)
 MOCK_EMBEDDING_DIM: Final[int] = 384
 
@@ -46,18 +47,6 @@ class MockEmbedder(Embedder):
             results.append(vector)
 
         return results
-
-    def embed_texts_with_timeout(
-        self,
-        texts: list[str],
-        *,
-        timeout_seconds: float,
-    ) -> list[list[float]]:
-        """Expose the non-blocking test provider to candidate deadline callers."""
-
-        if timeout_seconds <= 0:
-            raise TimeoutError("embedding request deadline elapsed")
-        return self.embed_texts(texts)
 
     def _hash_to_vector(self, text: str) -> list[float]:
         """Convert text to deterministic vector via hash.
@@ -105,15 +94,3 @@ class ZeroEmbedder(Embedder):
             List of zero vectors, one per input text.
         """
         return [[0.0] * self._dimension for _ in texts]
-
-    def embed_texts_with_timeout(
-        self,
-        texts: list[str],
-        *,
-        timeout_seconds: float,
-    ) -> list[list[float]]:
-        """Expose the non-blocking test provider to candidate deadline callers."""
-
-        if timeout_seconds <= 0:
-            raise TimeoutError("embedding request deadline elapsed")
-        return self.embed_texts(texts)

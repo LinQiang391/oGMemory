@@ -16,13 +16,7 @@
 # from single quotes or other shell-sensitive bytes in tool/content fields).
 set -u
 
-# The code-only profile intentionally owns no generic after-turn lifecycle.
-# Keep this ahead of stdin, mktemp, and detached-child setup so Stop is inert.
 shopt -s nocasematch
-if [[ "${OGMEM_CODE_MEMORY_ONLY:-}" =~ ^[[:space:]]*(1|true|yes)[[:space:]]*$ ]]; then
-  exit 0
-fi
-
 # Match Python's boolean parser. Unset preserves capture; any explicit value
 # other than 1/true/yes disables it before reading stdin or spawning a child.
 if [[ -v OGMEM_AUTO_CAPTURE ]] && ! [[ "$OGMEM_AUTO_CAPTURE" =~ ^[[:space:]]*(1|true|yes)[[:space:]]*$ ]]; then

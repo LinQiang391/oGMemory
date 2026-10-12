@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import logging
 from types import SimpleNamespace
 from unittest.mock import Mock
 
@@ -60,7 +59,6 @@ class TestOpenAIEmbedder:
         assert call_kwargs["base_url"] == "https://example.com/v1"
         assert embedder.dimension == openai_embedder_module.EMBEDDING_3_LARGE_DIM
         assert embedder.model == "text-embedding-3-large"
-        assert embedder.max_input_chars == openai_embedder_module.DEFAULT_MAX_INPUT_CHARS
 
     def test_init_falls_back_to_environment_api_key(
         self,
@@ -101,76 +99,6 @@ class TestOpenAIEmbedder:
             model="custom-model",
         )
 
-    def test_deadline_aware_embedder_uses_remaining_timeout_and_disables_retries(
-        self,
-        fake_client: Mock,
-    ):
-        deadline_client = Mock()
-        deadline_client.embeddings.create.return_value = _embedding_response([[0.1, 0.2]])
-        fake_client.with_options.return_value = deadline_client
-        embedder = openai_embedder_module.OpenAIEmbedder(
-            api_key="test-key",
-            model="custom-model",
-            dimension=2,
-        )
-
-        result = embedder.embed_texts_with_timeout(["hello"], timeout_seconds=4.5)
-
-        assert result == [[0.1, 0.2]]
-        fake_client.with_options.assert_called_once()
-        options = fake_client.with_options.call_args.kwargs
-        assert 0 < options['timeout'] <= 4.5
-        assert options['max_retries'] == 0
-        deadline_client.embeddings.create.assert_called_once_with(
-            input=["hello"],
-            model="custom-model",
-        )
-
-    def test_deadline_aware_embedder_rejects_expired_budget_before_provider_call(
-        self,
-        fake_client: Mock,
-    ):
-        embedder = openai_embedder_module.OpenAIEmbedder(api_key="test-key")
-
-        with pytest.raises(TimeoutError, match="deadline"):
-            embedder.embed_texts_with_timeout(["hello"], timeout_seconds=0)
-
-        fake_client.with_options.assert_not_called()
-
-    def test_embed_texts_applies_configured_qwen_input_cap_before_provider_call(
-        self,
-        fake_client: Mock,
-    ):
-        fake_client.embeddings.create.return_value = _embedding_response([[0.1], [0.2]])
-        # The formal Qwen endpoint is capped at 2,048 tokens. 8,000 chars is a
-        # conservative provider-side estimate below 2,048 * 4 chars/token.
-        qwen_max_input_chars = 8_000
-        long_text = "x" * (qwen_max_input_chars + 500)
-        normal_text = "normal input remains unchanged"
-        texts = [long_text, normal_text]
-        embedder = openai_embedder_module.OpenAIEmbedder(
-            api_key="test-key",
-            model="Qwen/Qwen3-Embedding-0.6B",
-            dimension=1,
-            max_input_chars=qwen_max_input_chars,
-        )
-
-        result = embedder.embed_texts(texts)
-
-        assert result == [[0.1], [0.2]]
-        assert texts == [long_text, normal_text]
-        fake_client.embeddings.create.assert_called_once_with(
-            input=[long_text[:qwen_max_input_chars], normal_text],
-            model="Qwen/Qwen3-Embedding-0.6B",
-        )
-
-    def test_embed_texts_rejects_non_positive_input_cap(self):
-        with pytest.raises(ValueError, match="max_input_chars must be positive"):
-            openai_embedder_module.OpenAIEmbedder(
-                api_key="test-key",
-                max_input_chars=0,
-            )
-
     def test_embed_texts_rejects_batches_larger_than_limit(self, fake_client: Mock):
         embedder = openai_embedder_module.OpenAIEmbedder(api_key="test-key")
 
@@ -186,96 +114,13 @@ class TestOpenAIEmbedder:
         with pytest.raises(ValueError, match="Embedding dimension mismatch"):
             embedder.embed_texts(["hello"])
 
-    def test_embed_failure_log_keeps_raw_provider_message_private(
-        self,
-        fake_client: Mock,
-        caplog: pytest.LogCaptureFixture,
-    ):
-        secret_message = "upstream failed for /private/workspace with token=secret"
-        fake_client.embeddings.create.side_effect = RuntimeError(secret_message)
-        embedder = openai_embedder_module.OpenAIEmbedder(api_key="test-key")
-
-        with caplog.at_level(logging.ERROR, logger="providers.embedder.openai_embedder"):
-            with pytest.raises(RuntimeError, match="upstream failed"):
-                embedder.embed_texts(["hello"])
-
-        assert "RuntimeError" in caplog.text
-        assert secret_message not in caplog.text
-        assert "/private/workspace" not in caplog.text
-
     def test_unknown_model_dimension_defaults_to_ada_size(self):
         embedder = object.__new__(openai_embedder_module.OpenAIEmbedder)
 
         assert embedder._get_model_dimension("unknown") == openai_embedder_module.ADA_002_DIM
 
-    def test_multimodal_deadline_budget_is_shared_across_subrequests(self, monkeypatch):
-        class Clock:
-            now = 0.0
-
-            def monotonic(self):
-                return self.now
-
-        class Response:
-            def raise_for_status(self):
-                return None
-
-            def json(self):
-                return {"data": {"embedding": [0.1, 0.2]}}
-
-        class HttpClient:
-            request_timeouts = []
-
-            def __init__(self, *, timeout):
-                assert timeout == 120.0
-
-            def __enter__(self):
-                return self
-
-            def __exit__(self, *args):
-                return False
-
-            def post(self, url, *, json, headers, timeout):
-                del url, json, headers
-                self.request_timeouts.append(timeout)
-                clock.now += 4.0
-                return Response()
-
-        import httpx
-
-        clock = Clock()
-        embedder = openai_embedder_module.OpenAIEmbedder(
-            api_key="test-key",
-            multimodal=True,
-            dimension=2,
-        )
-        monkeypatch.setattr(openai_embedder_module.time, "monotonic", clock.monotonic)
-        monkeypatch.setattr(httpx, "Client", HttpClient)
-
-        result = embedder.embed_texts_with_timeout(["one", "two"], timeout_seconds=10.0)
-
-        assert result == [[0.1, 0.2], [0.1, 0.2]]
-        assert HttpClient.request_timeouts == [10.0, 6.0]
-
 
 class TestCachedOpenAIEmbedder:
-    def test_inherited_deadline_capability_dispatches_through_cached_override(
-        self,
-        fake_client: Mock,
-    ):
-        deadline_client = Mock()
-        deadline_client.embeddings.create.return_value = _embedding_response([[1.0]])
-        fake_client.with_options.return_value = deadline_client
-        embedder = openai_embedder_module.CachedOpenAIEmbedder(
-            api_key="test-key",
-            dimension=1,
-        )
-
-        assert embedder.embed_texts_with_timeout(["value"], timeout_seconds=3.0) == [[1.0]]
-        fake_client.with_options.assert_called_once()
-        options = fake_client.with_options.call_args.kwargs
-        assert 0 < options['timeout'] <= 3.0
-        assert options['max_retries'] == 0
-
     def test_cached_embedder_reuses_cached_vectors_and_preserves_order(self, fake_client: Mock):
         fake_client.embeddings.create.side_effect = [
             _embedding_response([[1.0, 1.1], [2.0, 2.1]]),

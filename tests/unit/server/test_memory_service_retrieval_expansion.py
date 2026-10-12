@@ -57,7 +57,6 @@ def search(read_api):
             session_id="session", trace_id="trace",
             visible_owner_spaces=("user:user", "agent:agent"),
         ),
-        context_type="MEMORY",
     )
 
 

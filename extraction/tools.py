@@ -92,154 +92,6 @@ class _CandidateValidationError(ToolCallProtocolError):
 _DEFAULT_SCHEMA_REGISTRY: SchemaRegistry | None = None
 EXTRACTION_TOOLS: list[dict] = []
 TOOL_TO_CATEGORY: dict[str, tuple[str, str]] = {}
-_TOOL_RESULT_STUB_BLOCK = re.compile(
-    r"\[ogmemory-tool-result v=2\]\r?\n.*?\r?\n\[/ogmemory-tool-result\]",
-    re.DOTALL,
-)
-_USER_PREFERENCE_CUE = re.compile(
-    r"(?:\b(?:i|i'm|i am|i'd|i would|my)\b[^.!?;\n]{0,100}"
-    r"\b(?:prefer|like|love|enjoy|dislike|hate|want|choose|use|favorite|favourite)\w*\b)"
-    r"|(?:\b(?:prefer|like|love|enjoy|dislike|hate|want|choose|use)\w*\b"
-    r"[^.!?;\n]{0,60}\b(?:i|my)\b)",
-    re.IGNORECASE,
-)
-_CJK_USER_PREFERENCE_CUE = re.compile(
-    r"(?:我|本人|俺|咱|私).{0,40}"
-    r"(?:更喜欢|不喜欢|喜欢|偏好|更爱|爱用|常用|习惯|倾向|讨厌|希望|想要|选择)",
-)
-_USER_PROFILE_CUE = re.compile(
-    r"\b(?:i am|i'm|my name is|i work as|i work at|i work in|i live in|"
-    r"i am from|i'm from|i study|i have|my (?:job|occupation|role|location|"
-    r"age|background) is)\b",
-    re.IGNORECASE,
-)
-_CJK_USER_PROFILE_CUE = re.compile(
-    r"(?:我是|我叫|我住在|我来自|我有|我的(?:名字|职业|工作|住址|所在地|年龄|背景)|"
-    r"我在.{0,20}(?:工作|学习))",
-)
-_USER_SELF_REPORT_QUESTION = re.compile(
-    r"^\s*(?:do|did|can|could|would|should|is|are|am|was|were|have|has|will)\b"
-    r"|\b(?:whether|if)\s+i\b",
-    re.IGNORECASE,
-)
-_CJK_SELF_REPORT_QUESTION = re.compile(r"(?:是否|是不是|能否|吗|么)")
-_USER_SENTENCE_BOUNDARY = re.compile(r"[.!?;。！？；\n]+")
-_LATIN_SUPPORT_TERM = re.compile(r"[a-z0-9]+", re.IGNORECASE)
-_CJK_SUPPORT_RUN = re.compile(r"[\u3400-\u4dbf\u4e00-\u9fff\uf900-\ufaff]{2,}")
-_GENERIC_SENSITIVE_TERMS = frozenset({
-    "a", "am", "an", "and", "are", "choose", "chooses", "content",
-    "dislike", "dislikes", "enjoy", "enjoys", "favorite", "favourite",
-    "for", "hate", "hates", "i", "identity", "information", "is", "like",
-    "likes", "love", "loves", "me", "my", "of", "person", "preference",
-    "preferences", "prefer", "preferred", "prefers", "profile", "result",
-    "results", "message", "messages", "assistant", "the", "to", "tool", "tools",
-    "output", "outputs", "use", "uses", "user", "using", "want", "wants",
-    "would",
-})
-_GENERIC_CJK_SENSITIVE_PHRASES = (
-    "更喜欢", "不喜欢", "用户", "本人", "喜欢", "偏好", "更爱", "爱用",
-    "常用", "习惯", "倾向", "讨厌", "希望", "想要", "选择", "身份", "信息",
-    "画像", "个人", "我", "俺", "咱", "私",
-)
-
-
-def _direct_sensitive_support_terms(value: str) -> set[str]:
-    """Extract topic-bearing terms while discarding generic identity wording."""
-    normalized = value.casefold().replace("_", " ")
-    terms = {
-        term
-        for term in _LATIN_SUPPORT_TERM.findall(normalized)
-        if (
-            len(term) >= 3
-            and not term.isdigit()
-            and term not in _GENERIC_SENSITIVE_TERMS
-        )
-    }
-    cjk_text = normalized
-    for phrase in _GENERIC_CJK_SENSITIVE_PHRASES:
-        cjk_text = cjk_text.replace(phrase, " ")
-    for run in _CJK_SUPPORT_RUN.findall(cjk_text):
-        terms.update(run[index:index + 2] for index in range(len(run) - 1))
-    return terms
-
-
-def _has_direct_topic_overlap(
-    candidate_terms: set[str],
-    evidence_terms: set[str],
-    *,
-    strict_single_term: bool,
-) -> bool:
-    overlap = candidate_terms & evidence_terms
-    if any(_CJK_SUPPORT_RUN.fullmatch(term) for term in overlap):
-        return True
-    latin_overlap = [term for term in overlap if term.isascii()]
-    minimum_single_length = 6 if strict_single_term else 4
-    return bool(
-        any(len(term) >= minimum_single_length for term in latin_overlap)
-        or len(latin_overlap) >= 2
-    )
-
-
-def _sensitive_candidate_has_direct_user_support(
-    candidate: CandidateMemory,
-    user_text: str,
-    evidence_quote: str | None,
-) -> bool:
-    """Require a declarative first-person statement with matching topic terms."""
-    candidate_terms = _direct_sensitive_support_terms("\n".join((
-        candidate.routing_key,
-        candidate.abstract,
-        candidate.overview,
-        candidate.content,
-    )))
-    primary_candidate_terms = _direct_sensitive_support_terms("\n".join((
-        candidate.routing_key,
-        candidate.abstract,
-    )))
-    normalized_quote = " ".join(
-        str(evidence_quote or "").split()
-    ).casefold().strip(" .!?;。！？；\"'“”‘’")
-    if not candidate_terms or (normalized_quote and not primary_candidate_terms):
-        return False
-    for segment in _USER_SENTENCE_BOUNDARY.split(user_text):
-        sentence = segment.strip()
-        if not sentence:
-            continue
-        if (
-            _USER_SELF_REPORT_QUESTION.search(sentence)
-            or _CJK_SELF_REPORT_QUESTION.search(sentence)
-        ):
-            continue
-        if candidate.category == "profile":
-            explicit_self_report = bool(
-                _USER_PROFILE_CUE.search(sentence)
-                or _CJK_USER_PROFILE_CUE.search(sentence)
-            )
-        else:
-            explicit_self_report = bool(
-                _USER_PREFERENCE_CUE.search(sentence)
-                or _CJK_USER_PREFERENCE_CUE.search(sentence)
-            )
-        if not explicit_self_report:
-            continue
-        normalized_sentence = " ".join(sentence.split()).casefold()
-        if normalized_quote and normalized_quote not in normalized_sentence:
-            continue
-        sentence_terms = _direct_sensitive_support_terms(sentence)
-        if not _has_direct_topic_overlap(
-            candidate_terms,
-            sentence_terms,
-            strict_single_term=False,
-        ):
-            continue
-        if normalized_quote and not _has_direct_topic_overlap(
-            primary_candidate_terms,
-            _direct_sensitive_support_terms(normalized_quote),
-            strict_single_term=True,
-        ):
-            continue
-        return True
-    return False
 
 
 def _get_default_schema_registry() -> SchemaRegistry:
@@ -270,7 +122,6 @@ class _Span:
     categories: list[str] = field(default_factory=list)
     message_ids: list[str] = field(default_factory=list)
     safe_user_text: str = ""
-    had_externalized_stub: bool = False
     focused_messages: list[dict] = field(default_factory=list)
     prefetch_result: PrefetchResult | None = None
     source_context: str = ""
@@ -561,8 +412,7 @@ class Extractor:
 
         # Phase 2: structure each span
         candidates = self._structure_spans(
-            spans, messages, language, session_time, session_summary,
-            tool_stats_text, ctx, archive_id,
+            spans, messages, language, session_time, session_summary, tool_stats_text, ctx, archive_id,
         )
 
         from extraction.source_attribution import route_source_preferences
@@ -1115,6 +965,7 @@ class Extractor:
         seen: dict[str | tuple[str, int, int], list[_PreparedSpan]] = {}
         retain_source_ranges = self._reconcile_source_occurrences_enabled()
         skipped = 0
+
         for span in spans:
             prepared = self._prepare_span(
                 span, messages, language,
@@ -1135,23 +986,7 @@ class Extractor:
                         prepared.span.categories,
                     )
                     existing.span.message_ids = _merge_unique_categories(
-                        existing.span.message_ids,
-                        prepared.span.message_ids,
-                    )
-                    safe_user_texts = [
-                        value
-                        for value in (
-                            existing.span.safe_user_text,
-                            prepared.span.safe_user_text,
-                        )
-                        if value
-                    ]
-                    existing.span.safe_user_text = "\n".join(
-                        dict.fromkeys(safe_user_texts)
-                    )
-                    existing.span.had_externalized_stub = bool(
-                        existing.span.had_externalized_stub
-                        or prepared.span.had_externalized_stub
+                        existing.span.message_ids, prepared.span.message_ids,
                     )
                     skipped += 1
                     logger.info(
@@ -1241,7 +1076,7 @@ class Extractor:
                 "start": span.start, "end": span.end, "message_ids": list(span.message_ids),
                 "source_context": source_context, "session_time": session_time.isoformat(),
                 "selected_user_messages": selected_users,
-                "known_origin": bool(selected_users) and not span.had_externalized_stub
+                "known_origin": bool(selected_users)
                 and all(isinstance(message.get("content"), str) and isinstance(message.get("id"), str)
                         and bool(message["id"]) and ids[message["id"]] == 1
                         for message in span_messages if message.get("role") == "user"),
@@ -1298,13 +1133,6 @@ class Extractor:
         focused = (messages if self._profile_snapshot_enabled and "profile" in span.categories
                    else messages[ctx_start: ctx_end + 1])
         span.focused_messages = focused
-        span.had_externalized_stub = any(
-            _TOOL_RESULT_STUB_BLOCK.search(
-                self._content_to_str(message.get("content", ""))
-            )
-            is not None
-            for message in focused
-        )
 
         conversation = self._format_conversation(
             focused, session_time,
@@ -1755,32 +1583,8 @@ class Extractor:
         archive_id: str | None,
     ) -> None:
         """Assign provenance ID to all candidates from a single span."""
-        if not span:
+        if not archive_id or not span or not span.message_ids:
             return
-        filter_sensitive = span.had_externalized_stub
-        if filter_sensitive:
-            retained = []
-            for candidate in candidates:
-                if candidate.category not in {"profile", "preference"}:
-                    retained.append(candidate)
-                    continue
-                supported_by_user = all(
-                    (str(step.evidence_quote or "").strip() or step.category == "preference")
-                    and _sensitive_candidate_has_direct_user_support(
-                        step, span.safe_user_text, step.evidence_quote,
-                    )
-                    for step in incremental_source_steps(candidate)
-                )
-                if supported_by_user:
-                    retained.append(candidate)
-                    continue
-                logger.warning(
-                    "Dropped sensitive candidate without selected-span user support: "
-                    "category=%s routing_key=%s",
-                    candidate.category,
-                    candidate.routing_key,
-                )
-            candidates[:] = retained
         if archive_id and span.message_ids:
             from core.provenance_resolver import ProvenanceResolver
             prov_id = ProvenanceResolver.build_id(

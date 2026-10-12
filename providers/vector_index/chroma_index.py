@@ -15,7 +15,6 @@ from typing import Any
 
 from core.interfaces import VectorIndex
 from core.models import IndexRecord, SeedHit
-from core.resource_identity import CODE_INDEX_METADATA_FIELDS
 
 logger = logging.getLogger(__name__)
 
@@ -278,17 +277,18 @@ class ChromaVectorIndex(VectorIndex):
             "who",
             "where",
             "routing_key",
-            *CODE_INDEX_METADATA_FIELDS,
         ):
             val = record.metadata.get(key) if record.metadata else None
             if val is not None:
                 meta[key] = val
-        sanitized: dict[str, str | int | float | bool] = {}
+        sanitized = {}
         for k, v in meta.items():
             if isinstance(v, bool):
                 sanitized[k] = v
             elif isinstance(v, (int, float, str)):
                 sanitized[k] = v
+            elif v is not None:
+                sanitized[k] = str(v)
         return sanitized
 
     @staticmethod
@@ -300,7 +300,7 @@ class ChromaVectorIndex(VectorIndex):
                     conditions.append({"level": {"$in": expected}})
                 else:
                     conditions.append({"level": expected})
-            elif key in ("account_id", "owner_space", "resource_type", "uri"):
+            elif key in ("account_id", "owner_space", "uri"):
                 if isinstance(expected, list):
                     conditions.append({key: {"$in": expected}})
                 else:

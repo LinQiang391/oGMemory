@@ -8,11 +8,11 @@ from __future__ import annotations
 
 import logging
 import re
-from collections.abc import Sequence
+from typing import Sequence
 
 from core.enums import ContextType
 from core.errors import ValidationError
-from core.models import RequestContext, RetrievalConfig, TypedQuery
+from core.models import RetrievalConfig, RequestContext, TypedQuery
 from retrieval.intent_classifier import RetrievalIntentClassifier
 
 logger = logging.getLogger(__name__)
@@ -73,8 +73,6 @@ class QueryPlanner:
         hints: dict | None = None,
         categories: list[str] | None = None,
         top_k: int | None = None,
-        context_type: str | None = None,
-        resource_type: str | None = None,
     ) -> list[TypedQuery]:
         query = sanitize_query(query or "")
         if not query:
@@ -87,43 +85,16 @@ class QueryPlanner:
                 f"top_k={effective_top_k} exceeds maximum {self.config.max_top_k}",
             )
 
-        context_type_override = (context_type or "").strip().upper() or None
-        valid_context_types = {member.value for member in ContextType}
-        if context_type_override and context_type_override not in valid_context_types:
-            raise ValidationError("context_type", "unsupported context type override")
-        normalized_resource_type = (resource_type or "").strip() or None
-        if normalized_resource_type and context_type_override != ContextType.RESOURCE.value:
-            raise ValidationError(
-                "resource_type",
-                "resource_type requires context_type=RESOURCE",
-            )
-
         # Try semantic decomposition for complex queries
         sub_queries = self._decompose(query)
         if len(sub_queries) > 1:
             logger.info("[QueryPlanner] decomposed '%s' into %d sub-queries: %s", query, len(sub_queries), sub_queries)
             return [
                 self._make_query(
-                    sq,
-                    context_type_override or ContextType.MEMORY.value,
-                    ctx,
-                    categories=categories,
-                    top_k=effective_top_k,
-                    resource_type=normalized_resource_type,
+                    sq, ContextType.MEMORY.value, ctx,
+                    categories=categories, top_k=effective_top_k,
                 )
                 for sq in sub_queries
-            ]
-
-        if context_type_override:
-            return [
-                self._make_query(
-                    query,
-                    context_type_override,
-                    ctx,
-                    categories=categories,
-                    top_k=effective_top_k,
-                    resource_type=normalized_resource_type,
-                )
             ]
 
         matched_types = self._classify(query)
@@ -132,9 +103,7 @@ class QueryPlanner:
             return [
                 self._make_query(
                     query, matched_types[0], ctx,
-                    categories=categories,
-                    top_k=effective_top_k,
-                    resource_type=None,
+                    categories=categories, top_k=effective_top_k,
                 )
             ]
 
@@ -142,14 +111,7 @@ class QueryPlanner:
         # instead of triple-query to avoid 3x embedding load and timeouts.
         logger.info("[QueryPlanner] matched %d types, defaulting to MEMORY", len(matched_types))
         return [
-            self._make_query(
-                query,
-                ContextType.MEMORY.value,
-                ctx,
-                categories=categories,
-                top_k=effective_top_k,
-                resource_type=None,
-            )
+            self._make_query(query, ContextType.MEMORY.value, ctx, categories=categories, top_k=effective_top_k)
         ]
 
     @staticmethod
@@ -208,18 +170,14 @@ class QueryPlanner:
         *,
         categories: list[str] | None,
         top_k: int,
-        resource_type: str | None,
     ) -> TypedQuery:
         visible_spaces = list(ctx.visible_owner_spaces) if getattr(ctx, "visible_owner_spaces", ()) else []
-        owner_space: str | list[str] | None
         # Determine owner_space based on context_type:
         # - SKILL: agent space (skills/patterns/cases are agent-scoped), but
         #   if the visible scope list is provided and excludes agent space,
         #   fall back to an impossible filter to return no results.
-        # - code RESOURCE: account-wide by contract; no user/agent owner filter.
-        # - other RESOURCE queries: preserve the existing visible owner scope.
-        # - MEMORY: use visible scope list when provided; otherwise preserve
-        #   historical behavior.
+        # - MEMORY / RESOURCE: use visible scope list when provided;
+        #   otherwise preserve historical behavior.
         if context_type == ContextType.SKILL.value:
             visible_agent_spaces = [space for space in visible_spaces if str(space).startswith("agent:")]
             agent_space = ctx.agent_space_name() if ctx.agent_id else ""
@@ -229,11 +187,6 @@ class QueryPlanner:
                 owner_space = visible_agent_spaces
             else:
                 owner_space = "__inaccessible__"
-        elif (
-            context_type == ContextType.RESOURCE.value
-            and resource_type == "code"
-        ):
-            owner_space = None
         elif visible_spaces:
             owner_space = visible_spaces
         else:
@@ -250,5 +203,4 @@ class QueryPlanner:
             account_id=ctx.account_id,
             owner_space=owner_space,
             intent=intent.value,
-            resource_type=resource_type,
         )

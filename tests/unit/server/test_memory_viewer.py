@@ -6,7 +6,7 @@ import pytest
 
 import server.app as app_module
 import server.memory_viewer as memory_viewer_module
-from commit.code_resource_events import build_code_resource_write_event
+from commit.write_events import build_write_event
 from core.models import ContextNode, OutboxEvent, RequestContext, Role
 from server.auth import ResolvedIdentity
 
@@ -761,7 +761,7 @@ def test_memory_viewer_rejects_retry_after_task_state_changes(monkeypatch):
 
 
 def test_task_visibility_resolves_session_owner_from_event_payload():
-    event = build_code_resource_write_event(ContextNode(
+    event = build_write_event(ContextNode(
         uri="ctx://acct/sessions/session-1/history/archive-1",
         context_type="MEMORY",
         category="event",

@@ -121,18 +121,6 @@ class TestBaseApiUrl:
         assert mod.base_api_url() == "http://localhost:8090"
 
 
-class TestMcpRecovery:
-    def test_recovery_is_disabled_without_explicit_opt_in(self, monkeypatch):
-        monkeypatch.delenv("OGMEM_CLAUDE_MCP_RECOVERY_ENABLED", raising=False)
-        mod = _reimport("ogm_plugin_request")
-        assert mod.mcp_recovery_enabled() is False
-
-    def test_recovery_can_be_enabled_after_mcp_setup(self, monkeypatch):
-        monkeypatch.setenv("OGMEM_CLAUDE_MCP_RECOVERY_ENABLED", "true")
-        mod = _reimport("ogm_plugin_request")
-        assert mod.mcp_recovery_enabled() is True
-
-
 # ===========================================================================
 # call_add_session_message
 # ===========================================================================

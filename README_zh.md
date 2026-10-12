@@ -793,9 +793,9 @@ ContextFS / SQL 存储 + 向量索引
 - [Cemri et al.](https://arxiv.org/abs/2503.13657) — Multi-Agent 协调失败分析
 
 ### 基础设施
-- oGMemory 使用基于 AGFS 的分层存储，为 Session 范围内的记忆资源提供持久化能力
+- [OpenViking](https://github.com/volcengine/OpenViking) — AGFS 文件存储层与核心设计理念来源
 - [AI Agent Memory Architectures](https://zylos.ai/research/2026-03-09-multi-agent-memory-architectures-shared-isolated-hierarchical) — Zylos Research, 2026
 
 ## 许可证
 
-[Apache License 2.0](LICENSE)
+[Apache License 2.0](LICENSE) | 致谢 [OpenViking](https://github.com/volcengine/OpenViking) AGFS 文件存储层

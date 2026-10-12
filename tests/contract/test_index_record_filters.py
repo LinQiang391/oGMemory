@@ -101,7 +101,7 @@ class TestIndexRecordFiltersMandatory:
         assert "account_id" in str(exc_info.value).lower() or "owner_space" in str(exc_info.value).lower()
 
     def test_index_record_filters_all_three_levels(self):
-        """IndexRecords at all supported levels must carry the same filters."""
+        """All 3 IndexRecords from one node must have the same filters."""
         uri = "ctx://acme/users/alice/memories/profile"
         filters = {"account_id": "acme", "owner_space": "user:alice"}
 

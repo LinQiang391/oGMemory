@@ -135,42 +135,6 @@ def test_evict_idle_sessions_saves_state_before_removing(ctx):
     assert mgr.has_session("idle") is False
 
 
-def test_evict_idle_session_reloads_durable_runtime_extensions(ctx):
-    initial = ContextNode(
-        uri="ctx://acct-test/sessions/idle/state.json",
-        context_type="RESOURCE",
-        category="state",
-        level=0,
-        owner_space="session:idle",
-        abstract="Session state",
-        overview="Session state",
-        content=json.dumps({
-            "runtime_extensions": {"turn_ledger": {"sequence": 7}},
-        }),
-        metadata={},
-    )
-    fs = Mock()
-    fs.exists.return_value = True
-    fs.read_node.return_value = initial
-    mgr = SessionManager(get_context_fs=lambda: fs)
-    idle = mgr.get_or_create("idle", ctx)
-    idle.window_state.last_accessed_at = "2026-05-20T01:00:00+00:00"
-    assert idle.runtime_extensions["turn_ledger"]["sequence"] == 7
-
-    evicted = mgr.evict_idle_sessions(
-        max_idle_seconds=1800,
-        now_iso="2026-05-20T02:00:01+00:00",
-        ctx=ctx,
-    )
-    saved = fs.write_node.call_args.args[0]
-    fs.read_node.return_value = saved
-    restored = mgr.get_or_create("idle", ctx)
-
-    assert evicted == ["idle"]
-    assert restored.runtime_extensions["turn_ledger"]["sequence"] == 7
-    assert fs.read_node.call_count == 2
-
-
 def test_evict_idle_sessions_saves_each_session_state_under_own_tenant():
     fs = Mock()
     fs.exists.return_value = False
@@ -1082,33 +1046,6 @@ def test_load_session_state_retries_after_storage_error(ctx):
     assert mgr.load_session_state("s1", ctx) is False
     assert mgr.load_session_state("s1", ctx) is False
     assert fs.exists.call_count == 4
-
-
-def test_remove_session_invalidates_loaded_state_cache(ctx):
-    payload = {"runtime_extensions": {"example": {"value": 1}}}
-    fs = Mock()
-    fs.exists.return_value = True
-    fs.read_node.return_value = ContextNode(
-        uri="ctx://acct-test/sessions/s1/state.json",
-        context_type="RESOURCE",
-        category="state",
-        level=0,
-        owner_space="session:s1",
-        abstract="Session state",
-        overview="Session state",
-        content=json.dumps(payload),
-        metadata={},
-    )
-    mgr = SessionManager(get_context_fs=lambda: fs)
-
-    first = mgr.get_or_create("s1", ctx=ctx)
-    assert first.runtime_extensions == payload["runtime_extensions"]
-    mgr.remove_session("s1", ctx)
-    second = mgr.get_or_create("s1", ctx=ctx)
-
-    assert second is not first
-    assert second.runtime_extensions == payload["runtime_extensions"]
-    assert fs.read_node.call_count == 2
 
 
 def test_commit_persists_runtime_window_state_as_session_state(ctx):

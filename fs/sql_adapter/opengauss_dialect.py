@@ -62,15 +62,6 @@ class OpenGaussDialect(PostgreSQLDialect):
                 "openGauss SQL storage requires a database created with DBCOMPATIBILITY 'PG'"
             )
 
-    def ensure_workspace_root(self, cursor: Any, account_id: str, root_id: str) -> None:
-        cursor.execute(
-            "MERGE INTO code_workspace_sync_roots target "
-            "USING (SELECT %s::varchar AS account_id, %s::varchar AS root_id) source "
-            "ON (target.account_id = source.account_id AND target.root_id = source.root_id) "
-            "WHEN NOT MATCHED THEN INSERT (account_id, root_id) "
-            "VALUES (source.account_id, source.root_id)",
-            (account_id, root_id),
-        )
 
     def write_context_node(
         self, cursor: Any, values: tuple[Any, ...], *, create_only: bool
@@ -233,34 +224,6 @@ class OpenGaussDialect(PostgreSQLDialect):
             values,
         )
 
-    def insert_tool_result_artifact(self, cursor: Any, values: tuple[Any, ...]) -> bool:
-        cursor.execute(
-            """
-            MERGE INTO tool_result_artifacts target
-            USING (
-                SELECT %s::varchar AS account_id, %s::varchar AS session_id,
-                       %s::varchar AS owner_user_id,
-                       %s::varchar AS owner_agent_id,
-                       %s::varchar AS artifact_id, %s::text AS output_text,
-                       %s::jsonb AS metadata, %s::varchar AS content_sha256,
-                       %s::timestamptz AS created_at
-            ) source
-            ON (target.account_id = source.account_id
-                AND target.session_id = source.session_id
-                AND target.owner_user_id = source.owner_user_id
-                AND target.owner_agent_id = source.owner_agent_id
-                AND target.artifact_id = source.artifact_id)
-            WHEN NOT MATCHED THEN INSERT
-                (account_id, session_id, owner_user_id, owner_agent_id,
-                 artifact_id, output_text, metadata, content_sha256, created_at)
-            VALUES
-                (source.account_id, source.session_id, source.owner_user_id,
-                 source.owner_agent_id, source.artifact_id, source.output_text,
-                 source.metadata, source.content_sha256, source.created_at)
-            """,
-            values,
-        )
-        return cursor.rowcount > 0
 
     def insert_audit_log(self, cursor: Any, values: tuple[Any, ...]) -> None:
         cursor.execute(

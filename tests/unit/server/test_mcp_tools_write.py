@@ -96,8 +96,6 @@ def test_write_memory_submits_text_to_after_turn_flow():
 
     assert payload["ok"] is True
     assert payload["status"] == "accumulating"
-    assert payload["retryable"] is False
-    assert payload["submitted_messages"] == 1
     assert payload["accepted_messages"] == 1
     assert service.after_turn_params["sessionId"] == "s1"
     assert service.after_turn_params["agentId"] == "codex"
@@ -169,6 +167,8 @@ def test_write_memory_does_not_return_internal_write_result_uris():
     assert payload["status"] == "completed"
     assert payload["stats"]["pending_tokens"] == 0
     assert "ctx://" not in str(payload)
+
+
 def test_write_memory_requires_session_id():
     with pytest.raises(ValueError, match="session_id is required"):
         write_memory(_FakeService(), text="hello")

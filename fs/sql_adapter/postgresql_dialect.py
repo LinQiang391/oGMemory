@@ -15,12 +15,6 @@ class PostgreSQLDialect(SQLDialect):
         cursor.execute("INSERT INTO extraction_work_accounts (account_id) VALUES (%s) "
                        "ON CONFLICT (account_id) DO NOTHING", (account_id,))
 
-    def ensure_workspace_root(self, cursor: Any, account_id: str, root_id: str) -> None:
-        cursor.execute(
-            "INSERT INTO code_workspace_sync_roots (account_id, root_id) "
-            "VALUES (%s, %s) ON CONFLICT (account_id, root_id) DO NOTHING",
-            (account_id, root_id),
-        )
 
     def write_context_node(
         self, cursor: Any, values: tuple[Any, ...], *, create_only: bool
@@ -152,21 +146,6 @@ class PostgreSQLDialect(SQLDialect):
             values,
         )
 
-    def insert_tool_result_artifact(self, cursor: Any, values: tuple[Any, ...]) -> bool:
-        cursor.execute(
-            """
-            INSERT INTO tool_result_artifacts
-                (account_id, session_id, owner_user_id, owner_agent_id,
-                 artifact_id, output_text, metadata, content_sha256, created_at)
-            VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s)
-            ON CONFLICT
-                (account_id, session_id, owner_user_id, owner_agent_id, artifact_id)
-            DO NOTHING
-            RETURNING artifact_id
-            """,
-            values,
-        )
-        return cursor.fetchone() is not None
 
     def insert_audit_log(self, cursor: Any, values: tuple[Any, ...]) -> None:
         cursor.execute(

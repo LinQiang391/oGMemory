@@ -41,6 +41,13 @@ from core.interfaces import (
 
 # Export logging configuration
 from core.logging_config import get_logger, setup_logging, with_context
+from core.react_loop import (
+    ReactIterationTrace,
+    ReactLoop,
+    ReactLoopResult,
+    ReactTaskContext,
+    ReactTrace,
+)
 from core.models import (
     CandidateMemory,
     ContextNode,
@@ -57,39 +64,6 @@ from core.models import (
     SeedResult,
     TypedQuery,
     WritePlan,
-)
-from core.react_loop import (
-    ReactIterationTrace,
-    ReactLoop,
-    ReactLoopResult,
-    ReactTaskContext,
-    ReactTrace,
-)
-from core.resource_identity import (
-    CODE_INDEX_METADATA_FIELDS,
-    CODE_WORKSPACE_SYNC_BINDINGS_ROOT_ID,
-    AmbiguousRootBindingError,
-    ResourceCollisionError,
-    ResourceIdentityError,
-    RootBindingError,
-    canonical_node_uri,
-    code_index_metadata,
-    compute_chunk_key,
-    compute_file_key,
-    compute_root_fingerprint,
-    compute_workspace_root_id,
-    digest_slug,
-    guard_full_key_collision,
-    metadata_matches_exact,
-    normalize_posix_relative_path,
-    normalize_resource_relative_path,
-    redact_path,
-    reserve_workspace_root_binding_state,
-    resolve_root_slug,
-    resolve_workspace_root_binding_state,
-    resource_owner_space,
-    select_nodes_by_metadata,
-    validate_root_binding,
 )
 
 __all__ = [
@@ -109,31 +83,6 @@ __all__ = [
     "SearchMemoryResult",
     "RetrievalConfig",
     "RetrieverMode",
-    # Resource identity
-    "CODE_INDEX_METADATA_FIELDS",
-    "CODE_WORKSPACE_SYNC_BINDINGS_ROOT_ID",
-    "ResourceIdentityError",
-    "ResourceCollisionError",
-    "RootBindingError",
-    "AmbiguousRootBindingError",
-    "resource_owner_space",
-    "compute_root_fingerprint",
-    "compute_workspace_root_id",
-    "normalize_resource_relative_path",
-    "normalize_posix_relative_path",
-    "compute_file_key",
-    "compute_chunk_key",
-    "digest_slug",
-    "guard_full_key_collision",
-    "validate_root_binding",
-    "resolve_root_slug",
-    "reserve_workspace_root_binding_state",
-    "resolve_workspace_root_binding_state",
-    "metadata_matches_exact",
-    "select_nodes_by_metadata",
-    "canonical_node_uri",
-    "redact_path",
-    "code_index_metadata",
     # Interfaces
     "ContextFS",
     "RelationStore",

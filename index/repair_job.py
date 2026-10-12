@@ -26,11 +26,12 @@ import logging
 import re
 import uuid
 from dataclasses import dataclass, field
-from datetime import UTC, datetime
+from datetime import datetime, timezone
 from typing import Any
 
 from core.enums import NodeStatus
 from core.models import OutboxEvent
+
 
 logger = logging.getLogger(__name__)
 
@@ -47,8 +48,6 @@ _REQUIRED_FILES: tuple[str, ...] = (
 _NODE_STATUS_PENDING = "PENDING"
 _NODE_STATUS_ACTIVE = "ACTIVE"
 _NODE_STATUS_BROKEN = "BROKEN"
-_DELETE_TOMBSTONE_FILE = ".delete_tombstone.json"
-_TOOL_OUTPUT_URI_SEGMENT = "/memories/tool_outputs/"
 
 
 @dataclass
@@ -265,21 +264,6 @@ class RepairJob:
         """
         files = self._agfs.list_files(uri)
 
-        if _DELETE_TOMBSTONE_FILE in files:
-            return RepairReport(
-                uri=uri,
-                action="skipped",
-                reason="Node has a durable delete tombstone",
-                files_present=files,
-            )
-        if _TOOL_OUTPUT_URI_SEGMENT in uri:
-            return RepairReport(
-                uri=uri,
-                action="skipped",
-                reason="Tool-output nodes are excluded from generic repair indexing",
-                files_present=files,
-            )
-
         # Branch 1: .meta.json missing
         if ".meta.json" not in files:
             return self._handle_missing_metadata(uri, files)
@@ -301,14 +285,6 @@ class RepairJob:
                 uri=uri,
                 action="marked_broken",
                 reason=".meta.json contains invalid JSON",
-                files_present=files,
-            )
-
-        if meta.get("indexing_disabled") is True or meta.get("category") == "tool_outputs":
-            return RepairReport(
-                uri=uri,
-                action="skipped",
-                reason="Node metadata disables generic indexing",
                 files_present=files,
             )
 
@@ -456,6 +432,8 @@ class RepairJob:
             logger.error(f"Invalid URI: {uri}")
             return
 
+        account_id = account_match.group(1)
+
         # SECURITY: Extract owner_space from URI to maintain tenant isolation
         # URI format: ctx://{account}/{owner_type}s/{owner_id}/memories/{category}/{slug}
         # or: ctx://{account}/{owner_type}s/{owner_id}/skills/{skill_name}
@@ -516,8 +494,8 @@ class RepairJob:
             "level": level,
             "owner_space": owner_space,
             "status": status,
-            "created_at": datetime.now(UTC).isoformat(),
-            "updated_at": datetime.now(UTC).isoformat(),
+            "created_at": datetime.now(timezone.utc).isoformat(),
+            "updated_at": datetime.now(timezone.utc).isoformat(),
             "version": 1,
             "tags": ["repaired"],
         }
@@ -544,7 +522,7 @@ class RepairJob:
             return
 
         meta["status"] = status
-        meta["updated_at"] = datetime.now(UTC).isoformat()
+        meta["updated_at"] = datetime.now(timezone.utc).isoformat()
 
         if "tags" not in meta:
             meta["tags"] = []
@@ -564,24 +542,6 @@ class RepairJob:
         Returns:
             Number of OutboxEvents created
         """
-        # Re-check durable no-index markers at event creation time.  This is a
-        # second line of defence against a marker appearing after the initial
-        # scan or a caller passing a synthetic RepairReport directly.
-        files = self._agfs.list_files(uri)
-        if _DELETE_TOMBSTONE_FILE in files or _TOOL_OUTPUT_URI_SEGMENT in uri:
-            return 0
-        meta_content = self._agfs.read_file(uri, ".meta.json")
-        if meta_content:
-            try:
-                meta = json.loads(meta_content)
-            except json.JSONDecodeError:
-                meta = {}
-            if (
-                meta.get("indexing_disabled") is True
-                or meta.get("category") == "tool_outputs"
-            ):
-                return 0
-
         # Create OutboxEvent for repaired/activated nodes
         if report.action in ("repaired", "activated"):
             event = OutboxEvent(

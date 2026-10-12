@@ -84,41 +84,36 @@ test("native plugin phase switches over real HTTP", async (t) => {
         });
       }
     }
-    for (const externalization of [false, true]) {
-      for (const reason of ["reset", "deleted"]) {
-        await t.test(`capture off keeps cleanup identity: externalization=${externalization}, reason=${reason}`, async () => {
-          calls.length = 0;
-          const defaults = { accountId: "default-account", userId: "default-user", agentId: "default-agent" };
-          const identity = { accountId: "host-account", userId: "host-user", agentId: "host-agent" };
-          const sessionId = `dynamic-${externalization}-${reason}`;
-          const { engine, hooks } = host({ memoryApiBaseUrl, ...defaults, autoCapture: false,
-            toolResultExternalizationEnabled: externalization,
-            toolResultFirstViewExternalizationEnabled: externalization });
-          const input = { ...params, ...identity, sessionId };
-          assert.deepEqual(await engine.ingest(input), { ingested: false });
-          await engine.afterTurn(input);
-          await engine.dispose();
-          assert.equal(calls.length, 0, "identity registration must not capture or queue writes");
-          const end = hooks.filter((hook) => hook.name === "session_end").at(-1).handler;
-          await end({ sessionId, reason }, {});
-          assert.deepEqual(calls.map(({ path, method }) => ({ path, method })), [
-            { path: "/api/v1/dispose", method: "POST" },
-            ...(reason === "deleted" ? [{ path: `/api/v1/sessions/${sessionId}`, method: "DELETE" }] : []),
-          ]);
-          for (const { body, headers } of calls) {
-            assert.deepEqual({ accountId: body.accountId, userId: body.userId, agentId: body.agentId }, identity);
-            assert.equal(headers["x-user-id"], identity.userId);
-            assert.equal(body.messages, undefined);
-          }
-          // A different session only overrides userId; defaults must still be used for other fields.
-          calls.length = 0;
-          const partialId = sessionId + "-partial";
-          await engine.afterTurn({ ...params, sessionId: partialId, userId: "partial-user" });
-          await end({ sessionId: partialId, reason: "reset" }, {});
-          assert.equal(calls.length, 1);
-          assert.deepEqual(calls[0].body, { sessionId: partialId, ...defaults, userId: "partial-user" });
-        });
-      }
+    for (const reason of ["reset", "deleted"]) {
+      await t.test(`capture off keeps cleanup identity: reason=${reason}`, async () => {
+        calls.length = 0;
+        const defaults = { accountId: "default-account", userId: "default-user", agentId: "default-agent" };
+        const identity = { accountId: "host-account", userId: "host-user", agentId: "host-agent" };
+        const sessionId = `dynamic-${reason}`;
+        const { engine, hooks } = host({ memoryApiBaseUrl, ...defaults, autoCapture: false });
+        const input = { ...params, ...identity, sessionId };
+        assert.deepEqual(await engine.ingest(input), { ingested: false });
+        await engine.afterTurn(input);
+        await engine.dispose();
+        assert.equal(calls.length, 0, "identity registration must not capture or queue writes");
+        const end = hooks.filter((hook) => hook.name === "session_end").at(-1).handler;
+        await end({ sessionId, reason }, {});
+        assert.deepEqual(calls.map(({ path, method }) => ({ path, method })), [
+          { path: "/api/v1/dispose", method: "POST" },
+        ]);
+        for (const { body, headers } of calls) {
+          assert.deepEqual({ accountId: body.accountId, userId: body.userId, agentId: body.agentId }, identity);
+          assert.equal(headers["x-user-id"], identity.userId);
+          assert.equal(body.messages, undefined);
+        }
+        // A different session only overrides userId; defaults must still be used for other fields.
+        calls.length = 0;
+        const partialId = sessionId + "-partial";
+        await engine.afterTurn({ ...params, sessionId: partialId, userId: "partial-user" });
+        await end({ sessionId: partialId, reason: "reset" }, {});
+        assert.equal(calls.length, 1);
+        assert.deepEqual(calls[0].body, { sessionId: partialId, ...defaults, userId: "partial-user" });
+      });
     }
     await t.test("capture off creates no after-turn retry work; cleanup still disposes existing buffers", async () => {
       calls.length = 0;

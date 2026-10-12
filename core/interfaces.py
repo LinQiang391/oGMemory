@@ -5,19 +5,20 @@ All protocols use typing.Protocol for structural subtyping.
 """
 
 from datetime import datetime
-from typing import Any, Protocol
-
+from typing import Protocol
 from typing_extensions import runtime_checkable
 
+from typing import Any
+
 from core.models import (
-    CandidateMemory,
+    RequestContext,
     ContextNode,
+    RelationEdge,
+    CandidateMemory,
+    WritePlan,
     IndexRecord,
     OutboxEvent,
-    RelationEdge,
-    RequestContext,
     SeedHit,
-    WritePlan,
 )
 
 
@@ -413,10 +414,6 @@ class OutboxStore(Protocol):
         Returns:
             List of (node_uri, OutboxEvent) tuples
         """
-        ...
-
-    def count_unfinished(self, account_id: str | None = None) -> dict[str, int]:
-        """Count live pending and processing events without claiming them."""
         ...
 
     def mark_processing(self, event: OutboxEvent, node_uri: str) -> None:
