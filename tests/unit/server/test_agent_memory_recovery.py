@@ -46,7 +46,7 @@ def test_service_finalization_writes_memory():
     from server.memory_service import MemoryService
 
     client, fs, outbox, llm = setup()
-    svc = MemoryService(config=OgMemConfig(storage_backend="agfs", index_workers=0))
+    svc = MemoryService(config=OgMemConfig(storage_backend="agfs", index_workers=0, agent_memory_enabled=True))
     svc._get_context_fs = lambda: fs
     svc._get_outbox_store = lambda fs: outbox
     svc._get_trace_event_store = lambda: store

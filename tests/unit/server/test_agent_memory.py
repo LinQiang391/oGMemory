@@ -2,6 +2,7 @@
 
 import json
 from copy import deepcopy
+from unittest.mock import MagicMock
 
 import pytest
 
@@ -182,7 +183,17 @@ def test_finalized_trace_writes_tools_and_experiences_and_replays(agent):
     assert {queued.event_type for _, queued in outbox.list_pending("acct")} == {"UPSERT_CONTEXT"}
     result = worker.run_once(outbox, ["acct"])
     assert result["succeeded"] == 2
+    from core.models import RetrievalConfig
+    from tests.unit.retrieval.test_pipeline import _build_pipeline
 
+    pipeline = _build_pipeline(
+        index,
+        SameEmbedding(),
+        RetrievalConfig(expand_hierarchy=False, include_agent_memories=True),
+        with_expand=False,
+    )
+    retrieved = pipeline.run("batch limit", ctx, categories=list(FIELDS), top_k=10)
+    assert {hit.category for hit in retrieved.hits} == set(FIELDS)
 
 
 def test_resumes_reviewed_proposals_after_restart():
@@ -212,6 +223,39 @@ def test_resumes_reviewed_proposals_after_restart():
     assert [name for name, _ in llm.calls] == ["summarize_agent_memory"] * 2
 
 
+def test_finalize_enqueues_agent_memory_and_existing_skill_candidates(monkeypatch):
+    from providers.unified_config import OgMemConfig
+    from server.memory_service import MemoryService
+
+    monkeypatch.setattr(MemoryService, "_start_skill_sedimentation_worker", lambda self: None)
+    service = MemoryService(config=OgMemConfig(
+        agent_memory_enabled=True, skill_sedimentation_enabled=True, workers=1,
+    ))
+    store, outbox = MagicMock(), MagicMock()
+    store.finalize_session.return_value = {
+        "ok": True,
+        "uri": "ctx://acct/traces/session/turns/turn1",
+        "turn_id": "turn1",
+    }
+    store.enqueue_skill_candidate_from_trace.return_value = {"candidate_id": "skill-candidate-1"}
+    service._get_trace_event_store = lambda: store
+    service._get_context_fs = lambda: object()
+    service._get_outbox_store = lambda fs: outbox
+    service._start_outbox_worker = lambda: None
+    result = service.finalize_session_trace(
+        {"_ctx": CTX, "sessionId": "session", "stopEventIndex": 6}
+    )
+    event, context = outbox.register_once.call_args.args
+    assert context == CTX
+    assert result["agent_memory_event_id"] == event.event_id
+    assert event.payload["context"]["user_id"] == "alice"
+    assert result["skill_candidate_id"] == "skill-candidate-1"
+    store.enqueue_skill_candidate_from_trace.assert_called_once_with(
+        account_id="acct", agent_id="codex", session_id="session", turn_id="turn1",
+        trace_uri=event.payload["trace_uri"],
+    )
+
+
 def test_anthropic_blocks_preserve_exposed_thinking_and_tool_results():
     events = message_events(
         [
@@ -232,6 +276,37 @@ def test_anthropic_blocks_preserve_exposed_thinking_and_tool_results():
     assert events[0]["reasoning"] == "Check the limit first."
     assert events[2]["tool_name"] == "read"
     assert events[2]["tool_response"] == "Limit: 100."
+
+
+def test_procedure_queries_share_existing_skills_and_agent_memories():
+    from core.models import RetrievalConfig
+    from retrieval.query_planner import QueryPlanner
+
+    planner = QueryPlanner(RetrievalConfig(include_agent_memories=True))
+    queries = planner.plan("how to upload a batch", CTX)
+    assert [query.context_type for query in queries] == ["SKILL", "MEMORY"]
+    queries = planner.plan("how to upload a batch", CTX, categories=["experience"])
+    assert [query.context_type for query in queries] == ["MEMORY"]
+    queries = planner.plan("how to upload a batch", CTX, categories=["skill"])
+    assert [(query.context_type, query.categories) for query in queries] == [("SKILL", ["skill"])]
+    queries = planner.plan(
+        "how to upload a batch", CTX, categories=["profile", "experience", "skill"]
+    )
+    assert [(query.context_type, query.categories) for query in queries] == [
+        ("MEMORY", ["profile", "experience"]),
+        ("SKILL", ["skill"]),
+    ]
+
+
+def test_config_enables_agent_memory_from_yaml_and_environment(monkeypatch):
+    from providers import unified_config as uc
+
+    monkeypatch.setattr(uc, "_load_yaml", lambda path: {"agent_memory": {"enabled": True}})
+    monkeypatch.delenv("OGMEM_AGENT_MEMORY_ENABLED", raising=False)
+    assert uc.OgMemConfig.load().agent_memory_enabled is True
+    monkeypatch.setattr(uc, "_load_yaml", lambda path: {})
+    monkeypatch.setenv("OGMEM_AGENT_MEMORY_ENABLED", "true")
+    assert uc.OgMemConfig.load().agent_memory_enabled is True
 
 
 def test_updates_existing_nodes_with_a_second_turn():
@@ -256,6 +331,24 @@ def test_updates_existing_nodes_with_a_second_turn():
         for turn in turns:
             assert any(ref.startswith(turn) for ref in node.metadata["provenance_ids"])
             assert any(source["uri"].startswith(turn) for source in unit["grounding"])
+
+
+def test_enabled_service_constructs_the_shared_write_api():
+    from providers.unified_config import OgMemConfig
+    from server.memory_service import MemoryService
+
+    service = MemoryService(config=OgMemConfig(agent_memory_enabled=True))
+    client = _MemoryAGFS()
+    fs = NodeFS(client)
+    service._get_context_fs = lambda: fs
+    service._get_outbox_store = lambda fs: OutboxStore(client, fs)
+    service._get_shared_vector_index = lambda: InMemoryVectorIndex()
+    service._get_shared_embedder = lambda: SameEmbedding()
+    service.get_llm = lambda: ExtractionLLM()
+    service._start_outbox_worker = lambda: None
+    api = service.get_write_api()
+    assert api._fs is fs
+    assert {schema.owner_scope for schema in api._schema_registry.list_enabled()} == {"user"}
 
 
 def test_tool_units_keep_typed_history_and_rebuild_all_retrieval_layers():

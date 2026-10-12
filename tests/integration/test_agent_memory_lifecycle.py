@@ -85,7 +85,7 @@ def _run_service(url, workers):
     store = AGFSTraceEventStore(client=client)
     index = InMemoryVectorIndex()
     ctx = RequestContext("lifecycle-" + uuid4().hex, "u", "a", "s", "request")
-    service = MemoryService(config=OgMemConfig(storage_backend="agfs", index_workers=workers))
+    service = MemoryService(config=OgMemConfig(storage_backend="agfs", index_workers=workers, agent_memory_enabled=True))
     service._default_account_id = ctx.account_id
     service._get_context_fs = lambda: fs
     service._get_outbox_store = lambda fs: outbox

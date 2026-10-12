@@ -439,6 +439,8 @@ def _list_node_summaries(context_fs: Any, base_uri: str, ctx: RequestContext, li
 
 
 def _node_detail(node: ContextNode) -> dict[str, Any]:
+    from retrieval.context_reader import canonical_agent_node
+    node = canonical_agent_node(node)
     external_uri = internal_to_external_uri(node.uri, category=node.category)
     return {
         "uri": external_uri,

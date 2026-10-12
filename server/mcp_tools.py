@@ -1322,7 +1322,9 @@ def read_memory(
         node = None
         for internal_uri in external_to_internal_uri_candidates(uri, ctx):
             try:
-                if unit_key is None and hasattr(context_fs, "read_node_fields"):
+                needs_full_node = unit_key is not None or (
+                    level == "overview" and parsed.memory_type in {"tool_memory", "tool_evidence", "experience"})
+                if hasattr(context_fs, "read_node_fields") and not needs_full_node:
                     node = context_fs.read_node_fields(internal_uri, ctx, level)
                 else:
                     node = context_fs.read_node(internal_uri, ctx)
@@ -1337,6 +1339,9 @@ def read_memory(
             raise ValueError(f"URI does not reference a single memory: {uri}")
         if unit_key is not None:
             node = project_memory_unit(node, unit_key)
+        else:
+            from retrieval.context_reader import canonical_agent_node
+            node = canonical_agent_node(node)
         canonical_uri = internal_to_external_uri(node.uri, category=node.category)
         canonical_parsed = parse_ogmemory_uri(canonical_uri)
         payload = {
@@ -1351,9 +1356,12 @@ def read_memory(
             payload["abstract"] = node.abstract
         if level in {"overview", "all"}:
             payload["overview"] = node.overview
+        if level == "overview" and not node.overview and node.metadata.get("agent_memory_version") == 1:
+            payload["content"] = node.content
+            payload["level"] = "content"
         if level in {"content", "all"}:
             payload["content"] = node.content
-        if unit_key is not None:
+        if unit_key is not None or node.metadata.get("grounding"):
             payload["grounding"] = node.metadata["grounding"]
         return _truncate_payload(payload, max_chars)
     except Exception as exc:

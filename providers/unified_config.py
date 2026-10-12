@@ -564,6 +564,7 @@ class OgMemConfig:
     sql_connection_string: str | None = None
     sql_pool_size: int = 5
     trace_max_turn_events: int = 128
+    agent_memory_enabled: bool = False
 
     # -- Agent skill sedimentation --------------------------------------------
     skill_sedimentation_enabled: bool = False
@@ -1866,6 +1867,9 @@ class OgMemConfig:
                 int,
             ),
             # Agent skill sedimentation
+            agent_memory_enabled=_resolve_bool(
+                (raw.get("agent_memory") or {}).get("enabled"), "OGMEM_AGENT_MEMORY_ENABLED", False,
+            ),
             skill_sedimentation_enabled=_resolve_bool(
                 sedimentation.get("enabled"), "OGMEM_SKILL_SEDIMENTATION_ENABLED", False,
             ),
