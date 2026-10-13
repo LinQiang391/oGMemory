@@ -759,3 +759,7 @@ deploy/
 ├── ogmemory.example.yaml    # oGMemory 配置模板（复制为 ogmemory.yaml 后编辑）
 └── ogmemory.yaml            # oGMemory 实际配置（用户创建，不纳入版本控制）
 ```
+
+## Agent 工具与经验记忆
+
+部署模板默认关闭 Agent 记忆抽取。需要启用时，按 [Agent 记忆部署说明](agent-memory.md) 修改挂载 YAML、重启服务并验证配置和 Trace 抽取结果。
