@@ -183,3 +183,6 @@ opencode-verification/
 
 # Private backups written by local onboarding
 /config/ogmem.yaml.bak-*
+
+# Persistent advisory lock inodes for deployment management
+.ogmemory-*.lock
