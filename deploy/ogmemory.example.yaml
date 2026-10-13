@@ -171,3 +171,7 @@ cache:
 #   # http_url: "http://127.0.0.1:8090/api/v1/perf/events"   # 远程 HTTP 上报（与 file_path 二选一）
 #   # run_id: "manual-run-2026-05-11"
 #   # rate_card: "/etc/ogmem/rate_card.json"
+
+# Agent 工具与经验记忆；开启步骤见 deploy/agent-memory.md。
+agent_memory:
+  enabled: false

@@ -591,6 +591,9 @@ auth:
 memory:
   after_turn_threshold: "${OGMEM_AFTER_TURN_THRESHOLD}"
   rolling_compress_enabled: true
+
+agent_memory:
+  enabled: false
 YAML
 chmod 644 "$STACK_DIR/ogmemory.yaml"
 
