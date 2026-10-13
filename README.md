@@ -539,14 +539,11 @@ result = write_api.commit_session([
 <summary><strong>Docker / HTTP API Reference</strong></summary>
 
 ```bash
-# First configure .env and follow deploy/compose/README_zh.md.
-python3 scripts/check_build_network.py  # Check images and selected dependency sources.
-docker compose build ogmemory
-docker compose up -d --wait --wait-timeout 900
-docker compose exec ogmemory python3 /opt/ogmem/scripts/bootstrap_compose.py   # HTTP :8090, MCP :8091
+# Configure .env, then follow deploy/compose/README_zh.md.
+bash deploy/compose/deploy.sh start
 ```
 
-The Compose stack includes oGMemory and openGauss, with persistent memory and database volumes.
+The Compose stack runs oGMemory and openGauss images and preserves memory and database data in host directories.
 The current database image requires ARM64. Database and AGFS ports are internal.
 See [Docker Compose deployment and verification](deploy/compose/README_zh.md) for configuration,
 networking, model connectivity checks and cross-session persistence tests.

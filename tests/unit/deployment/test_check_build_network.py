@@ -91,7 +91,7 @@ def test_preflight_preserves_build_host_gateway(target):
     assert build['extra_hosts'] == {'host.docker.internal': 'host-gateway'}
 
 
-def test_compose_build_can_resolve_host_proxy():
+def test_image_deployment_can_reach_host_models():
     import yaml
     config = yaml.safe_load((ROOT / 'compose.yaml').read_text())
-    assert 'host.docker.internal:host-gateway' in config['services']['ogmemory']['build']['extra_hosts']
+    assert 'host.docker.internal:host-gateway' in config['services']['ogmemory']['extra_hosts']

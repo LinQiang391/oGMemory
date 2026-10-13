@@ -510,7 +510,8 @@ curl -X POST http://localhost:8090/api/v1/compose \
 <summary><strong>Docker</strong></summary>
 
 ```bash
-docker compose up  # 服务端口 8090，PostgreSQL 端口 5432
+# 先填写 .env，按 deploy/compose/README_zh.md 部署。
+bash deploy/compose/deploy.sh start
 ```
 
 </details>
