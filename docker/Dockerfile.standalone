@@ -14,7 +14,7 @@ RUN pip install --no-cache-dir \
     --timeout 120 \
     flask gunicorn openai psycopg2-binary pyagfs rich requests apscheduler httpx pyyaml jinja2 \
     pydantic python-dotenv json-repair "jsonschema>=4.20.0" rank-bm25 nltk \
-    "mcp[cli]>=2.0.0,<3" "volcengine-python-sdk[ark]"
+    "mcp[cli]==2.0.0" "volcengine-python-sdk[ark]"
 
 # Copy oGMemory source
 COPY core/       /opt/ogmem/core/
