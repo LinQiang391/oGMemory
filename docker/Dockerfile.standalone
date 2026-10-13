@@ -14,7 +14,7 @@ RUN pip install --no-cache-dir \
     --timeout 120 \
     flask gunicorn openai psycopg2-binary pyagfs rich requests apscheduler httpx pyyaml jinja2 \
     pydantic python-dotenv json-repair "jsonschema>=4.20.0" rank-bm25 nltk \
-    "mcp[cli]>=2.0.0,<3" "volcengine-python-sdk[ark]"
+    "mcp[cli]==2.0.0" "volcengine-python-sdk[ark]"
 
 # Copy oGMemory source
 COPY core/       /opt/ogmem/core/
@@ -30,9 +30,7 @@ COPY session/    /opt/ogmem/session/
 COPY cli/        /opt/ogmem/cli/
 COPY scripts/    /opt/ogmem/scripts/
 COPY skills/     /opt/ogmem/skills/
-# lifecycle/ removed — not present in this workspace
 COPY perf/       /opt/ogmem/perf/
-COPY features/   /opt/ogmem/features/
 COPY scene/      /opt/ogmem/scene/
 
 # Copy AGFS binary and config

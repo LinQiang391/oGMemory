@@ -22,8 +22,8 @@ RUN apt-get update && \
     apt-get clean && rm -rf /var/lib/apt/lists/*
 RUN pip install --no-cache-dir --index-url "${PIP_INDEX_URL}" --timeout 120 \
     flask gunicorn openai psycopg2-binary pyagfs rich requests apscheduler httpx pyyaml jinja2 \
-    pydantic python-dotenv json-repair rank-bm25 nltk \
-    "mcp[cli]>=2.0.0,<3" "volcengine-python-sdk[ark]"
+    pydantic python-dotenv json-repair "jsonschema>=4.20.0" rank-bm25 nltk \
+    "mcp[cli]==2.0.0" "volcengine-python-sdk[ark]"
 
 FROM agfs-deps AS agfs-builder
 RUN CGO_ENABLED=1 go build -trimpath -ldflags="-w -s" -o /out/agfs-server ./cmd/server
@@ -45,7 +45,6 @@ COPY cli/        /opt/ogmem/cli/
 COPY scripts/    /opt/ogmem/scripts/
 COPY skills/     /opt/ogmem/skills/
 COPY perf/       /opt/ogmem/perf/
-COPY features/   /opt/ogmem/features/
 COPY scene/      /opt/ogmem/scene/
 
 # Copy AGFS binary and config
