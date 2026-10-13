@@ -48,3 +48,7 @@ auth:
 memory:
   after_turn_threshold: "${OGMEM_AFTER_TURN_THRESHOLD}"
   rolling_compress_enabled: true
+
+# Agent 工具与经验记忆；开启步骤见 deploy/agent-memory.md。
+agent_memory:
+  enabled: false
