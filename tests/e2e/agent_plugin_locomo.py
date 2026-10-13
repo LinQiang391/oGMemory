@@ -322,7 +322,6 @@ class OpenClawHost(AgentHost):
                             "agentId": self.args.memory_agent_id,
                             "prefetchEnabled": True,
                             "prefetchTopK": 5,
-                            "semanticTurnMode": "user_message",
                             "compactTakeoverEnabled": False,
                             "shortTermIndexMode": "sync",
                         },
