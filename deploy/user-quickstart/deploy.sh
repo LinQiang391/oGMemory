@@ -4,9 +4,9 @@ set -Eeuo pipefail
 readonly ENV_FILE="${OGMEMORY_ENV_FILE:-$HOME/ogmemory.env}"
 readonly STACK_ROOT="${OGMEMORY_STACK_ROOT:-$HOME}"
 readonly PUBLISH_IP="127.0.0.1"
-readonly OPENGAUSS_IMAGE="swr.cn-north-4.myhuaweicloud.com/kunpeng-ai/opengauss-distributed:0328"
-readonly OGMEM_IMAGE="swr.cn-north-4.myhuaweicloud.com/kunpeng-ai/ogmemory:poc_0807"
-readonly OPENCLAW_IMAGE="swr.cn-north-4.myhuaweicloud.com/kunpeng-ai/openclaw-ogmem:poc_0807"
+readonly OPENGAUSS_IMAGE="${OPENGAUSS_IMAGE:-swr.cn-north-4.myhuaweicloud.com/kunpeng-ai/opengauss-distributed:0328}"
+readonly OGMEM_IMAGE="${OGMEM_IMAGE:-swr.cn-north-4.myhuaweicloud.com/kunpeng-ai/ogmemory:poc_0807}"
+readonly OPENCLAW_IMAGE="${OPENCLAW_IMAGE:-swr.cn-north-4.myhuaweicloud.com/kunpeng-ai/openclaw-ogmem:poc_0807}"
 
 fail() {
   echo "错误: $*" >&2
@@ -502,8 +502,13 @@ if is_true "$RESET_OPENGAUSS_DATA"; then
   chmod 777 "$STACK_DIR/opengauss"
 fi
 
-docker network inspect "$OGMEM_NETWORK" >/dev/null 2>&1 || \
-  docker network create "$OGMEM_NETWORK" >/dev/null
+if ! docker network inspect "$OGMEM_NETWORK" >/dev/null 2>&1; then
+  network_args=()
+  if [[ -n "${OGMEM_NETWORK_SUBNET:-}" ]]; then
+    network_args+=(--subnet "$OGMEM_NETWORK_SUBNET")
+  fi
+  docker network create "${network_args[@]}" "$OGMEM_NETWORK" >/dev/null
+fi
 
 echo "创建 openGauss..."
 docker run -d \

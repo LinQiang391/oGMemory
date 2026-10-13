@@ -1216,7 +1216,10 @@ class Extractor:
             if truncated or not prompt_fits(fallback_prompt, schema):
                 compact += ("\n\nExtract only facts from this source within the output budget. "
                             "Extract complete source facts without target_uri or expected_version.")
-                fallback_prompt = build_extraction_fallback_prompt(compact, self._extraction_tools)
+                source_tools = [tool for tool in self._extraction_tools
+                                if tool["name"] not in {"edit_memory", "append_memory"}]
+                fallback_prompt = build_extraction_fallback_prompt(compact, source_tools)
+                schema = build_extraction_envelope_schema(source_tools)
                 reads = None
             logger.info("JSON extraction fallback compacted: span=%d-%d native_chars=%d "
                         "fallback_chars=%d retained_reads=%d", prepared.span.start, prepared.span.end,

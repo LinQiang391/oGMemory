@@ -50,7 +50,7 @@ def test_standalone_dockerfile_defines_mcp_env_used_by_default_config():
 def test_standalone_dockerfile_declares_runtime_dependencies():
     dockerfile = (ROOT / "docker" / "Dockerfile.standalone").read_text(encoding="utf-8")
 
-    assert '"mcp[cli]>=2.0.0,<3"' in dockerfile
+    assert '"mcp[cli]==2.0.0"' in dockerfile
     assert "libsqlite3-0" not in dockerfile
     for dependency in ("pydantic", "python-dotenv", "json-repair", "rank-bm25", "nltk"):
         assert dependency in dockerfile

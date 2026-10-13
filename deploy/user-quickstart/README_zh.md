@@ -95,6 +95,18 @@ chmod 700 "$HOME/deploy.sh"
 
 如果实例名称已被其他用户使用，脚本会在删除容器前停止。请修改 `INSTANCE_NAME` 后重新执行。
 
+从源码构建后，可通过进程环境变量指定镜像：
+
+```bash
+OGMEM_IMAGE=ogmemory:my-build OPENCLAW_IMAGE=openclaw-ogmem:my-build "$HOME/deploy.sh"
+```
+
+若 Docker 默认地址池耗尽，检查现有 Docker 网络和宿主路由，选择无冲突的网段后执行：
+
+```bash
+OGMEM_NETWORK_SUBNET=10.242.113.0/24 "$HOME/deploy.sh"
+```
+
 ### 1.3 修改配置并重建（可选）
 
 需要更换 LLM 配置、Embedding API Key、模型服务地址或端口时，修改 `$HOME/ogmemory.env`，再次执行：
