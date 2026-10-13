@@ -131,6 +131,17 @@ def mock_sql_fs():
         yield fs, mock_conn, mock_cursor
 
 
+def test_inventory_counts_agent_tools_and_experiences(mock_sql_fs):
+    fs, _, cursor = mock_sql_fs
+    tools = "ctx://acme/agents/main/memories/tools"
+    experiences = "ctx://acme/agents/main/memories/experiences"
+    cursor.fetchall.return_value = [(tools, "tool", 3), (experiences, "experience", 2)]
+
+    assert fs.count_memory_children(_ctx()) == {tools: 3, experiences: 2}
+    query = next(call for call in cursor.execute.call_args_list if "GROUP BY parent" in call.args[0])
+    assert {"tool", "experience"} <= set(query.args[1][1])
+
+
 class TestSQLContextFSWriteNode:
     def test_write_new_node(self, mock_sql_fs):
         fs, conn, cursor = mock_sql_fs

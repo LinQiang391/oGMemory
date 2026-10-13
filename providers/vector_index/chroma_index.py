@@ -5,6 +5,7 @@ come from the Embedder, not from ChromaDB's built-in models.
 """
 
 import hashlib
+import json
 import logging
 import os
 import threading
@@ -14,6 +15,7 @@ from pathlib import Path
 from typing import Any
 
 from core.interfaces import VectorIndex
+from core.memory_names import memory_directory
 from core.models import IndexRecord, SeedHit
 
 logger = logging.getLogger(__name__)
@@ -152,6 +154,24 @@ class ChromaVectorIndex(VectorIndex):
     ) -> list[SeedHit]:
         chroma_where = self._build_where(filters)
         with self._locked():
+            if "memory_directory" in filters:
+                # Derive type constraints from persisted URIs before nearest-neighbor truncation.
+                uris = set()
+                offset = 0
+                while True:
+                    page = self._collection.get(
+                        where=chroma_where, include=["metadatas"], limit=1000, offset=offset,
+                    )
+                    for meta in page["metadatas"]:
+                        uri = (meta or {}).get("uri", "")
+                        if memory_directory(uri) in filters["memory_directory"]:
+                            uris.add(uri)
+                    if len(page["ids"]) < 1000:
+                        break
+                    offset += len(page["ids"])
+                if not uris:
+                    return []
+                chroma_where = self._build_where({**filters, "uri": sorted(uris)})
             count = self._collection.count()
             if count == 0:
                 return []
@@ -166,6 +186,9 @@ class ChromaVectorIndex(VectorIndex):
             return hits
         for i in range(len(results["ids"][0])):
             meta = results["metadatas"][0][i] if results["metadatas"] else {}
+            meta = dict(meta)
+            if "agent_memory_grounding_json" in meta:
+                meta["grounding"] = json.loads(meta.pop("agent_memory_grounding_json"))
             doc = results["documents"][0][i] if results["documents"] else ""
             dist = results["distances"][0][i] if results["distances"] else 1.0
             score = max(0.0, 1.0 - dist)
@@ -277,11 +300,16 @@ class ChromaVectorIndex(VectorIndex):
             "who",
             "where",
             "routing_key",
+            "unit_key",
+            "agent_memory_unit_key",
+            "unit_revision",
         ):
             val = record.metadata.get(key) if record.metadata else None
             if val is not None:
                 meta[key] = val
-        sanitized = {}
+        if isinstance((record.metadata or {}).get("grounding"), list):
+            meta["agent_memory_grounding_json"] = json.dumps(record.metadata["grounding"], ensure_ascii=False)
+        sanitized: dict[str, str | int | float | bool] = {}
         for k, v in meta.items():
             if isinstance(v, bool):
                 sanitized[k] = v

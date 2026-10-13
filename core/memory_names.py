@@ -6,6 +6,17 @@ import unicodedata
 from core.candidate_dedup import case_draft_signature, event_draft_signature
 
 
+def memory_directory(uri: str) -> str:
+    """Return the type directory from a memory or skill context URI."""
+    parts = uri.split("/", 7)
+    if len(parts) > 6 and parts[0] == "ctx:" and parts[3] in {"users", "agents"}:
+        if parts[5] == "memories":
+            return parts[6]
+        if parts[5] == "skills":
+            return "skills"
+    return ""
+
+
 def candidate_identity_key(candidate) -> tuple[str, str, str, str, str]:
     """Keep owner, source scope and subject separate during extraction deduplication."""
     if candidate.target_uri:

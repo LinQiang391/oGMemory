@@ -281,6 +281,10 @@ def create_mcp_server(
                 description="Maximum response characters, from 1 to 50000, before server limits apply."
             ),
         ] = 12000,
+        unit_key: Annotated[
+            str | None,
+            Field(description="Exact unit_key returned with a Tool or Experience search hit."),
+        ] = None,
         session_id: Annotated[
             str | None,
             Field(description="Current conversation ID; reuse it across related memory calls."),
@@ -302,6 +306,7 @@ def create_mcp_server(
         return read_memory_tool(
             service,
             uri=uri,
+            **({"unit_key": unit_key} if unit_key is not None else {}),
             level=level,
             max_chars=max_chars,
             session_id=session_id,

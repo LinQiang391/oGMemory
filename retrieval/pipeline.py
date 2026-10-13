@@ -27,6 +27,7 @@ from core.models import (
     SeedHit,
 )
 from retrieval.hotness import blend_hotness
+from retrieval.identity import memory_identity
 from retrieval.result_ranker import ResultRanker, _vec_to_leaf
 from retrieval.hierarchical_searcher import HierarchicalSearcher
 from retrieval.candidate_pool import candidate_top_k
@@ -69,6 +70,7 @@ class RetrievalPipeline:
         score_threshold: float | None = None,
         mode: str = RetrieverMode.QUICK,
         fill_content_for_top_k: int = 0,
+        memory_directories: list[str] | None = None,
     ) -> SearchMemoryResult:
         t0 = time.monotonic()
         trace = RetrievalTrace()
@@ -84,6 +86,7 @@ class RetrievalPipeline:
         all_seed_results: list[SeedResult] = []
         level_counts: dict[str, int] = {"L0": 0, "L1": 0, "L2": 0}
         for tq in typed_queries:
+            tq.memory_directories = memory_directories
             sr = self._run_seed(tq, ctx, trace, mode=mode)
             all_seed_results.append(sr)
             for h in sr.starting_points:
@@ -216,10 +219,11 @@ class RetrievalPipeline:
 
                 for b in blocks:
                     uri = getattr(b, "uri", None) or getattr(b, "source_uri", None)
-                    if uri and uri in seen_uris:
+                    identity = memory_identity(uri, getattr(b, "metadata", None)) if uri else None
+                    if identity and identity in seen_uris:
                         continue
-                    if uri:
-                        seen_uris.add(uri)
+                    if identity:
+                        seen_uris.add(identity)
                     all_blocks.append(b)
 
             final_limit = max((getattr(tq, "top_k", 0) for tq in typed_queries), default=0)
@@ -257,16 +261,17 @@ class RetrievalPipeline:
             return seed_results[0]
         merged = SeedResult()
         seen_sp: set[str] = set()
-        seen_ic: set[str] = set()
+        seen_ic: set[tuple[str, str]] = set()
         for sr in seed_results:
             for v in sr.starting_points:
                 if v.uri not in seen_sp:
                     merged.starting_points.append(v)
                     seen_sp.add(v.uri)
             for v in sr.initial_candidates:
-                if v.uri not in seen_ic:
+                identity = memory_identity(v.uri, v.metadata)
+                if identity not in seen_ic:
                     merged.initial_candidates.append(v)
-                    seen_ic.add(v.uri)
+                    seen_ic.add(identity)
             if not merged.query_vector and sr.query_vector:
                 merged.query_vector = sr.query_vector
             merged.root_uris.extend(sr.root_uris)

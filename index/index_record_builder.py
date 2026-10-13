@@ -52,6 +52,18 @@ def _extract_account_id(uri: str) -> str:
     return match.group(1)
 
 
+def agent_memory_index_ids(node: ContextNode) -> list[str]:
+    """Enumerate the layers and all recorded unit identities for index cleanup."""
+    return [
+        IndexRecord.generate_id(node.uri + "#agent-unit=" + key, 2)
+        for key in node.metadata["agent_memory"]["units"]
+    ] + [
+        IndexRecord.generate_id(node.uri, 0),
+        IndexRecord.generate_id(node.uri, 1),
+        IndexRecord.generate_id(node.uri + "/content.md", 2),
+    ]
+
+
 def build_index_records(node: ContextNode) -> list[IndexRecord]:
     """Expand ContextNode into 3 IndexRecords (L0/L1/L2).
 
@@ -59,6 +71,8 @@ def build_index_records(node: ContextNode) -> list[IndexRecord]:
     - Level 0: abstract (L0) - first-pass recall
     - Level 1: overview (L1) - agent decision layer
     - Level 2: content (L2) - deep reading layer
+
+    Typed Agent nodes emit L0, L1 and complete L2 units.
 
     CRITICAL: All records include account_id + owner_space in filters
     to prevent cross-tenant leakage at the vector index level.
@@ -83,6 +97,42 @@ def build_index_records(node: ContextNode) -> list[IndexRecord]:
         "has_overview": bool(node.overview),
         "has_content": bool(node.content),
     }
+
+    if node.metadata.get("agent_memory_version") == 1:
+        from extraction.agent_memory import memory_units, node_memory_fields, render_agent_memory
+
+        fields = node_memory_fields(node)
+        units = memory_units(node.category, fields)
+        base_metadata.update(
+            agent_memory_version=1,
+            routing_key=node.metadata["routing_key"], abstract=node.abstract,
+        )
+        records = [
+            IndexRecord(IndexRecord.generate_id(node.uri, level), node.uri, level, text,
+                        dict(base_filters), {**base_metadata, "level": label})
+            for level, label, text in ((0, "abstract", node.abstract), (1, "overview", node.overview))
+            if units and text
+        ]
+        records.extend(
+            IndexRecord(
+                IndexRecord.generate_id(node.uri + "#agent-unit=" + item["key"], 2),
+                node.uri + "/content.md", 2,
+                render_agent_memory(
+                    node.category,
+                    {**fields, "units": [item]} if node.category == "tool" else item,
+                    grounding=item.get("grounding"),
+                ),
+                dict(base_filters),
+                {**base_metadata, "level": "content", "parent_uri": node.uri,
+                 "abstract": item["title"], "has_overview": False,
+                 "unit_key": item["key"], "agent_memory_unit_key": item["key"],
+                 "grounding": item.get("grounding", []),
+                 "unit_revision": node.metadata["agent_memory"]["units"][item["key"]]["revision"]},
+            )
+            for item in units
+        )
+        _validate_filters(records)
+        return records
 
     # Enrich metadata with structured extraction fields (when/who/where)
     for key in ("when", "who", "where", "routing_key"):

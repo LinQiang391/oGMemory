@@ -849,7 +849,7 @@ class TestPostUpsertLivenessCheck:
                 assert event_id == event.event_id
                 return True
 
-            def claim_batch(self, worker_id="default"):
+            def claim_batch(self, worker_id="default", *, exclude_event_types=None):
                 return [(event.uri, event)]
 
             def mark_done(self, claimed_event, node_uri):
@@ -882,7 +882,7 @@ class TestPostUpsertLivenessCheck:
                 self.retry_calls = 0
                 self.release_calls = 0
 
-            def claim_batch(self, worker_id="default"):
+            def claim_batch(self, worker_id="default", *, exclude_event_types=None):
                 return [(event.uri, event)]
 
             def processing_lock(self, _node_uri):
@@ -949,7 +949,7 @@ class TestPostUpsertLivenessCheck:
                     # Post-upsert DB error - re-raises
                     raise RuntimeError("DB down post-check")
 
-            def claim_batch(self, worker_id="default"):
+            def claim_batch(self, worker_id="default", *, exclude_event_types=None):
                 return [(event.uri, event)]
 
             def mark_done(self, event, node_uri):
@@ -994,7 +994,7 @@ class TestPostUpsertLivenessCheck:
                 cls._call_count += 1
                 return cls._call_count == 1  # True first time, False second time
 
-            def claim_batch(self, worker_id="default"):
+            def claim_batch(self, worker_id="default", *, exclude_event_types=None):
                 return [(event.uri, event)]
 
             def mark_done(self, event, node_uri):
@@ -1035,7 +1035,7 @@ class TestPostUpsertLivenessCheck:
                 # Pre-check returns False — event already gone
                 return False
 
-            def claim_batch(self, worker_id="default"):
+            def claim_batch(self, worker_id="default", *, exclude_event_types=None):
                 return [(event.uri, event)]
 
             def mark_done(self, event, node_uri):

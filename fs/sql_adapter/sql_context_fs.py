@@ -1083,7 +1083,7 @@ class SQLContextFS(PoolAdapterMixin):
                     (
                         ctx.account_id,
                         ["profile", "preference", "entity", "event", "case", "pattern",
-                         "tool", "session_summary", "session_archive"],
+                         "tool", "experience", "session_summary", "session_archive"],
                     ),
                 )
                 rows = cur.fetchall()
@@ -1095,7 +1095,7 @@ class SQLContextFS(PoolAdapterMixin):
         allowed = {
             "profile": "profile", "preferences": "preference", "entities": "entity",
             "events": "event", "cases": "case", "patterns": "pattern",
-            "tools": "tool", "session_summaries": "session_summary",
+            "tools": "tool", "tool_units": "tool", "experiences": "experience", "session_summaries": "session_summary",
             "session_archives": "session_archive",
         }
         for parent, category, count in rows:

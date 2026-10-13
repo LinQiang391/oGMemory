@@ -10,7 +10,7 @@ from core.models import ContextNode, OutboxEvent
 
 def build_write_event(node: ContextNode) -> OutboxEvent:
     """Build an UPSERT event for a memory node."""
-    from index.index_record_builder import build_index_records
+    from index.index_record_builder import agent_memory_index_ids, build_index_records
 
     records_data = [
         {
@@ -23,14 +23,15 @@ def build_write_event(node: ContextNode) -> OutboxEvent:
         }
         for record in build_index_records(node)
     ]
+    payload = {"records": records_data, "task_owner_spaces": _task_owner_spaces(node)}
+    if node.metadata.get("agent_memory_version") == 1:
+        payload["agent_memory_version"] = 1
+        payload["ids_to_delete"] = agent_memory_index_ids(node)
     return OutboxEvent(
         event_id=str(uuid.uuid4()),
         event_type=EventType.UPSERT_CONTEXT.value,
         uri=node.uri,
-        payload={
-            "records": records_data,
-            "task_owner_spaces": _task_owner_spaces(node),
-        },
+        payload=payload,
         status="PENDING",
     )
 

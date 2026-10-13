@@ -74,8 +74,12 @@ class ObserveModel(AgentMiddleware):
         return await handler(request)
 
 
-def main() -> None:
-    report_path = Path(os.getenv("OGMEM_VERIFY_REPORT", "deepagents-verification.json"))
+def main(*, report_path: Path | None = None, wait_seconds: int | None = None) -> dict[str, Any]:
+    report_path = report_path or Path(os.getenv("OGMEM_VERIFY_REPORT", "deepagents-verification.json"))
+    if wait_seconds is None:
+        wait_seconds = int(os.getenv("OGMEM_VERIFY_WAIT_SECONDS", "300"))
+    if wait_seconds <= 0:
+        raise ValueError("wait_seconds must be positive")
     run_id = uuid4().hex[:12]
     project = "DA验证" + run_id
     hour = 9 + int(run_id[:2], 16) % 12
@@ -126,14 +130,17 @@ def main() -> None:
         config={"configurable": {"thread_id": write_session}},
     )
     report["write_answer"] = result["messages"][-1].content
-    assert len([c for c in memory.calls if c["path"] == "after_turn"]) == 1
+    writes = [c for c in memory.calls if c["path"] == "after_turn"]
+    assert len(writes) == 1, "Expected exactly one automatic turn capture"
+    assert writes[0]["ok"] is True, "Service did not acknowledge the automatic write"
+    assert writes[0]["message_count"] == 2, "Write must contain the current user and assistant messages"
     memory.dispose(write_session)
     print("WRITE_ANSWER", report["write_answer"], flush=True)
 
     # Poll the real service for extraction/index readiness, rather than assuming
     # that an accepted after_turn response means the memory is searchable.
     evidence = ""
-    deadline = time.monotonic() + int(os.getenv("OGMEM_VERIFY_WAIT_SECONDS", "300"))
+    deadline = time.monotonic() + wait_seconds
     with httpx.Client(timeout=120) as client:
         while time.monotonic() < deadline:
             response = client.post(
@@ -183,6 +190,9 @@ def main() -> None:
         assert any(run_id in context for context in observer.memory_contexts), (
             "Async model did not receive the test memory"
         )
+        assert not any("<ogmemory-context>" in str(m.content) for m in result["messages"]), (
+            "Async recall context was persisted in conversation history"
+        )
         await memory.adispose(async_session)
         return result["messages"][-1].content
 
@@ -197,6 +207,7 @@ def main() -> None:
     )
     print("PASS: real model + automatic capture + cross-session sync/async recall", flush=True)
     print("REPORT:", report_path.resolve(), flush=True)
+    return report
 
 
 if __name__ == "__main__":
