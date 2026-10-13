@@ -525,3 +525,7 @@ COMPOSE_FILE=compose.yaml:deploy/compose/compose.network.yaml
 保存后执行 `docker compose config --quiet`，再重试启动。数据库仍通过服务名 `opengauss` 访问，不需要配置固定容器 IP。已运行的实例需要更改网段时，应安排停机并保留数据卷后重建网络。不要为解决此错误直接清理共享服务器上的其他项目网络。
 
 日志可能包含业务内容和供应商错误，分享前检查脱敏。排错优先保留数据，不默认删卷或重复写入。
+
+## Agent 工具与经验记忆
+
+部署模板默认关闭 Agent 记忆抽取。需要启用时，按 [Agent 记忆部署说明](../agent-memory.md) 修改挂载 YAML、重启服务并验证配置和 Trace 抽取结果。
