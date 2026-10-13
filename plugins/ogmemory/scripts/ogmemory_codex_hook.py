@@ -608,6 +608,8 @@ def handle_event(hook: dict[str, Any]) -> dict[str, Any] | None:
 
 
 def main() -> int:
+    for stream in (sys.stdin, sys.stdout, sys.stderr):
+        stream.reconfigure(encoding="utf-8", errors="strict")
     try:
         hook = json.load(sys.stdin)
     except (TypeError, ValueError):
