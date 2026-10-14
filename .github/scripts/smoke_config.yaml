@@ -1,0 +1,28 @@
+llm:
+  provider: mock
+  api_key: ci-unused-key
+embedding:
+  provider: mock
+vector_db:
+  type: memory
+  dimension: 1024
+service:
+  http_port: 8090
+  workers: 1
+  threads: 4
+mcp:
+  enabled: false
+storage:
+  backend: agfs
+agfs:
+  base_url: http://127.0.0.1:1833
+  mount_prefix: /local/plugin
+index:
+  interval: 2
+  workers: 1
+identity:
+  account_id: ci-smoke
+  user_id: ci-user
+  agent_id: ci-agent
+auth:
+  role_control_enabled: false
