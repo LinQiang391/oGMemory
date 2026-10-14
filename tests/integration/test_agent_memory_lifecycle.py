@@ -91,6 +91,7 @@ def _run_service(url, workers):
     service._get_outbox_store = lambda fs: outbox
     service._get_trace_event_store = lambda: store
     service._get_shared_projection_index = lambda: index
+    service._get_shared_vector_index = lambda: index
     service._get_shared_embedder = lambda: SameEmbedding()
     service.get_llm = lambda: ExtractionLLM()
     events = message_events(MESSAGES) + [{"event_type": "turn_end", "status": "ok"}]
