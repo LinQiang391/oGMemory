@@ -305,6 +305,10 @@ body { background: var(--surface-solid); }
 .retrieval-toolbar { display: flex; flex-wrap: wrap; align-items: center; gap: 8px; }
 .retrieval-toolbar label, .retrieval-filters label { display: flex; height: 34px; align-items: center; gap: 7px; padding: 0 8px 0 11px; border: 1px solid var(--line); border-radius: 8px; background: var(--surface-solid); color: var(--muted); font-size: 11px; font-weight: 600; }
 .retrieval-toolbar select, .retrieval-filters select, .retrieval-filters input { height: 26px; border: 0; outline: 0; background: transparent; color: var(--ink); font-size: 11px; }
+/* Native select menus need an opaque theme background for their options. */
+.retrieval-toolbar select, .retrieval-filters select { background-color: var(--surface-solid); color-scheme: inherit; }
+.retrieval-toolbar select option, .retrieval-filters select option { background-color: var(--surface-solid); color: var(--ink); }
+.retrieval-toolbar label:focus-within, .retrieval-filters label:focus-within { border-color: var(--line-strong); box-shadow: 0 0 0 2px color-mix(in srgb, var(--violet) 16%, transparent); }
 .retrieval-scope-control select { max-width: 240px; }
 .retrieval-mode { display: inline-flex; height: 34px; align-items: center; padding: 0 13px; border-radius: 8px; background: color-mix(in srgb, var(--ink) 6%, transparent); color: var(--ink); font-family: ui-monospace, SFMono-Regular, Consolas, monospace; font-size: 11px; font-weight: 700; }
 .toolbar-button { height: 34px; padding: 0 12px; border: 1px solid var(--line); border-radius: 8px; background: var(--surface-solid); color: var(--ink); cursor: pointer; font-size: 11px; }
