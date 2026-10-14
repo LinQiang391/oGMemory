@@ -18,6 +18,232 @@ function host(config) {
   return { engine: factory(), hooks };
 }
 
+async function identityServer(t, onRequest = () => {}) {
+  const calls = [];
+  const server = createServer(async (req, res) => {
+    let raw = "";
+    for await (const chunk of req) raw += chunk;
+    const call = { path: req.url, body: JSON.parse(raw || "{}") };
+    calls.push(call);
+    await onRequest(call);
+    res.setHeader("Content-Type", "application/json");
+    res.end(JSON.stringify({ ok: true, disposed: true, messages: [], estimatedTokens: 0, prepareToken: "test-token" }));
+  });
+  server.listen(0, "127.0.0.1");
+  await once(server, "listening");
+  t.after(async () => {
+    server.closeAllConnections();
+    await new Promise((resolve) => server.close(resolve));
+  });
+  const instance = host({
+    memoryApiBaseUrl: `http://127.0.0.1:${server.address().port}`,
+    agentId: "configured-fallback",
+    autoCapture: false,
+    prefetchEnabled: false,
+  });
+  const end = instance.hooks.filter((hook) => hook.name === "session_end").at(-1).handler;
+  return { ...instance, end, calls };
+}
+
+for (const eviction of ["expiry", "capacity"]) {
+  test(`updated runtime identity survives ${eviction}`, async (t) => {
+    let timestamp = Date.now();
+    t.mock.method(Date, "now", () => timestamp);
+    const { engine, end, calls } = await identityServer(t);
+    await engine.afterTurn({ sessionId: "live", agentId: "old-agent", messages: [] });
+    await engine.ingest({ sessionId: "live", agentId: "new-agent" });
+    if (eviction === "expiry") timestamp += 2 * 60 * 60 * 1000 + 1;
+    else {
+      for (let index = 0; index < 2049; index += 1) {
+        await engine.ingest({ sessionId: `other-${index}`, agentId: "other-agent" });
+      }
+    }
+    await engine.assemble({ sessionId: "live", messages: [] });
+    await end({ sessionId: "live", reason: "deleted" }, {});
+    assert.deepEqual(calls.map(({ body }) => body.agentId), ["new-agent", "new-agent", "new-agent"]);
+  });
+  for (const keyOnly of [false, true]) {
+    test(`trace restores saved identity after ${eviction} before CE, keyOnly=${keyOnly}`, { timeout: 5000 }, async (t) => {
+      let timestamp = Date.now();
+      t.mock.method(Date, "now", () => timestamp);
+      let receiveTrace;
+      const trace = new Promise((resolve) => { receiveTrace = resolve; });
+      const { engine, hooks, calls } = await identityServer(t, ({ path, body }) => {
+        if (path.endsWith("/trace/events")) receiveTrace(body);
+      });
+      const session = { sessionId: "live", sessionKey: "agent:main:legacy-key" };
+      await engine.afterTurn({ ...session, agentId: "runtime-agent", messages: [] });
+      if (eviction === "expiry") timestamp += 2 * 60 * 60 * 1000 + 1;
+      else {
+        for (let index = 0; index < 2049; index += 1) {
+          await engine.ingest({ sessionId: `other-${index}`, agentId: "other-agent" });
+        }
+      }
+      for (const hook of hooks.filter((hook) => hook.name === "before_tool_call")) {
+        await hook.handler({ toolName: "read", params: { path: "README.md" } }, keyOnly ? { sessionKey: session.sessionKey } : session);
+      }
+      const envelope = await trace;
+      await engine.assemble({ sessionId: "live", messages: [] });
+      assert.deepEqual([envelope.agent_id, calls.find(({ path }) => path.endsWith("/compose")).body.agentId],
+        ["runtime-agent", "runtime-agent"]);
+    });
+  }
+  for (const operation of ["assemble", "compact", "afterTurn"]) {
+    test(`live session retains identity after ${eviction} during ${operation}`, async (t) => {
+      let timestamp = Date.now();
+      t.mock.method(Date, "now", () => timestamp);
+      const { engine, end, calls } = await identityServer(t);
+      await engine.afterTurn({ sessionId: "live", sessionKey: "agent:main:live", messages: [] });
+      if (eviction === "expiry") timestamp += 2 * 60 * 60 * 1000 + 1;
+      else {
+        for (let index = 0; index < 2049; index += 1) {
+          await engine.ingest({ sessionId: `other-${index}`, agentId: "other-agent" });
+        }
+      }
+      await engine[operation]({ sessionId: "live", messages: [] });
+      await end({ sessionId: "live", reason: "deleted" }, {});
+      assert.ok(calls.length >= 2);
+      for (const { body } of calls) assert.equal(body.agentId, "main");
+    });
+  }
+  for (const sessionKey of [undefined, "agent:main:legacy-key"]) {
+    test(`session cleanup preserves its saved identity after ${eviction}, key=${sessionKey}`, async (t) => {
+      let timestamp = Date.now();
+      t.mock.method(Date, "now", () => timestamp);
+      const { engine, hooks, calls } = await identityServer(t);
+      await engine.afterTurn({ sessionId: "old", sessionKey, agentId: "runtime-agent", messages: [] });
+      if (eviction === "expiry") timestamp += 2 * 60 * 60 * 1000 + 1;
+      else {
+        for (let index = 0; index < 2049; index += 1) {
+          await engine.ingest({ sessionId: `other-${index}`, agentId: "other-agent" });
+        }
+      }
+      const event = { sessionId: "old", sessionKey, reason: "deleted" };
+      for (const hook of hooks.filter((hook) => hook.name === "session_end")) {
+        await hook.handler(event, {});
+      }
+      assert.deepEqual(calls.filter(({ path }) => !path.endsWith("/trace/events"))
+        .map(({ path, body }) => [path, body.agentId]), [
+        ["/api/v1/dispose", "runtime-agent"],
+        ["/api/v1/sessions/old", "runtime-agent"],
+      ]);
+    });
+  }
+}
+
+test("session key supplies identity after an initial configured fallback", async (t) => {
+  const { engine, calls } = await identityServer(t);
+  await engine.afterTurn({ sessionId: "live", messages: [] });
+  await engine.assemble({ sessionId: "live", sessionKey: "agent:main:live", messages: [] });
+  assert.equal(calls.find(({ path }) => path.endsWith("/compose")).body.agentId, "main");
+});
+
+test("alias association preserves the latest explicit identity", async (t) => {
+  const { engine, calls } = await identityServer(t);
+  await engine.ingest({ sessionId: "live", agentId: "old-agent" });
+  await engine.ingest({ sessionKey: "agent:main:live", agentId: "new-agent" });
+  await engine.ingest({ sessionId: "live" });
+  await engine.assemble({ sessionId: "live", sessionKey: "agent:main:live", messages: [] });
+  assert.equal(calls.find(({ path }) => path.endsWith("/compose")).body.agentId, "new-agent");
+});
+
+test("alias association prefers explicit identity over a newer key-derived identity", async (t) => {
+  const { engine, calls } = await identityServer(t);
+  await engine.ingest({ sessionId: "live", agentId: "runtime-agent" });
+  await engine.ingest({ sessionKey: "agent:main:live" });
+  await engine.assemble({ sessionId: "live", sessionKey: "agent:main:live", messages: [] });
+  assert.equal(calls.find(({ path }) => path.endsWith("/compose")).body.agentId, "runtime-agent");
+});
+
+test("completed session releases its retained identity before reuse", async (t) => {
+  const { engine, end, calls } = await identityServer(t);
+  await engine.afterTurn({ sessionId: "live", agentId: "runtime-agent", messages: [] });
+  await end({ sessionId: "live", reason: "deleted" }, {});
+  await engine.assemble({ sessionId: "live", sessionKey: "agent:main:reused", messages: [] });
+  assert.equal(calls.find(({ path }) => path.endsWith("/compose")).body.agentId, "main");
+});
+
+test("late session key survives expiry and is released at session end", async (t) => {
+  let timestamp = Date.now();
+  t.mock.method(Date, "now", () => timestamp);
+  const { engine, end, calls } = await identityServer(t);
+  const sessionKey = "agent:main:late";
+  await engine.afterTurn({ sessionId: "live", agentId: "runtime-agent", messages: [] });
+  await engine.ingest({ sessionId: "live", sessionKey });
+  timestamp += 2 * 60 * 60 * 1000 + 1;
+  await engine.assemble({ sessionKey, messages: [] });
+  await end({ sessionKey }, {});
+  await engine.assemble({ sessionKey, messages: [] });
+  assert.deepEqual(calls.filter(({ path }) => path.endsWith("/compose")).map(({ body }) => body.agentId),
+    ["runtime-agent", "main"]);
+});
+
+test("live session uses the latest runtime identity before its saved identity", async (t) => {
+  const { engine, end, calls } = await identityServer(t);
+  await engine.afterTurn({ sessionId: "live", agentId: "old-agent", messages: [] });
+  await engine.ingest({ sessionId: "live", agentId: "new-agent" });
+  await engine.assemble({ sessionId: "live", messages: [] });
+  assert.equal(calls.find(({ path }) => path.endsWith("/compose")).body.agentId, "new-agent");
+  await end({ sessionId: "live", reason: "deleted" }, {});
+  assert.deepEqual(calls.map(({ body }) => body.agentId), ["new-agent", "new-agent", "new-agent"]);
+});
+
+test("reset preserves the new session identity while old disposal is pending", { timeout: 5000 }, async (t) => {
+  let releaseDispose;
+  let disposalStarted;
+  const pending = new Promise((resolve) => { releaseDispose = resolve; });
+  const started = new Promise((resolve) => { disposalStarted = resolve; });
+  const { engine, end, calls } = await identityServer(t, async ({ path }) => {
+    if (path.endsWith("/dispose")) {
+      disposalStarted();
+      await pending;
+    }
+  });
+  const sessionKey = "agent:runtime-agent:channel:conversation";
+  await engine.afterTurn({ sessionId: "old", sessionKey, agentId: "runtime-agent", messages: [] });
+  const cleanup = end({ sessionId: "old", sessionKey, reason: "reset" }, {});
+  try {
+    await started;
+    await engine.assemble({ sessionId: "new", sessionKey, agentId: "runtime-agent", messages: [] });
+  } finally {
+    releaseDispose();
+    await cleanup;
+  }
+  await engine.assemble({ sessionId: "new", messages: [] });
+  assert.deepEqual(calls.filter(({ path }) => path.endsWith("/compose"))
+    .map(({ body }) => body.agentId), ["runtime-agent", "runtime-agent"]);
+});
+
+test("active session aliases retain their runtime identity at cache capacity", { timeout: 5000 }, async (t) => {
+  let receiveTrace;
+  const trace = new Promise((resolve) => { receiveTrace = resolve; });
+  const { engine, hooks } = await identityServer(t, ({ path, body }) => {
+    if (path.endsWith("/trace/events")) receiveTrace(body);
+  });
+  const sessionKey = "agent:main:active";
+  await engine.ingest({ sessionId: "active", sessionKey, agentId: "runtime-agent" });
+  for (let index = 0; index < 2046; index += 1) {
+    await engine.ingest({ sessionId: `idle-${index}`, agentId: "idle-agent" });
+  }
+  await engine.ingest({ sessionId: "active" });
+  await engine.ingest({ sessionId: "new", agentId: "new-agent" });
+  for (const hook of hooks.filter((hook) => hook.name === "before_tool_call")) {
+    await hook.handler({ toolName: "read", params: { path: "README.md" } }, { sessionKey });
+  }
+  assert.equal((await trace).agent_id, "runtime-agent");
+});
+
+test("sessionKey-only end releases the runtime identity for the next session", async (t) => {
+  const { engine, hooks, calls } = await identityServer(t);
+  const sessionKey = "agent:main:reused";
+  await engine.ingest({ sessionKey, agentId: "runtime-agent" });
+  for (const hook of hooks.filter((hook) => hook.name === "session_end")) {
+    await hook.handler({ sessionKey }, {});
+  }
+  await engine.assemble({ sessionKey, messages: [] });
+  assert.equal(calls.find(({ path }) => path.endsWith("/compose")).body.agentId, "main");
+});
+
 test("capture/recall defaults, environment and explicit false precedence", () => {
   const names = ["OGMEM_AUTO_CAPTURE", "OGMEM_AUTO_RECALL"];
   const saved = names.map((name) => process.env[name]);
@@ -157,4 +383,70 @@ test("explicit compact remains available with automatic capture disabled", async
   });
   assert.equal(result.compacted, true);
   assert.deepEqual(calls, ["prepare_compaction", "compact"]);
+});
+
+test("trace and context engine share the runtime agent over HTTP", async () => {
+  const calls = [];
+  const server = createServer(async (req, res) => {
+    let raw = "";
+    for await (const chunk of req) raw += chunk;
+    const body = JSON.parse(raw || "{}");
+    calls.push({ path: req.url, body });
+    res.setHeader("Content-Type", "application/json");
+    res.end(JSON.stringify(req.url.endsWith("/compose")
+      ? { messages: [], estimatedTokens: 0 }
+      : { ok: true, prepareToken: "prepared", compacted: false }));
+  });
+  server.listen(0, "127.0.0.1");
+  await once(server, "listening");
+  const { engine, hooks } = host({
+    memoryApiBaseUrl: `http://127.0.0.1:${server.address().port}`,
+    agentId: "configured-fallback",
+    compactTakeoverEnabled: true,
+    prefetchEnabled: true,
+  });
+  const emit = async (name, event, context) => {
+    for (const hook of hooks.filter((hook) => hook.name === name)) {
+      await hook.handler(event, context);
+    }
+  };
+  const waitForTrace = async (sessionId) => {
+    for (let attempt = 0; attempt < 100; attempt += 1) {
+      if (calls.some(({ path, body }) => path.endsWith("/trace/events")
+        && body.session_id === sessionId)) return;
+      await new Promise((resolve) => setTimeout(resolve, 10));
+    }
+    throw new Error(`Trace upload timed out for ${sessionId}`);
+  };
+  try {
+    for (const agentId of ["main", "custom-agent"]) {
+      calls.length = 0;
+      const sessionId = `session-${agentId}`;
+      const sessionKey = `agent:${agentId}:channel:conversation`;
+      const params = { sessionId, sessionKey, messages: [{ role: "user", content: "hello" }] };
+      await engine.assemble(params);
+      await emit("before_agent_run", { prompt: "hello", messages: [] }, { sessionId, sessionKey, agentId });
+      await waitForTrace(sessionId);
+      await engine.ingest({ sessionId, messages: params.messages });
+      await engine.afterTurn({ sessionId, messages: params.messages });
+      await engine.compact({ sessionId });
+      await emit("session_end", { sessionId, reason: "reset" }, {});
+      const paths = calls.map(({ path }) => path);
+      for (const endpoint of ["prefetch", "compose", "trace/events", "ingest", "after_turn", "prepare_compaction", "compact", "dispose"]) {
+        assert.ok(paths.includes(`/api/v1/${endpoint}`), endpoint);
+      }
+      for (const { body } of calls) assert.equal(body.agent_id || body.agentId, agentId);
+    }
+    calls.length = 0;
+    await emit("before_agent_run", { prompt: "hello", messages: [] }, { sessionId: "hook-first", agentId: "runtime-custom" });
+    await waitForTrace("hook-first");
+    await engine.assemble({ sessionId: "hook-first", sessionKey: "agent:main:legacy-key", messages: [] });
+    assert.equal(calls.find(({ path }) => path.endsWith("/compose")).body.agentId, "runtime-custom");
+    await emit("session_end", { sessionId: "hook-first", reason: "reset" }, {});
+    await engine.assemble({ sessionId: "hook-first", messages: [] });
+    assert.equal(calls.filter(({ path }) => path.endsWith("/compose")).at(-1).body.agentId, "configured-fallback");
+  } finally {
+    server.closeAllConnections();
+    await new Promise((resolve) => server.close(resolve));
+  }
 });

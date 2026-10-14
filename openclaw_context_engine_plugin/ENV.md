@@ -70,7 +70,7 @@ These can also be provided in OpenClaw lifecycle params.
 | --- | --- | --- | --- |
 | none | `accountId` | empty | Default account ID. |
 | none | `userId` | empty | Default user ID. |
-| none | `agentId` | empty | Default agent ID. |
+| none | `agentId` | empty | Fallback agent ID. Trace and CE share the session runtime agent ID; OpenClaw session keys supply the agent ID before hooks arrive. Register and authorize that runtime agent in oGMemory. |
 
 ## Local ContextEngine Provider
 

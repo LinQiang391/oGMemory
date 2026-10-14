@@ -26,6 +26,7 @@ import {
   findGoBinary,
   findPythonBin,
 } from "./process.js";
+import { createSessionAgentResolver } from "./session-agent.js";
 import { appendTakeoverCompactionBoundary } from "./compaction-boundary.js";
 import {
   isOpenClawHeartbeatMessage,
@@ -1957,7 +1958,13 @@ export default {
     // Context engine registration
     // =======================================================================
 
-    registerOpenClawTraceHooks(api, cfg);
+    const sessionIdentities = new Map();
+    const sessionAgents = createSessionAgentResolver(cfg.agentId);
+    const withSessionAgent = (params) => ({
+      ...params,
+      agentId: sessionAgents.resolve(params),
+    });
+    registerOpenClawTraceHooks(api, cfg, { sessionAgents });
 
     if (cfg.toolResultExternalizationEnabled) {
       api.on("before_tool_call", (event, ctx) => {
@@ -1980,19 +1987,24 @@ export default {
       });
     }
 
-    const sessionIdentities = new Map();
     const sessionFlushers = new Map();
     api.on("session_end", async (event, ctx) => {
       const sessionId = event?.sessionId || ctx?.sessionId || "";
-      if (!sessionId) return;
+      if (!sessionId) {
+        sessionAgents.forget(event, ctx);
+        return;
+      }
       const reason = event?.reason || "unknown";
       const deleteRequested = reason === "deleted";
 
-      const identity = sessionIdentities.get(sessionId) || {
+      const savedIdentity = sessionIdentities.get(sessionId);
+      const identity = {
         accountId: cfg.accountId,
         userId: cfg.userId,
-        agentId: cfg.agentId,
+        ...savedIdentity,
+        agentId: sessionAgents.resolve(event, ctx),
       };
+      sessionAgents.forget(event, ctx);
       console.log(
         `[og-memory] session_end dispose called, sessionId=${sessionId}, reason=${reason}`,
       );
@@ -2298,6 +2310,7 @@ export default {
       },
 
       async ingest(params) {
+        params = withSessionAgent(params);
         if (!cfg.autoCapture) return { ingested: false };
         if (isHeartbeatContextRun(params)) return { ingested: false };
         return call(
@@ -2307,6 +2320,7 @@ export default {
       },
 
       async assemble(params) {
+        params = withSessionAgent(params);
         const messages = params?.messages || [];
         const sessionKey = afterTurnSessionKey(params);
         if (sessionKey) {
@@ -2427,6 +2441,7 @@ export default {
       },
 
       async compact(params) {
+        params = withSessionAgent(params);
         return runCompactControlFlow({
           cfg,
           params,
@@ -2435,6 +2450,7 @@ export default {
       },
 
       async afterTurn(params) {
+        params = withSessionAgent(params);
         if (isHeartbeatContextRun(params)) return;
         const messages = params?.messages || [];
         const filtered = withoutHeartbeatTurns(
@@ -2474,6 +2490,7 @@ export default {
           agentId: lifecycleParams?.agentId || cfg.agentId,
         };
         if (lifecycleParams?.sessionId) {
+          sessionAgents.retain(lifecycleParams.sessionId);
           sessionIdentities.set(lifecycleParams.sessionId, identity);
         }
         // Only capture work is skipped; local lifecycle bookkeeping remains active.

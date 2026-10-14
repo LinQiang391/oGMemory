@@ -1,5 +1,6 @@
 import { randomUUID as nodeRandomUUID } from "node:crypto";
 import { isIP } from "node:net";
+import { createSessionAgentResolver } from "./session-agent.js";
 
 const MAX_TRACE_CONTENT_CHARS = 10_000;
 const MAX_TRACE_BODY_BYTES = 60_000;
@@ -404,6 +405,7 @@ export function registerOpenClawTraceHooks(api, cfg, deps = {}) {
   const randomUUID = deps.randomUUID || nodeRandomUUID;
   const now = deps.now || (() => new Date());
   const nowMs = deps.nowMs || (() => Date.now());
+  const sessionAgents = deps.sessionAgents || createSessionAgentResolver(cfg.agentId, nowMs);
   const sessionIdentities = new Map();
   const pendingSessionStarts = new Map();
   const heartbeatRuns = new Map();
@@ -576,18 +578,15 @@ export function registerOpenClawTraceHooks(api, cfg, deps = {}) {
       for (const identity of matchedIdentities) {
         cachedIdentity.accountId ||= identity.accountId;
         cachedIdentity.userId ||= identity.userId;
-        cachedIdentity.agentId ||= identity.agentId;
       }
       const runtimeIdentity = {
         accountId: event?.accountId || ctx?.accountId,
         userId: event?.senderId || ctx?.senderId,
-        agentId: event?.agentId || ctx?.agentId,
       };
       cachedIdentity.accountId = runtimeIdentity.accountId || cachedIdentity.accountId;
       cachedIdentity.userId = runtimeIdentity.userId || cachedIdentity.userId;
-      cachedIdentity.agentId = runtimeIdentity.agentId || cachedIdentity.agentId;
       cachedIdentity.lastSeenMs = nowMs();
-      if ([cachedIdentity.accountId, cachedIdentity.userId, cachedIdentity.agentId].some(Boolean)) {
+      if ([cachedIdentity.accountId, cachedIdentity.userId].some(Boolean)) {
         for (const [alias, identity] of sessionIdentities) {
           if (matchedIdentities.has(identity)) sessionIdentities.set(alias, cachedIdentity);
         }
@@ -599,7 +598,7 @@ export function registerOpenClawTraceHooks(api, cfg, deps = {}) {
         timestamp: now().toISOString(),
         account_id: cachedIdentity.accountId || cfg.accountId,
         user_id: cachedIdentity.userId || cfg.userId,
-        agent_id: cachedIdentity.agentId || cfg.agentId,
+        agent_id: sessionAgents.resolve(event, ctx),
         session_id: String(sessionId),
         event: canonicalEvent,
       };
@@ -613,6 +612,7 @@ export function registerOpenClawTraceHooks(api, cfg, deps = {}) {
       }
       scheduleTraceUpload(envelope);
       if (hookName === "session_end") {
+        if (!deps.sessionAgents) sessionAgents.forget(event, ctx);
         const currentAliases = new Set(aliases);
         for (const [alias, identity] of sessionIdentities) {
           if (identity === cachedIdentity || currentAliases.has(alias)) {
