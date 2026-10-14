@@ -63,7 +63,7 @@ def table_names(control, name):
 
 def test_transaction_reinitializes_while_another_initializer_waits_for_its_ddl(targets, monkeypatch):
     dialect, names, control, _ = targets
-    dsn = psycopg2.extensions.make_dsn(control.dsn, options=f"-c search_path={names[0]} -c statement_timeout=8000")
+    dsn = psycopg2.extensions.make_dsn(os.environ[f"OGMEM_SCOPE_{dialect.upper()}_TEST_DSN"], options=f"-c search_path={names[0]} -c statement_timeout=8000")
     first, second = psycopg2.connect(dsn), psycopg2.connect(dsn)
     held = threading.Event()
     original_lock = schema._target_lock

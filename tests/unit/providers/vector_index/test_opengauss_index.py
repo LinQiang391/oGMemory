@@ -4,12 +4,11 @@ Uses mock database connection for isolated testing.
 For integration tests with real database, see scripts/test_opengauss_index.py
 """
 
-import math
-import pytest
-from unittest.mock import Mock, MagicMock, patch
-from typing import Any
+from unittest.mock import patch
 
-from core.models import IndexRecord, TypedQuery, SeedHit
+import pytest
+
+from core.models import IndexRecord, SeedHit, TypedQuery
 
 
 # Mock Json to just pass through the input value
@@ -24,8 +23,10 @@ class MockJson:
         return self.obj == other
 
 
-# Apply the mock at module level
-patch('providers.vector_index.opengauss_index.Json', MockJson).start()
+@pytest.fixture(autouse=True)
+def mock_json_adapter():
+    with patch("providers.vector_index.opengauss_index.Json", MockJson):
+        yield
 
 
 class MockCursor:

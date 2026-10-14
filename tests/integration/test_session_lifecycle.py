@@ -137,8 +137,11 @@ class TestFullLifecycle:
 class TestMemoryServiceSessionIntegration:
     @pytest.fixture
     def service(self):
+        import uuid
+
         from providers.unified_config import OgMemConfig
         cfg = OgMemConfig(
+            account_id=f"session-test-{uuid.uuid4().hex}",
             agfs_base_url="http://localhost:1833",
             agfs_mount_prefix="/local/plugin",
         )
