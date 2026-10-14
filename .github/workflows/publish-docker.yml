@@ -1,0 +1,200 @@
+name: Publish oGMemory ARM64 image
+
+on:
+  workflow_dispatch:
+    inputs:
+      image_tag:
+        description: 'Shared image and Release tag; empty = current Asia/Shanghai date MMDD (no latest)'
+        required: false
+        type: string
+      source_sha:
+        description: 'Optional full historical SHA; empty = freshly fetched GitCode master (sync always runs first)'
+        required: false
+        type: string
+      push_image:
+        description: 'Push tested image to SWR (requires SWR_USERNAME and SWR_PASSWORD)'
+        type: boolean
+        default: false
+      create_release:
+        description: 'Archive the same gated image as tar.gz in GitHub Release'
+        type: boolean
+        default: false
+      allow_overwrite:
+        description: 'Allow replacing existing SWR tag and Release/tag/assets (old archive is replaced)'
+        type: boolean
+        default: false
+      build_runner:
+        description: 'Native ARM64 build environment'
+        type: choice
+        options:
+          - github-arm64
+          - self-hosted-arm64
+        default: github-arm64
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ogmemory-arm64-publish
+  cancel-in-progress: false
+
+jobs:
+  resolve:
+    if: github.repository == 'LinQiang391/oGMemory' && github.ref == 'refs/heads/ci'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    permissions:
+      contents: write
+    concurrency:
+      group: sync-gitcode-master
+      cancel-in-progress: false
+    outputs:
+      source_sha: ${{ steps.source.outputs.sha }}
+      image_tag: ${{ steps.source.outputs.image_tag }}
+    steps:
+      - name: Checkout trusted CI configuration
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ github.sha }}
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Sync fresh GitCode master and pin build source
+        id: source
+        shell: bash
+        env:
+          IMAGE_TAG: ${{ inputs.image_tag }}
+          REQUESTED_SHA: ${{ inputs.source_sha }}
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          PUSH_IMAGE: ${{ inputs.push_image }}
+        run: |
+          set -euo pipefail
+          if [[ -z "$IMAGE_TAG" ]]; then
+            IMAGE_TAG=$(TZ=Asia/Shanghai date +%m%d)
+          fi
+          export IMAGE_TAG
+          python3 - <<'PY'
+          import os, re
+          tag = os.environ['IMAGE_TAG']
+          if not re.fullmatch(r'[A-Za-z0-9_][A-Za-z0-9_.-]{0,127}', tag) or tag.lower() == 'latest':
+              raise SystemExit('Use an explicit valid Docker tag; latest is not allowed')
+          sha = os.environ['REQUESTED_SHA']
+          if sha and not re.fullmatch(r'[0-9a-fA-F]{40}', sha):
+              raise SystemExit('source_sha must be an exact 40-character commit SHA')
+          PY
+          git fetch --no-tags origin refs/heads/master:refs/remotes/origin/master
+          git fetch --no-tags https://gitcode.com/opengauss/oGMemory.git \
+            refs/heads/master:refs/remotes/gitcode/master
+          current=$(git rev-parse refs/remotes/origin/master)
+          upstream=$(git rev-parse refs/remotes/gitcode/master)
+          if [[ "$current" != "$upstream" ]]; then
+            if ! git merge-base --is-ancestor "$current" "$upstream"; then
+              printf '%s\n' 'master has diverged; refusing force update or stale-source build.' >&2
+              exit 1
+            fi
+            authorization=$(printf 'x-access-token:%s' "$GH_TOKEN" | base64 -w0)
+            printf '::add-mask::%s\n' "$authorization"
+            GIT_CONFIG_COUNT=1 \
+            GIT_CONFIG_KEY_0=http.https://github.com/.extraheader \
+            GIT_CONFIG_VALUE_0="AUTHORIZATION: basic $authorization" \
+              git push origin refs/remotes/gitcode/master:refs/heads/master
+          fi
+          remote=$(gh api "repos/$GH_REPO/git/ref/heads/master" --jq '.object.sha')
+          if [[ "$remote" != "$upstream" ]]; then
+            printf '%s\n' 'GitHub master does not match fetched GitCode SHA; refusing build.' >&2
+            exit 1
+          fi
+          sha="$upstream"
+          mode=latest-gitcode-master
+          if [[ -n "$REQUESTED_SHA" ]]; then
+            sha=$(git rev-parse --verify "${REQUESTED_SHA}^{commit}")
+            git merge-base --is-ancestor "$sha" "$upstream"
+            mode=explicit-source-sha
+          fi
+          git cat-file -e "$sha:docker/Dockerfile.compose"
+          printf 'sha=%s\n' "$sha" >> "$GITHUB_OUTPUT"
+          printf 'image_tag=%s\n' "$IMAGE_TAG" >> "$GITHUB_OUTPUT"
+          printf 'Source mode: `%s`\n\nFetched GitCode master: `%s`\n\nBuild SHA: `%s`\n\nImage tag: `%s`\n\nPush: `%s`\n' \
+            "$mode" "$upstream" "$sha" "$IMAGE_TAG" "$PUSH_IMAGE" >> "$GITHUB_STEP_SUMMARY"
+
+  publish:
+    needs: resolve
+    runs-on: ${{ inputs.build_runner == 'self-hosted-arm64' && fromJSON('["self-hosted","Linux","ARM64","ogmemory-arm64"]') || fromJSON('["ubuntu-24.04-arm"]') }}
+    timeout-minutes: 180
+    permissions:
+      contents: write
+    steps:
+      - name: Checkout pinned CI helpers
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ github.sha }}
+          path: ci
+          persist-credentials: false
+
+      - name: Checkout immutable source (not CI branch)
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ needs.resolve.outputs.source_sha }}
+          path: source
+          persist-credentials: false
+
+      - name: Install benchmark client dependencies
+        run: |
+          python3 -m venv "$RUNNER_TEMP/locomo-client"
+          "$RUNNER_TEMP/locomo-client/bin/pip" install requests httpx websocket-client openai pyyaml
+          printf '%s\n' "$RUNNER_TEMP/locomo-client/bin" >> "$GITHUB_PATH"
+
+      - name: Verify real LLM and Embedding access before building
+        env:
+          LLM_BASE_URL: ${{ vars.LLM_BASE_URL }}
+          LLM_MODEL: ${{ vars.LLM_MODEL }}
+          LLM_API_KEY: ${{ secrets.LLM_API_KEY }}
+          EMBEDDING_BASE_URL: ${{ vars.EMBEDDING_BASE_URL }}
+          EMBEDDING_MODEL: ${{ vars.EMBEDDING_MODEL }}
+          EMBEDDING_API_KEY: ${{ secrets.EMBEDDING_API_KEY }}
+        run: python3 ci/.github/scripts/locomo_gate.py --source source --output evidence --preflight-only
+
+      - name: Build and smoke-test without registry credentials
+        env:
+          SOURCE_SHA: ${{ needs.resolve.outputs.source_sha }}
+          IMAGE_TAG: ${{ needs.resolve.outputs.image_tag }}
+          ALLOW_OVERWRITE: ${{ inputs.allow_overwrite }}
+        run: python3 ci/.github/scripts/publish_image.py build --source source --output evidence
+
+      - name: Real LoCoMo small release gate (strictly above 80 percent)
+        env:
+          LLM_BASE_URL: ${{ vars.LLM_BASE_URL }}
+          LLM_MODEL: ${{ vars.LLM_MODEL }}
+          LLM_API_KEY: ${{ secrets.LLM_API_KEY }}
+          EMBEDDING_BASE_URL: ${{ vars.EMBEDDING_BASE_URL }}
+          EMBEDDING_MODEL: ${{ vars.EMBEDDING_MODEL }}
+          EMBEDDING_API_KEY: ${{ secrets.EMBEDDING_API_KEY }}
+        run: python3 ci/.github/scripts/locomo_gate.py --source source --output evidence
+
+      - name: Push SWR tag and verify remote image
+        if: inputs.push_image
+        env:
+          IMAGE_TAG: ${{ needs.resolve.outputs.image_tag }}
+          SWR_USERNAME: ${{ secrets.SWR_USERNAME }}
+          SWR_PASSWORD: ${{ secrets.SWR_PASSWORD }}
+          ALLOW_OVERWRITE: ${{ inputs.allow_overwrite }}
+        run: python3 ci/.github/scripts/publish_image.py push --source source --output evidence
+
+      - name: Archive gated image in GitHub Release
+        if: inputs.create_release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          IMAGE_TAG: ${{ needs.resolve.outputs.image_tag }}
+          ALLOW_OVERWRITE: ${{ inputs.allow_overwrite }}
+        run: python3 ci/.github/scripts/archive_release.py --output evidence --archive-dir release-assets
+
+      - name: Upload build and LoCoMo evidence (not image tar)
+        if: always()
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: ogmemory-arm64-evidence-${{ github.run_id }}-${{ github.run_attempt }}
+          path: evidence/
+          if-no-files-found: warn
+          retention-days: 14

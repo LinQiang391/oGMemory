@@ -1,0 +1,57 @@
+name: Sync GitCode master
+
+on:
+  schedule:
+    - cron: '17 * * * *'
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  sync:
+    if: github.repository == 'LinQiang391/oGMemory' && github.ref == 'refs/heads/ci'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    concurrency:
+      group: sync-gitcode-master
+      cancel-in-progress: false
+    steps:
+      - name: Checkout CI branch history
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ github.sha }}
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Fast-forward GitHub master from GitCode
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+        run: |
+          set -euo pipefail
+          git fetch --no-tags origin refs/heads/master:refs/remotes/origin/master
+          git fetch --no-tags https://gitcode.com/opengauss/oGMemory.git \
+            refs/heads/master:refs/remotes/gitcode/master
+          current=$(git rev-parse refs/remotes/origin/master)
+          upstream=$(git rev-parse refs/remotes/gitcode/master)
+          if [[ "$current" == "$upstream" ]]; then
+            printf 'master already synchronized: `%s`\n' "$upstream" >> "$GITHUB_STEP_SUMMARY"
+            exit 0
+          fi
+          if ! git merge-base --is-ancestor "$current" "$upstream"; then
+            printf '%s\n' 'master has diverged; refusing force update.' >&2
+            exit 1
+          fi
+          # Upload commit objects before updating the ref; a normal push rejects divergence.
+          authorization=$(printf 'x-access-token:%s' "$GH_TOKEN" | base64 -w0)
+          printf '::add-mask::%s\n' "$authorization"
+          GIT_CONFIG_COUNT=1 \
+          GIT_CONFIG_KEY_0=http.https://github.com/.extraheader \
+          GIT_CONFIG_VALUE_0="AUTHORIZATION: basic $authorization" \
+            git push origin refs/remotes/gitcode/master:refs/heads/master
+          remote=$(gh api "repos/$GH_REPO/git/ref/heads/master" --jq '.object.sha')
+          [[ "$remote" == "$upstream" ]]
+          printf 'Synced GitCode master to GitHub master.\n\nPrevious: `%s`\n\nSource SHA: `%s`\n' \
+            "$current" "$upstream" >> "$GITHUB_STEP_SUMMARY"
