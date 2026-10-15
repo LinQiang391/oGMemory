@@ -36,6 +36,11 @@ llm:
   model: "${LLM_MODEL}"
   temperature: 0.7
   max_tokens: 4096
+  # Per-request timeout, not the entire extraction pipeline deadline.
+  request_timeout_seconds: 120
+  # Reasoning models consume the output budget before emitting tool arguments.
+  # Validate full sessions; e.g. the tested GLM deployment needed max_tokens:
+  # 16384 and request_timeout_seconds: 300, not the defaults above.
   # api_key_command:
   #   command: ["/usr/local/bin/op", "read", "op://team/ogmemory/api-key"]
 
@@ -50,10 +55,37 @@ embedding:
   #   command: ["/usr/local/bin/op", "read", "op://team/ogmemory/embedding-api-key"]
   # st_model: "BAAI/bge-large-en-v1.5"
 
+# ---- Storage Backend ----
+# Picks the FS adapter used for context files, grants, outbox, subscriptions, etc.
+#   backend: sql   — context data lives in the relational DB (openGauss is PG-wire
+#                    compatible and can host these tables alongside the vector
+#                    index). Recommended; aligns with the long-term AGFS-removal
+#                    direction. The standalone image does not bundle AGFS.
+#   backend: agfs  — requires a separately managed AGFS server; openGauss
+#                    holds only the vector index. Configure agfs.base_url
+#                    for that server if you have an existing AGFS workflow.
+#
+# The connection string is assembled from STORAGE_DB_* env vars by the
+# container entrypoint (see docker/entrypoint-standalone.sh); the ${...}
+# references below are the local-run fallback. STORAGE_DB_HOST_PORT is
+# the port ogmem actually dials — it is the host port (compose forwards
+# this to the postgres container's internal 5432) because the ogmem
+# container runs with network_mode: host and can only reach bridge-
+# networked siblings via 127.0.0.1:<host_port>.
+storage:
+  backend: sql
+  connection_string: "host=${STORAGE_DB_HOST} port=${STORAGE_DB_HOST_PORT} dbname=${STORAGE_DB_NAME} user=${STORAGE_DB_USER} password=${STORAGE_DB_PASSWORD}"
+  pool_size: 5
+
 # ---- 向量数据库 ----
+# 连接串由容器 entrypoint 从 VECTOR_DB_* 环境变量拼装并注入（见
+# docker/entrypoint-standalone.sh）；${...} 引用是本地直跑时的兜底。
+# VECTOR_DB_HOST_PORT is the port ogmem dials — the host port, not the
+# openGauss container's internal port (VECTOR_DB_PORT). Same reason as
+# STORAGE_DB_HOST_PORT above.
 vector_db:
   type: opengauss
-  connection_string: "host=127.0.0.1 port=8799 dbname=postgres user=gaussdb password=CHANGE_ME"
+  connection_string: "host=${VECTOR_DB_HOST} port=${VECTOR_DB_HOST_PORT} dbname=${VECTOR_DB_NAME} user=${VECTOR_DB_USER} password=${VECTOR_DB_PASSWORD}"
   dimension: 1024
   table_name: vector_index
   pool_size: 5
@@ -62,7 +94,7 @@ vector_db:
 
 # ---- HTTP 服务 ----
 service:
-  http_port: 8090
+  http_port: ${OGMEM_HTTP_PORT}
   workers: 1
   threads: 2
   # http_ip_allowlist: ["127.0.0.1", "10.0.0.0/8"]
@@ -107,7 +139,7 @@ mcp:
   enable_code_edit_tools: "${OGMEM_MCP_ENABLE_CODE_EDIT_TOOLS}"
   allowed_hosts: "${OGMEM_MCP_ALLOWED_HOSTS}"
 
-# ---- AGFS（容器内部使用，一般不需修改）----
+# ---- Optional external AGFS (unused with storage.backend: sql) ----
 agfs:
   base_url: "http://127.0.0.1:1833"
   mount_prefix: "/local/plugin"
@@ -175,3 +207,93 @@ cache:
 # Agent 工具与经验记忆；开启步骤见 deploy/agent-memory.md。
 agent_memory:
   enabled: false
+
+# ---- M3 (M3-Bench) ----
+# Per-domain overrides for the M3 video pipeline and QA. Each sub-block is
+# merged on top of the corresponding top-level block (llm / embedding), so
+# omitting fields here falls back to the service defaults. Used by
+# m3.config.load_m3_runtime_config (m3/qa.py, m3/run_video_pipeline.py).
+m3:
+  # Multimodal per-clip episodic memory generation.
+  episodic_llm:
+    provider: "${LLM_PROVIDER}"
+    api_key: "${LLM_API_KEY}"
+    base_url: "${LLM_BASE_URL}"
+    model: "${LLM_MODEL}"
+    temperature: 0.2
+    max_tokens: 4096
+
+  # Direct retrieval QA answer model for the vision-only MVP.
+  qa_llm:
+    provider: "${LLM_PROVIDER}"
+    api_key: "${LLM_API_KEY}"
+    base_url: "${LLM_BASE_URL}"
+    model: "${LLM_MODEL}"
+    temperature: 0.2
+    max_tokens: 4096
+
+  # Eval judge (m3.eval). Defaults to MiniMax-M3 via OGMEM_MINIMAX_API_KEY so
+  # the bench-scale eval run works without OPENAI_API_KEY. Override
+  # provider + base_url + model to point at any OpenAI-compatible endpoint
+  # (DeepSeek, vLLM, OpenAI). CLI flags --judge-base-url / --judge-model /
+  # --judge-api-key override individual fields per-run.
+  judge_llm:
+    provider: minimax
+    api_key: "${OGMEM_MINIMAX_API_KEY}"
+    base_url: "https://api.minimaxi.com/v1"
+    model: "MiniMax-M3"
+    temperature: 0.0
+    max_tokens: 4096
+
+  # Episodic-memory retrieval index embedding. Defaults mirror the top-level
+  # embedding block but are explicit so M3 can evolve independently.
+  embedding:
+    provider: openai
+    model: "BAAI/bge-large-zh-v1.5"
+    base_url: "${LLM_BASE_URL}"
+    api_key: "${LLM_API_KEY}"
+    dimension: 1024
+
+  # M3 graph store — where graph_nodes / graph_edges live. Resolves in
+  # this order:
+  #   1. ``m3.graph_store.connection_string`` (this block, explicit override)
+  #   2. ``storage.connection_string``         (default; same DB as the
+  #                                            ContextFS / events / grants
+  #                                            tables — usually the
+  #                                            pgvector Postgres)
+  # The legacy fallback to ``vector_db.connection_string`` is **gone**:
+  # the graph store and the vector index are separate roles and merging
+  # them is what glued M3 to the vector DB through the single-DB
+  # topology. If you actually want the graph store on the openGauss
+  # cluster (legacy behaviour), set
+  # ``m3.graph_store.connection_string`` to the same DSN as
+  # ``vector_db.connection_string`` below. CLI drivers also accept
+  # ``--connection-string`` for one-off overrides.
+  #
+  # The default (no entry here) puts graph_nodes / graph_edges on the
+  # STORAGE_DB Postgres alongside the rest of the SQL state. That is
+  # the recommended topology — graph writes happen in the same DB
+  # transaction context as the storage writes they accompany.
+  # graph_store:
+  #   connection_string: "host=... port=... dbname=... user=... password=..."
+
+  # M3-specific vector-index knobs. The connection string is
+  # **inherited from the top-level ``vector_db.connection_string``**
+  # above — only the M3 vector index reads it (the graph store does
+  # not; see ``m3.graph_store`` above). The M3 VectorIndex and the
+  # graph store do NOT have to share a database: in the recommended
+  # split topology the graph store sits on STORAGE_DB (Postgres) and
+  # the vector index sits on VECTOR_DB (openGauss).
+  #
+  # ``backend: opengauss`` is the recommended production target;
+  # ``pgvector`` is the single-DB convenience alias for PostgreSQL
+  # +pgvector deployments that point the vector index at the same
+  # Postgres as the graph store (the ``deploy/docker-compose.yml``
+  # ``postgres`` service ships the ``pgvector/pgvector:pg16`` image
+  # so this works out of the box in dev).
+  #
+  # Override ``table_name`` if multiple M3 runs share a DB.
+  vector_index:
+    backend: opengauss
+    table_name: m3_episodic_vectors
+    pool_size: 5

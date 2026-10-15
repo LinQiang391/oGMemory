@@ -49,6 +49,7 @@ class ProviderConfig:
     # Model parameters
     llm_temperature: float = 0.7
     llm_max_tokens: int = 4096
+    llm_request_timeout_seconds: float = 120.0
     llm_json_mode: bool = False
     llm_reasoning_effort: str | None = None
     llm_is_reasoning_model: bool | None = None
@@ -96,10 +97,11 @@ class ProviderConfig:
             OGMEM_EMBEDDING_MODEL: Embedding model name
             OGMEM_LLM_MODEL: LLM model name
             VECTOR_DB_TYPE: Vector database type (memory/opengauss)
-            OPENGAUSS_CONNECTION_STRING: PostgreSQL connection string for opengauss
-            OPENGAUSS_DIMENSION: Embedding dimension (default 1024)
-            OPENGAUSS_TABLE_NAME: Table name for vector storage
-            OPENGAUSS_POOL_SIZE: Connection pool size
+            VECTOR_DB_CONNECTION_STRING: PostgreSQL/openGauss connection string
+                (legacy alias: OPENGAUSS_CONNECTION_STRING)
+            VECTOR_DB_DIMENSION: Embedding dimension (default 1024)
+            VECTOR_DB_TABLE_NAME: Table name for vector storage
+            VECTOR_DB_POOL_SIZE: Connection pool size
         """
         from providers.unified_config import get_config
         return get_config().to_provider_config()
@@ -118,6 +120,7 @@ class ProviderConfig:
             cache_max_size=cfg.cache_max_size,
             llm_temperature=cfg.llm_temperature,
             llm_max_tokens=cfg.llm_max_tokens,
+            llm_request_timeout_seconds=cfg.llm_request_timeout_seconds,
             llm_json_mode=getattr(cfg, 'llm_json_mode', False),
             llm_reasoning_effort=cfg.llm_reasoning_effort,
             llm_is_reasoning_model=cfg.llm_is_reasoning_model,
@@ -218,11 +221,28 @@ class ProviderConfig:
 
         raise ValueError(f"Unknown embedding provider: {ep}")
 
-    def create_vector_index(self) -> VectorIndex:
-        """Create a VectorIndex instance based on configuration."""
-        from providers.vector_index import create_vector_index
+    def create_vector_index(self, pool=None) -> VectorIndex:
+        """Create a VectorIndex instance based on configuration.
 
-        return create_vector_index(self)
+        Args:
+            pool: Optional SharedConnectionPool to share with other SQL stores.
+                  When provided, the vector index uses the same pool for
+                  unified connection management and cross-store atomicity.
+        """
+        from providers.vector_index.factory import create_vector_index
+
+        if pool is None or str(self.vector_db_type).strip().casefold() != "opengauss":
+            return create_vector_index(self)
+
+        from providers.vector_index.opengauss_index import OpenGaussVectorIndex
+
+        return OpenGaussVectorIndex(
+            connection_string=self.opengauss_connection_string,
+            dimension=self.opengauss_dimension,
+            table_name=self.opengauss_table_name,
+            pool_size=self.opengauss_pool_size,
+            pool=pool,
+        )
 
     def create_llm(self) -> LLM:
         """Create an LLM instance based on configuration."""
@@ -238,6 +258,7 @@ class ProviderConfig:
                     model=self.openai_llm_model,
                     temperature=self.llm_temperature,
                     max_tokens=self.llm_max_tokens,
+                    request_timeout_seconds=self.llm_request_timeout_seconds,
                     json_mode=self.llm_json_mode,
                     reasoning_effort=self.llm_reasoning_effort,
                     is_reasoning_model=self.llm_is_reasoning_model,
@@ -250,6 +271,7 @@ class ProviderConfig:
                 model=self.openai_llm_model,
                 temperature=self.llm_temperature,
                 max_tokens=self.llm_max_tokens,
+                request_timeout_seconds=self.llm_request_timeout_seconds,
                 json_mode=self.llm_json_mode,
                 reasoning_effort=self.llm_reasoning_effort,
                 is_reasoning_model=self.llm_is_reasoning_model,
@@ -270,6 +292,7 @@ class ProviderConfig:
             openai_llm_model=self.openai_llm_model,
             llm_temperature=self.llm_temperature,
             llm_max_tokens=self.llm_max_tokens,
+            llm_request_timeout_seconds=self.llm_request_timeout_seconds,
             llm_json_mode=self.llm_json_mode,
             llm_reasoning_effort=self.llm_reasoning_effort,
             llm_is_reasoning_model=self.llm_is_reasoning_model,

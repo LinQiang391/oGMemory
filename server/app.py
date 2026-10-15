@@ -62,6 +62,7 @@ _SKILL_UPLOAD_MIMETYPES = _SKILL_ZIP_MIMETYPES | {"multipart/form-data"}
 app.config["MAX_CONTENT_LENGTH"] = _MAX_HTTP_BODY_BYTES
 _service: MemoryService | None = None
 _service_lock = threading.Lock()
+_operator_service = None
 _perf_emit_warned = False  # log first perf failure as WARNING, subsequent as DEBUG
 _MAX_TRACE_EVENT_BODY_BYTES = 64 * 1024
 _MAX_TRACE_EVENT_DEPTH = 64
@@ -147,6 +148,65 @@ def _shutdown_service() -> None:
 atexit.register(_shutdown_service)
 
 
+def _get_operator_service():
+    """Lazily build an OperatorService for the multimodal operator API.
+
+    Mirrors the lazy-init pattern of ``_get_service``. Built once per
+    process; subsequent calls return the same instance.
+    """
+    global _operator_service
+    if _operator_service is not None:
+        return _operator_service
+    from service.operator_service import OperatorService
+    from service.graph_service import GraphService
+    from extraction.operators import default_registry
+
+    cfg = get_config()
+    # Resolve the graph store the same way the rest of the system does.
+    # For AGFS mode we use the in-memory store (no SQL graph tables
+    # wired yet); for SQL mode we use the SQL store. Production users
+    # wiring operator output into a real graph should set the store
+    # via this hook.
+    storage_backend = getattr(cfg, "storage_backend", "agfs")
+    if storage_backend == "sql":
+        try:
+            from providers.graph_store import SQLGraphStore
+            store = SQLGraphStore.from_config(cfg)
+        except Exception as exc:
+            logger.warning("SQLGraphStore unavailable (%s); falling back to in-memory", exc)
+            from providers.graph_store import MemoryGraphStore
+            store = MemoryGraphStore()
+    else:
+        from providers.graph_store import MemoryGraphStore
+        store = MemoryGraphStore()
+    graph_service = GraphService(store)
+
+    # Register built-in operators (uses MockBackend by default; deployments
+    # can override by populating ``operators:`` in config/operators.yaml).
+    registry = default_registry()
+    try:
+        from extraction.operators.builtin import register_all_defaults
+        register_all_defaults(registry)
+    except Exception as exc:
+        logger.warning("Failed to register default operators: %s", exc)
+
+    # Optionally load operators from YAML if configured.
+    yaml_path = getattr(cfg, "operators_config_path", None) or "config/operators.yaml"
+    import os
+    if os.path.exists(yaml_path):
+        try:
+            registry.load_from_config(yaml_path, override=True)
+        except Exception as exc:
+            logger.warning("Failed to load operators from %s: %s", yaml_path, exc)
+
+    _operator_service = OperatorService(
+        graph_service=graph_service,
+        registry=registry,
+    )
+    logger.info("OperatorService initialized (graph_store=%s)", type(store).__name__)
+    return _operator_service
+
+
 def _build_authenticated_context(params: dict):
     svc = _get_service()
     auth = svc.get_auth_service()
@@ -167,6 +227,10 @@ def _json_object_body() -> dict:
 
 def _error_response(exc: Exception):
     from core.errors import ConcurrentModificationError
+    from service.operator_service import OperatorServiceBusyError
+
+    if isinstance(exc, OperatorServiceBusyError):
+        return jsonify({"error": str(exc), "retryable": True}), 429
 
     if isinstance(exc, RequestEntityTooLarge):
         return jsonify({"error": exc.description}), 413
@@ -1652,6 +1716,116 @@ def handle_admin_audit_log(account_id, log_id):
             raise ControlPlaneDisabledError("Admin API is unavailable when role control is disabled")
         ctx = _build_authenticated_context({})
         return jsonify(svc.get_tenant_admin_service().get_audit_log(ctx, account_id, log_id))
+    except Exception as exc:
+        return _error_response(exc)
+
+
+# ---------------------------------------------------------------------------
+# Operator API (multimodal extraction)
+# ---------------------------------------------------------------------------
+
+@app.route("/api/v1/operators", methods=["GET"])
+def handle_operators_list():
+    """List registered operators, optionally filtered by raw_type."""
+    raw_type = request.args.get("raw_type")
+    try:
+        svc = _get_operator_service()
+        ops = svc.list_operators(raw_type=raw_type) if raw_type else svc.list_operators()
+        return jsonify({"operators": ops, "count": len(ops)})
+    except Exception as exc:
+        logger.error("operators list failed: %s", exc, exc_info=True)
+        return _error_response(exc)
+
+
+@app.route("/api/v1/operators/<operator_type>", methods=["GET"])
+def handle_operators_describe(operator_type):
+    """Get details (description, config_schema) for one operator."""
+    try:
+        svc = _get_operator_service()
+        return jsonify(svc.describe_operator(operator_type))
+    except Exception as exc:
+        return _error_response(exc)
+
+
+@app.route("/api/v1/operators/<operator_type>/run", methods=["POST"])
+def handle_operators_run_single(operator_type):
+    """Run a single operator against a raw node."""
+    params = request.get_json(force=True, silent=True) or {}
+    raw_node_id = params.get("raw_node_id")
+    if not raw_node_id:
+        return jsonify({"error": "raw_node_id is required"}), 400
+    ctx = _build_authenticated_context(params)
+    try:
+        svc = _get_operator_service()
+        result = svc.run_operator(
+            raw_node_id=raw_node_id,
+            operator_type=operator_type,
+            ctx=ctx,
+            params=params.get("params"),
+            write_to_graph=params.get("write_to_graph", True),
+        )
+        return jsonify(result)
+    except Exception as exc:
+        logger.error("operator run failed: %s", exc, exc_info=True)
+        return _error_response(exc)
+
+
+@app.route("/api/v1/operators/pipelines/run", methods=["POST"])
+def handle_operators_run_pipeline():
+    """Run a multi-step pipeline against a raw node (sync)."""
+    params = request.get_json(force=True, silent=True) or {}
+    raw_node_id = params.get("raw_node_id")
+    pipeline = params.get("pipeline")
+    if not raw_node_id or not pipeline:
+        return jsonify({"error": "raw_node_id and pipeline are required"}), 400
+    ctx = _build_authenticated_context(params)
+    try:
+        svc = _get_operator_service()
+        result = svc.run_pipeline(
+            raw_node_id=raw_node_id,
+            pipeline_spec=pipeline,
+            ctx=ctx,
+            write_to_graph=params.get("write_to_graph", True),
+        )
+        return jsonify(result)
+    except Exception as exc:
+        logger.error("pipeline run failed: %s", exc, exc_info=True)
+        return _error_response(exc)
+
+
+@app.route("/api/v1/operators/pipelines/run_async", methods=["POST"])
+def handle_operators_run_pipeline_async():
+    """Run a pipeline on a background thread; return task_id."""
+    params = request.get_json(force=True, silent=True) or {}
+    raw_node_id = params.get("raw_node_id")
+    pipeline = params.get("pipeline")
+    if not raw_node_id or not pipeline:
+        return jsonify({"error": "raw_node_id and pipeline are required"}), 400
+    ctx = _build_authenticated_context(params)
+    try:
+        svc = _get_operator_service()
+        task_id = svc.run_pipeline_async(
+            raw_node_id=raw_node_id,
+            pipeline_spec=pipeline,
+            ctx=ctx,
+            write_to_graph=params.get("write_to_graph", True),
+        )
+        return jsonify({"task_id": task_id, "status": "processing"})
+    except Exception as exc:
+        logger.error("async pipeline run failed: %s", exc, exc_info=True)
+        return _error_response(exc)
+
+
+@app.route("/api/v1/operators/tasks/<task_id>", methods=["GET"])
+def handle_operators_task_status(task_id):
+    """Poll the status of an async pipeline task owned by this account."""
+    try:
+        ctx = _build_authenticated_context(request.args.to_dict())
+        svc = _get_operator_service()
+        rec = svc.get_task_status(task_id, ctx)
+        if rec is None:
+            return jsonify({"error": "task not found"}), 404
+        return jsonify(rec)
     except Exception as exc:
         return _error_response(exc)
 

@@ -476,3 +476,23 @@ def test_health_probes_agfs_in_agfs_mode(monkeypatch):
     assert health["agfs"] is True
     agfs_client.assert_called_once_with(api_base_url="http://localhost:1833")
     client.ls.assert_called_once_with("/")
+
+
+@pytest.mark.parametrize('counts,visible', [
+    ({'total': 0, 'failed': 1}, False),
+    ({'total': 0, 'failed': 0}, True),
+    ({'total': 1, 'failed': 0}, False),
+    ({'total': 0}, True),  # Legacy AGFS counter shape.
+    ({'failed': 0}, False),
+])
+def test_code_index_visibility_rejects_dead_letters(monkeypatch, counts, visible):
+    from core.models import RequestContext
+
+    service = MemoryService(config=OgMemConfig(provider='mock', vector_db_type='memory'))
+    fs, outbox = Mock(), Mock()
+    outbox.count_unfinished.return_value = counts
+    monkeypatch.setattr(service, '_get_context_fs', lambda: fs)
+    monkeypatch.setattr(service, '_get_outbox_store', lambda _: outbox)
+    ctx = RequestContext(account_id='acme', user_id='u', agent_id='a', session_id='s', trace_id='t')
+    assert service._code_workspace_index_visible(ctx) is visible
+    outbox.count_unfinished.assert_called_once_with('acme')

@@ -304,17 +304,82 @@ class TestTimeout:
 class TestLLMException:
 
     def test_llm_exception_returns_empty(self):
+        """LLM throws on first call → empty result, no crash.
+
+        The base loop catches :class:`LLMCallError` raised from
+        :meth:`_call_llm` and finishes with
+        ``finish_reason="llm_error"`` instead of falling through to
+        ``_on_invalid_response``'s "disable tools and continue" path.
+        The previous silent-swallow contract (``return None, None``)
+        was responsible for turning hard server errors into
+        ``[Search] … [Answer] …`` protocol garbage.
+        """
+        from core.errors import LLMCallError
+
         llm = Mock()
         llm.complete_with_tools_messages = Mock(side_effect=RuntimeError("API down"))
-
-        loop = MockReactLoop(llm)
-        result = loop.run(_ctx(), _task_ctx())
-
+        result = MockReactLoop(llm=llm).run(_ctx(), _task_ctx())
         assert result.output == []
-        assert not result.completed
+        assert result.finish_reason == "llm_error"
+        assert result.completed is False
+
+    def test_call_llm_wraps_unknown_transport_error(self):
+        """``_call_llm`` wraps ``RuntimeError`` from the LLM in
+        :class:`LLMCallError` so the driver has a typed signal.
+
+        Previously the base method returned ``(None, None)`` and the
+        loop fell through to "no tools, continue"; that turned 400
+        errors into ``[Search] … [Answer] …`` protocol garbage.
+        """
+        from core.errors import LLMCallError
+
+        llm = Mock()
+        llm.complete_with_tools_messages = Mock(side_effect=RuntimeError("API down"))
+        loop = MockReactLoop(llm=llm)
+        with pytest.raises(LLMCallError) as exc_info:
+            loop._call_llm([{"role": "user", "content": "hi"}])
+        assert "API down" in str(exc_info.value)
+        assert isinstance(exc_info.value.cause, RuntimeError)
+
+    def test_call_llm_propagates_already_classified_error(self):
+        """If the LLM provider already raises ``LLMCallError`` (e.g.
+        ``OpenAILLM`` on 400), ``_call_llm`` re-raises it unchanged so
+        the status code is preserved end-to-end."""
+        from core.errors import LLMCallError
+
+        original = LLMCallError("BadRequestError (400)", status_code=400)
+        llm = Mock()
+        llm.complete_with_tools_messages = Mock(side_effect=original)
+        loop = MockReactLoop(llm=llm)
+        with pytest.raises(LLMCallError) as exc_info:
+            loop._call_llm([{"role": "user", "content": "hi"}])
+        assert exc_info.value is original
+        assert exc_info.value.status_code == 400
+
+    def test_run_does_not_retry_with_tools_disabled_after_llm_error(self):
+        """After a transport failure the loop must NOT fall through to
+        ``_on_invalid_response``'s "disable tools and continue" path.
+
+        We assert by counting LLM calls: with the buggy silent-swallow
+        behaviour the loop would have retried with tools disabled; the
+        hardened contract terminates after the first failure.
+        """
+        llm = Mock()
+        llm.complete_with_tools_messages = Mock(
+            side_effect=RuntimeError("500 Internal Server Error"),
+        )
+        loop = MockReactLoop(llm=llm, max_iterations=5)
+        result = loop.run(_ctx(), _task_ctx())
+        assert result.finish_reason == "llm_error"
+        assert result.iterations == 1
+        assert llm.complete_with_tools_messages.call_count == 1
 
 
-class TestLastIterationMessage:
+# ---------------------------------------------------------------------------
+# Tests: Timeout
+# ---------------------------------------------------------------------------
+
+class TestTimeout:
 
     def test_last_iteration_adds_message(self):
         llm = _make_llm()
