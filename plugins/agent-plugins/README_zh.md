@@ -31,7 +31,7 @@ MCP 地址必须包含实际端口和路径，不能用 REST 健康检查地址�
   "mcpServers": {
     "ogmemory": {
       "command": "node",
-      "args": ["/absolute/path/agent-plugins/servers/mcp-proxy.mjs"],
+      "args": ["/absolute/path/plugins/agent-plugins/servers/mcp-proxy.mjs"],
       "env": {"OGMEM_AGENT_PLUGIN_CONFIG": "/absolute/path/private/agent-plugin.json"}
     }
   }
@@ -45,12 +45,12 @@ MCP 地址必须包含实际端口和路径，不能用 REST 健康检查地址�
 ## 4. 验证
 
 ```bash
-node /absolute/path/agent-plugins/scripts/doctor.mjs
+node /absolute/path/plugins/agent-plugins/scripts/doctor.mjs
 ```
 
 退出码 0 表示三个工具齐全；2 表示已连接但有工具缺失；1 表示配置或连接失败。
 自检不读写记忆。再用一条独特测试偏好完成“保存 → 新会话查询 → 读详情”。
 只有服务返回的实际结果能证明写入状态；超时不代表写入失败，不要自动重试。
 
-四个客户端的逐步操作见仓库 [接入教程](../docs/integrations/agent-plugins.md)。
+四个客户端的逐步操作见仓库 [接入教程](../../docs/integrations/agent-plugins.md)。
 ZIP 内对应文件是 `CLIENT-GUIDE.md`。

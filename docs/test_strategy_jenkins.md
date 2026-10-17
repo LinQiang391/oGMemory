@@ -333,7 +333,7 @@ flowchart TD
 
 | 目录/文件变更 | 是否建议自动触发真实 LLM 回归 |
 |---|---:|
-| `openclaw_context_engine_plugin/` | 是 |
+| `plugins/openclaw/` | 是 |
 | `retrieval/` | 是 |
 | `service/` | 是 |
 | `providers/llm/` | 是 |

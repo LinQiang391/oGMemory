@@ -6,7 +6,9 @@ Across every phase of the Agent loop, manage what goes **in**, what **stays**, w
 Seven context types. Three-level cache hierarchy. One virtual filesystem.
 Cut token cost. Preserve signal density. Survive session boundaries.
 
-English | [中文](readme_zh.md)
+English | [中文](README_zh.md)
+
+Documentation: [docs/README.md](docs/README.md)
 </div>
 
 ---
@@ -600,6 +602,9 @@ Key environment variables (see [docs/OGMEMORY_ENV.md](docs/OGMEMORY_ENV.md) for 
 ```
 ContextEngine/
 ├── core/                   # Domain models, Protocol interfaces, enums, errors
+├── features/               # Optional product capabilities and feature flags
+├── scene/                  # Scene-specific workflows and policies
+├── integrations/           # Shared integration helpers and client-facing adapters
 ├── fs/sql_adapter/         # ContextFS → PostgreSQL adapter (atomic upsert, RLS tenant isolation)
 ├── extraction/             # CandidateExtractor (ReAct loop + YAML SchemaRegistry)
 │   ├── prompts/            #   LLM prompt templates
@@ -624,8 +629,14 @@ ContextEngine/
 ├── docs/                   # Architecture, deployment, quickstart guides
 ├── examples/               # Usage examples (SDK, Claude Code integration)
 ├── cli/                    # Unified management CLI (ogmem command)
-├── plugins/ogmemory/       # Codex plugin (full-lifecycle HTTP hooks)
-├── openclaw_context_engine_plugin/  # OpenClaw plugin (TypeScript bridge)
+├── plugins/                # Standalone client and Agent plugins
+│   ├── agent-plugins/      # Generic Agent Plugin package and published skills
+│   ├── claude-code/        # Claude Code hooks plugin
+│   ├── deepseek-harness/   # DeepSeek Harness adapter
+│   ├── hermes/             # Hermes Agent adapter
+│   ├── ogmemory/            # Codex plugin (full-lifecycle HTTP hooks)
+│   ├── openclaw/            # OpenClaw plugin (TypeScript bridge)
+│   └── opencode/            # OpenCode npm plugin
 └── scripts/                # Auxiliary scripts
 ```
 
@@ -634,7 +645,7 @@ ContextEngine/
 ## Codex Integration
 
 For portable memory retrieval and writing across clients, see the
-[Agent Plugin package](agent-plugins/README.md) and
+[Agent Plugin package](plugins/agent-plugins/README.md) and
 [client tutorial](docs/integrations/agent-plugins.md).
 
 The repository-local [`ogmemory` Codex plugin](plugins/ogmemory/) connects all Codex lifecycle hooks to a local or remote oGMemory HTTP service. It captures sessions, prompts, tools, permissions, compaction, subagents, completed turns, and session shutdown. See the [Codex integration guide](docs/integrations/codex.md).
@@ -643,15 +654,15 @@ The repository-local [`ogmemory` Codex plugin](plugins/ogmemory/) connects all C
 
 ## OpenCode Integration
 
-The npm-ready [`opencode-plugin`](opencode-plugin/) package provides automatic memory recall, incremental conversation write-back, and canonical Trace capture through OpenCode lifecycle hooks. It targets OpenCode 1.15.11 or later and operates above MCP; MCP remains available for explicit memory tools.
+The npm-ready [`plugins/opencode`](plugins/opencode/) package provides automatic memory recall, incremental conversation write-back, and canonical Trace capture through OpenCode lifecycle hooks. It targets OpenCode 1.15.11 or later and operates above MCP; MCP remains available for explicit memory tools.
 
-For source installation, configuration, privacy controls, and verification steps, see the [plugin README](opencode-plugin/README.md).
+For source installation, configuration, privacy controls, and verification steps, see the [plugin README](plugins/opencode/README.md).
 
 ---
 
 ## DeepSeek Harness Integration
 
-The installable [`deepseek-harness-plugin`](deepseek-harness-plugin/) bundle connects
+The installable [`plugins/deepseek-harness`](plugins/deepseek-harness/) bundle connects
 DeepSeek Harness to an oGMemory HTTP service and provides automatic cross-session
 memory recall.
 
@@ -670,7 +681,7 @@ and [example](examples/deepagents_memory.py).
 
 ## Hermes Agent Integration
 
-The native [`hermes_memory_plugin`](hermes_memory_plugin/) provider adds automatic
+The native [`plugins/hermes`](plugins/hermes/) provider adds automatic
 recall, turn write-back, session commit, and explicit `ogmemory_search` and
 `ogmemory_remember` tools to Hermes Agent.
 
@@ -684,7 +695,7 @@ See the [Hermes Agent integration guide](docs/integrations/hermes.md).
 ogmem onboard --mode plugin
 
 # Or install manually from the plugin source directory
-cd openclaw_context_engine_plugin && openclaw plugins install -l .
+cd plugins/openclaw && openclaw plugins install -l .
 ```
 
 `ogmem onboard --mode plugin` exports connection configuration for an **existing
@@ -742,7 +753,7 @@ Evaluated on [LoCoMo](https://arxiv.org/abs/2402.10790) long-context conversatio
 
 **Lifecycle stages to cover:** ③ before_tool_call + tool_result_persist and the remaining operational hardening for ⑥ session_end + dispose.
 
-**Documentation:** [docs/OGMEMORY_ENV.md](docs/OGMEMORY_ENV.md) (environment setup) | [Client integrations](docs/integrations/README.md) | [Codex](docs/integrations/codex.md) | [DeepSeek Harness](docs/integrations/deepseek-harness.md) | [Hermes Agent](docs/integrations/hermes.md) | [Quickstart](docs/QUICKSTART.md) | [Deployment](docs/deployment/deployment_operations_guide.md) | [OpenClaw Plugin](openclaw_context_engine_plugin/README.md) | [Benchmark](tests/e2e/) (LoCoMO evaluation)
+**Documentation:** [docs/OGMEMORY_ENV.md](docs/OGMEMORY_ENV.md) (environment setup) | [Client integrations](docs/integrations/README.md) | [Codex](docs/integrations/codex.md) | [DeepSeek Harness](docs/integrations/deepseek-harness.md) | [Hermes Agent](docs/integrations/hermes.md) | [Quickstart](docs/QUICKSTART.md) | [Deployment](docs/deployment/deployment_operations_guide.md) | [OpenClaw Plugin](plugins/openclaw/README.md) | [Benchmark](tests/e2e/) (LoCoMO evaluation)
 
 **MCP:** [Protocol compatibility](docs/mcp_protocol_compatibility.md)
 

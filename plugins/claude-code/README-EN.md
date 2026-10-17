@@ -17,7 +17,7 @@ Shared code: `scripts/ogm_plugin_request.py` (`base_api_url`, `http_plugin_heade
 
 - **Base URL:** `OG_MEMORY_URL` (e.g. `http://127.0.0.1:8090`).
 
-- **Same key as OpenClaw** (`openclaw_context_engine_plugin` → `authApiKey` / `process.env.OG_AUTH_API_KEY`):
+- **Same key as OpenClaw** (`plugins/openclaw` → `authApiKey` / `process.env.OG_AUTH_API_KEY`):
 
   Set **`OG_AUTH_API_KEY`** in the **environment of the `claude` process** (shell export, service env, etc.).  
   When set, requests also send `X-API-Key`, `X-Account-ID`, and `X-User-ID` (identity from `OgMemConfig` when the repo is on `PYTHONPATH`, else `OG_*` / `OG_MEMORY_*` as implemented in `ogm_plugin_request.py`).
@@ -104,7 +104,7 @@ Without this opt-in, filtering still works, but the Hook omits the
 **Local dev:**
 
 ```bash
-claude --plugin-dir ./claude-plugin
+claude --plugin-dir ./plugins/claude-code
 # optional: --debug
 ```
 

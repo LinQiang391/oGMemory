@@ -356,11 +356,11 @@ curl -fsS http://127.0.0.1:8090/api/v1/health
 
 ```bash
 cd "$OGMEM_REPO"
-npm test --prefix openclaw_context_engine_plugin
+npm test --prefix plugins/openclaw
 
 export OGMEM_PLUGIN_DST="$HOME/.openclaw/extensions/og-memory-context-engine"
 mkdir -p "$OGMEM_PLUGIN_DST"
-cp -a "$OGMEM_REPO/openclaw_context_engine_plugin/." "$OGMEM_PLUGIN_DST/"
+cp -a "$OGMEM_REPO/plugins/openclaw/." "$OGMEM_PLUGIN_DST/"
 ```
 
 OpenClaw `2026.6.9` 不允许 `plugins install --link` 与当前插件包的 Hook 元数据组合使用，因此本教程使用与容器镜像相同的扩展目录加载方式。修改插件源码后，重新执行上述 `cp -a` 并重启 Gateway。
@@ -726,8 +726,8 @@ grep -E 'ERROR|Traceback|FAILED|PROCESSING' \
 
 ## 仓库内参考
 
-- [`openclaw_context_engine_plugin/README.md`](../../openclaw_context_engine_plugin/README.md)
-- [`openclaw_context_engine_plugin/ENV.md`](../../openclaw_context_engine_plugin/ENV.md)
+- [`plugins/openclaw/README.md`](../../plugins/openclaw/README.md)
+- [`plugins/openclaw/ENV.md`](../../plugins/openclaw/ENV.md)
 - [`config/ogmem.reference.yaml`](../../config/ogmem.reference.yaml)
 - [`config/env.example`](../../config/env.example)
 - [`agfs/Makefile`](../../agfs/Makefile)

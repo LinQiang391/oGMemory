@@ -1243,7 +1243,7 @@ class TestAfterTurnDedup:
 
 def test_openclaw_plugin_manifest_exposes_compaction_config_schema():
     repo_root = Path(__file__).resolve().parents[3]
-    manifest_path = repo_root / "openclaw_context_engine_plugin" / "openclaw.plugin.json"
+    manifest_path = repo_root / "plugins/openclaw" / "openclaw.plugin.json"
     manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
     props = manifest["configSchema"]["properties"]
 

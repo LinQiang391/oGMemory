@@ -25,12 +25,12 @@ def main():
     for name in FILES:
         content = (ROOT / name).read_bytes()
         if name.endswith(".md"):
-            content = content.decode().replace("../docs/integrations/agent-plugins.md", "CLIENT-GUIDE.md").encode()
+            content = content.decode().replace("../../docs/integrations/agent-plugins.md", "CLIENT-GUIDE.md").encode()
         entries.append((f"agent-plugins/{name}", content))
-    entries.append(("agent-plugins/LICENSE", (ROOT.parent / "LICENSE").read_bytes()))
-    entries.append(("agent-plugins/ACCEPTANCE.json", (ROOT.parent / "docs/integrations/agent-plugins-acceptance.json").read_bytes()))
+    entries.append(("agent-plugins/LICENSE", (ROOT.parents[1] / "LICENSE").read_bytes()))
+    entries.append(("agent-plugins/ACCEPTANCE.json", (ROOT.parents[1] / "docs/integrations/agent-plugins-acceptance.json").read_bytes()))
     for source, destination in [("agent-plugins.md", "CLIENT-GUIDE.md")]:
-        text = (ROOT.parent / "docs/integrations" / source).read_text(encoding="utf-8")
+        text = (ROOT.parents[1] / "docs/integrations" / source).read_text(encoding="utf-8")
         def link(match):
             target = match[1]
             if "://" in target or target.startswith("#"):
@@ -39,7 +39,7 @@ def main():
                 return "](CLIENT-GUIDE.md)"
             if target == "agent-plugins-acceptance.json":
                 return "](ACCEPTANCE.json)"
-            path = (ROOT.parent / "docs/integrations" / target).resolve().relative_to(ROOT.parent)
+            path = (ROOT.parents[1] / "docs/integrations" / target).resolve().relative_to(ROOT.parents[1])
             return "](https://gitcode.com/opengauss/oGMemory/blob/dev/" + path.as_posix() + ")"
         entries.append((f"agent-plugins/{destination}", re.sub(r"\]\(([^)]+)\)", link, text).encode()))
     with ZipFile(archive, "x", ZIP_DEFLATED) as target:

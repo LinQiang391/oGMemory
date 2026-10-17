@@ -24,7 +24,7 @@ profile:
 
 ```bash
 mkdir -p "${HERMES_HOME:-$HOME/.hermes}/plugins/ogmemory"
-cp hermes_memory_plugin/ogmemory/* "${HERMES_HOME:-$HOME/.hermes}/plugins/ogmemory/"
+cp plugins/hermes/ogmemory/* "${HERMES_HOME:-$HOME/.hermes}/plugins/ogmemory/"
 ```
 
 Configure `${HERMES_HOME:-$HOME/.hermes}/config.yaml`:

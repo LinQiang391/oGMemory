@@ -1,6 +1,6 @@
 # OpenClaw Plugin Environment Variables
 
-This file documents variables consumed by `openclaw_context_engine_plugin/index.js`. Core oG-Memory server configuration is documented in [`../docs/OGMEMORY_ENV.md`](../docs/OGMEMORY_ENV.md).
+This file documents variables consumed by `plugins/openclaw/index.js`. Core oG-Memory server configuration is documented in [`../docs/OGMEMORY_ENV.md`](../../docs/OGMEMORY_ENV.md).
 
 `openclaw.json` plugin config has priority over environment variables. When neither is set, the defaults below apply.
 
@@ -107,7 +107,7 @@ export OGMEM_SHORT_TERM_INDEX_MODE=sync
 ```bash
 openclaw doctor
 curl http://127.0.0.1:8090/api/v1/health
-node openclaw_context_engine_plugin/compact.test.js
+node plugins/openclaw/compact.test.js
 ```
 
 Look for `[og-memory]` lines in OpenClaw gateway logs. Compose should call `/compose`; compact takeover should call `/prepare_compaction` before `/compact`.

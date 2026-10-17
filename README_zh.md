@@ -6,7 +6,9 @@
 七类上下文。三级缓存层次。一个虚拟文件系统。
 降低 token 消耗。保持信号密度。跨越会话边界。
 
-[English](readme.md) | 中文
+[English](README.md) | 中文
+
+文档总览：[docs/README.md](docs/README.md)
 </div>
 
 ---
@@ -601,6 +603,9 @@ result = write_api.commit_session(messages, ctx)
 ```
 ContextEngine/
 ├── core/                   # 领域模型、Protocol 接口、枚举、错误类型
+├── features/               # 可选产品能力与功能开关
+├── scene/                  # 场景工作流与策略
+├── integrations/           # 共用集成工具与客户端适配器
 ├── fs/sql_adapter/         # ContextFS → PostgreSQL 适配器（原子 upsert、RLS 租户隔离）
 ├── extraction/             # CandidateExtractor（ReAct 循环 + YAML SchemaRegistry）
 │   ├── prompts/            #   LLM 提示模板
@@ -625,8 +630,14 @@ ContextEngine/
 ├── docs/                   # 架构、部署、快速上手指南
 ├── examples/               # 使用示例（SDK、Claude Code 集成）
 ├── cli/                    # 统一管理 CLI（ogmem 命令）
-├── plugins/ogmemory/       # Codex 插件（全生命周期 HTTP Hooks）
-├── openclaw_context_engine_plugin/  # OpenClaw 插件（TypeScript 桥接）
+├── plugins/                # 独立客户端与 Agent 插件
+│   ├── agent-plugins/      # 通用 Agent Plugin 包与发布的 Skill
+│   ├── claude-code/        # Claude Code Hooks 插件
+│   ├── deepseek-harness/   # DeepSeek Harness 适配器
+│   ├── hermes/             # Hermes Agent 适配器
+│   ├── ogmemory/            # Codex 插件（全生命周期 HTTP Hooks）
+│   ├── openclaw/            # OpenClaw 插件（TypeScript 桥接）
+│   └── opencode/            # OpenCode npm 插件
 └── scripts/                # 辅助脚本
 ```
 
@@ -634,7 +645,7 @@ ContextEngine/
 
 ## 通用 Agent Plugin
 
-[`agent-plugins/`](agent-plugins/) 提供记忆检索、详情读取和写入三个 MCP 工具，
+[`plugins/agent-plugins/`](plugins/agent-plugins/) 提供记忆检索、详情读取和写入三个 MCP 工具，
 配套 `ogmemory-memory` Skill，适用于标准插件客户端及普通 MCP Agent。
 OpenClaw、DSH、Claude Code、Codex 的操作步骤见
 [通用 Agent Plugin 教程](docs/integrations/agent-plugins.md)。此接入由模型主动调用，不自动捕获对话。
@@ -647,15 +658,15 @@ OpenClaw、DSH、Claude Code、Codex 的操作步骤见
 
 ## OpenCode 集成
 
-仓库中的 [`opencode-plugin`](opencode-plugin/) 是可发布到 npm 的 OpenCode 插件包，提供自动记忆检索、会话增量写入和标准 Trace 记录。插件面向 OpenCode 1.15.11 或更高版本，工作在 MCP 之上；MCP 仍可用于显式记忆工具调用。
+仓库中的 [`plugins/opencode`](plugins/opencode/) 是可发布到 npm 的 OpenCode 插件包，提供自动记忆检索、会话增量写入和标准 Trace 记录。插件面向 OpenCode 1.15.11 或更高版本，工作在 MCP 之上；MCP 仍可用于显式记忆工具调用。
 
-源码安装、配置、隐私控制和验证步骤请参考[中文安装说明](opencode-plugin/INSTALL-ZH.md)。
+源码安装、配置、隐私控制和验证步骤请参考[中文安装说明](plugins/opencode/INSTALL-ZH.md)。
 
 ---
 
 ## DeepSeek Harness 集成
 
-仓库中的可安装 [`deepseek-harness-plugin`](deepseek-harness-plugin/) bundle 支持
+仓库中的可安装 [`plugins/deepseek-harness`](plugins/deepseek-harness/) bundle 支持
 DeepSeek Harness 连接 oGMemory HTTP 服务，并提供自动跨会话记忆召回。
 
 接入、配置与跨会话体验步骤见 [DeepSeek Harness 对接指南](docs/integrations/deepseek-harness.md)。
@@ -673,7 +684,7 @@ DeepSeek Harness 连接 oGMemory HTTP 服务，并提供自动跨会话记忆召
 
 ## Hermes Agent 集成
 
-仓库中的 [`hermes_memory_plugin`](hermes_memory_plugin/) 提供原生 Hermes
+仓库中的 [`plugins/hermes`](plugins/hermes/) 提供原生 Hermes
 `MemoryProvider`，支持自动召回、轮次写回、会话提交，以及
 `ogmemory_search`、`ogmemory_remember` 工具。
 
@@ -689,7 +700,7 @@ DeepSeek Harness 连接 oGMemory HTTP 服务，并提供自动跨会话记忆召
 ogmem onboard --mode plugin
 
 # 或在插件源码目录中手工安装
-cd openclaw_context_engine_plugin
+cd plugins/openclaw
 openclaw plugins install -l .
 ```
 
@@ -757,7 +768,7 @@ ContextFS / SQL 存储 + 向量索引
 
 | 文档 | 说明 |
 | ---- | ---- |
-| [CLAUDE.md](CLAUDE.md) | 完整技术规范 |
+| [docs/README.md](docs/README.md) | 文档总览与主题导航 |
 | [docs/OGMEMORY_ENV.md](docs/OGMEMORY_ENV.md) | 环境配置 |
 | [快速开始](docs/QUICKSTART.md) | 端到端使用指南 |
 | [客户端 Agent 对接指南](docs/integrations/README.md) | REST、Python、MCP 与 Agent 插件接入汇总 |
@@ -767,7 +778,7 @@ ContextFS / SQL 存储 + 向量索引
 | [部署指南](docs/deployment/deployment_operations_guide.md) | 生产环境部署 |
 | [OpenClaw + oGMemory Context Engine 单机部署](docs/deployment/openclaw_context_engine_quickstart_zh.md) | 拉取 `dev` 分支后的可验收部署教程 |
 | [OpenClaw + oGMemory 双接入镜像部署](deploy/ogmem_opengauss_deploy.md) | 一键复用 Context Engine、独立配置 MCP 的验证教程 |
-| [OpenClaw 插件](openclaw_context_engine_plugin/README.md) | 集成搭建 |
+| [OpenClaw 插件](plugins/openclaw/README.md) | 集成搭建 |
 | [基准测试](tests/e2e/) | LoCoMo 评测框架 |
 
 ---

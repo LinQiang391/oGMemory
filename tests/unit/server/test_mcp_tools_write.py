@@ -16,7 +16,7 @@ from server.mcp_tools import write_memory
 from server.memory_service import MemoryService
 from tests.unit.fs.test_agfs_trace_store import _MemoryAGFS
 
-_PII_CASES = json.loads((Path(__file__).parents[3] / "deepseek-harness-plugin/tests/fixtures/pii_cases.json").read_text())
+_PII_CASES = json.loads((Path(__file__).parents[3] / "plugins/deepseek-harness/tests/fixtures/pii_cases.json").read_text())
 
 
 class _FakeAuth:
@@ -568,7 +568,7 @@ def test_write_trace_persists_shared_pii_redaction_cases(case, wrapper):
 def test_trace_rule_bundles_match():
     root = Path(__file__).parents[3]
     assert json.loads((root / "skills/trace_redaction_rules.json").read_text()) == json.loads(
-        (root / "deepseek-harness-plugin/lib/trace_redaction_rules.json").read_text()
+        (root / "plugins/deepseek-harness/lib/trace_redaction_rules.json").read_text()
     )
 
 @pytest.mark.parametrize("text, expected", [
@@ -613,7 +613,7 @@ def test_write_trace_redacts_complete_quoted_credentials(text, as_json):
 
 
 @pytest.mark.parametrize("text", json.loads(
-    (Path(__file__).parents[3] / "deepseek-harness-plugin/tests/fixtures/yaml_secret_cases.json").read_text()
+    (Path(__file__).parents[3] / "plugins/deepseek-harness/tests/fixtures/yaml_secret_cases.json").read_text()
 ))
 @pytest.mark.parametrize("as_json", [False, True])
 def test_write_trace_redacts_yaml_multiline_secrets(text, as_json):

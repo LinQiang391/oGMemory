@@ -25,9 +25,9 @@ OpenCode 会自动安装配置中的 npm 插件。修改后重启 OpenCode。
 ```powershell
 $target = Join-Path $env:USERPROFILE ".config\opencode\plugins"
 New-Item -ItemType Directory -Force (Join-Path $target "ogmemory") | Out-Null
-Copy-Item "opencode-plugin\wrappers\ogmemory.js" (Join-Path $target "ogmemory.js")
-Copy-Item "opencode-plugin\index.mjs","opencode-plugin\package.json" (Join-Path $target "ogmemory")
-Copy-Item -Recurse "opencode-plugin\lib" (Join-Path $target "ogmemory\lib")
+Copy-Item "plugins/opencode\wrappers\ogmemory.js" (Join-Path $target "ogmemory.js")
+Copy-Item "plugins/opencode\index.mjs","plugins/opencode\package.json" (Join-Path $target "ogmemory")
+Copy-Item -Recurse "plugins/opencode\lib" (Join-Path $target "ogmemory\lib")
 ```
 
 最终目录为：

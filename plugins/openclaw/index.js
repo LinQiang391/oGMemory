@@ -36,7 +36,7 @@ import {
 export { appendTakeoverCompactionBoundary } from "./compaction-boundary.js";
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
-const PROJECT_ROOT = join(__dirname, "..");
+const PROJECT_ROOT = dirname(dirname(__dirname));
 
 // ---------------------------------------------------------------------------
 // Service defaults

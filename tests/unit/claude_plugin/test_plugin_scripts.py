@@ -19,9 +19,9 @@ from unittest.mock import MagicMock, patch
 import pytest
 
 # ---------------------------------------------------------------------------
-# Make claude-plugin/scripts importable
+# Make plugins/claude-code/scripts importable
 # ---------------------------------------------------------------------------
-_SCRIPTS_DIR = Path(__file__).resolve().parents[3] / "claude-plugin" / "scripts"
+_SCRIPTS_DIR = Path(__file__).resolve().parents[3] / "plugins/claude-code" / "scripts"
 _REDACTION_FIXTURES = (
     Path(__file__).resolve().parents[2] / "fixtures" / "trace" / "redaction_cases.json"
 )
@@ -190,6 +190,39 @@ class TestBaseApiUrl:
         mod = _reimport("ogm_plugin_request")
         monkeypatch.setattr(mod, "_try_ogmem_config", lambda: None)
         assert mod.base_api_url() == "http://localhost:8090"
+
+    def test_loads_monorepo_config_from_external_working_directory(self, monkeypatch, tmp_path):
+        config_path = tmp_path / "ogmem.yaml"
+        config_path.write_text(
+            "service:\n"
+            "  http_port: 19123\n"
+            "identity:\n"
+            "  account_id: configured-acct\n"
+            "  user_id: configured-user\n"
+            "  agent_id: configured-agent\n",
+            encoding="utf-8",
+        )
+        monkeypatch.chdir(tmp_path)
+        monkeypatch.setenv("OGMEM_CONFIG", str(config_path))
+        for name in (
+            "OG_MEMORY_URL",
+            "OG_MEMORY_ACCOUNT_ID",
+            "OG_ACCOUNT_ID",
+            "OG_MEMORY_USER_ID",
+            "OG_USER_ID",
+            "OG_MEMORY_AGENT_ID",
+            "OG_AGENT_ID",
+        ):
+            monkeypatch.delenv(name, raising=False)
+
+        mod = _reimport("ogm_plugin_request")
+
+        assert mod._identity_and_url() == (
+            "configured-acct",
+            "configured-user",
+            "configured-agent",
+            "http://127.0.0.1:19123",
+        )
 
 
 class TestMcpRecovery:

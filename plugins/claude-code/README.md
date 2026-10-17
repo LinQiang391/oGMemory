@@ -1,6 +1,6 @@
 # oGMemory Claude Code 插件
 
-将 Claude Code 对话同步到 oGMemory，在用户每次提问时检索相关记忆；成功工具调用的 I/O 会经 `PostToolUse` 以 `role: tool` 补录到同一会话，与 `after_turn` 基于 transcript 的 user/assistant 行互补。`call_compose.py` / `call_after_turn.py` 与 `call_add_session_message.py` 复用 `scripts/ogm_plugin_request.py`（`base_api_url`、请求头/身份、`base_ctx`），并在各脚本内将 `claude-plugin/scripts` 置前 `sys.path` 以稳定 `import ogm_plugin_request`。
+将 Claude Code 对话同步到 oGMemory，在用户每次提问时检索相关记忆；成功工具调用的 I/O 会经 `PostToolUse` 以 `role: tool` 补录到同一会话，与 `after_turn` 基于 transcript 的 user/assistant 行互补。`call_compose.py` / `call_after_turn.py` 与 `call_add_session_message.py` 复用 `scripts/ogm_plugin_request.py`（`base_api_url`、请求头/身份、`base_ctx`），并在各脚本内将 `plugins/claude-code/scripts` 置前 `sys.path` 以稳定 `import ogm_plugin_request`。
 
 ## 工作原理
 
@@ -123,7 +123,7 @@ Read/Bash 输出过滤通过 oGMemory HTTP API 工作；过滤后的原文恢复
 ### 本地开发
 
 ```bash
-claude --plugin-dir ./claude-plugin
+claude --plugin-dir ./plugins/claude-code
 # 可选: --debug
 ```
 

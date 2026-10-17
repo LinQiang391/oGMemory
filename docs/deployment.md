@@ -1,5 +1,7 @@
 # ContextEngine 部署文档
 
+> 文档入口：[文档总览](README.md)。Compose、生产运维和 OpenClaw 专项部署见对应专题文档；本页保留基础部署流程。
+
 ## 环境要求
 
 - Python 3.11+

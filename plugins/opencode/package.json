@@ -17,7 +17,7 @@
   "repository": {
     "type": "git",
     "url": "https://gitcode.com/opengauss/oGMemory.git",
-    "directory": "opencode-plugin"
+    "directory": "plugins/opencode"
   },
   "publishConfig": {"access": "public"}
 }
