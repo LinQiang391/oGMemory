@@ -215,9 +215,15 @@ curl http://localhost:1833/
 # 检查端口占用
 lsof -i :1833
 
-# 重启 AGFS
+# 构建并重启 AGFS
 make -C agfs build
-./agfs/build/agfs-server -c agfs/config.yaml &
+pkill -x agfs-server 2>/dev/null || true
+while lsof -ti :1833 >/dev/null 2>&1; do sleep 1; done
+mkdir -p .ogmem_data/agfs
+(
+  cd agfs
+  ./build/agfs-server -c config.yaml
+) &
 ```
 
 ### 测试超时

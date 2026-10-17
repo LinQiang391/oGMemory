@@ -4,6 +4,8 @@
 
 ## 本地开发
 
+本地默认使用 SQL 存储。先准备可连接的 PostgreSQL 或 openGauss 数据库；数据库不会由本地向导创建。配置示例见 [SQL 直连最小本地启动](OGMEMORY_ENV.md#sql-直连最小本地启动)。
+
 ```bash
 python -m pip install -e ".[dev]"
 ogmem onboard --mode local
@@ -17,8 +19,9 @@ ogmem status
 ogmem stop local
 ```
 
-本地服务会管理 AGFS、ContextEngine 和 IndexService。配置文件生成在
-`config/ogmem.yaml`，运行数据和日志默认位于 `.ogmem_data/`。
+默认 SQL 模式只启动 ContextEngine，不管理 AGFS 或 IndexService。需要 AGFS 时按
+[AGFS README](../agfs/README.md) 启动；需要索引服务时单独执行 `ogmem start index -d`。
+配置文件生成在 `config/ogmem.yaml`，运行数据和日志默认位于 `.ogmem_data/`。
 
 ## Docker Compose
 
