@@ -1,7 +1,5 @@
 # 部署入口
 
-本文只保留部署入口，具体参数和操作步骤维护在对应专题文档中。
-
 ## 选择部署方式
 
 - [Compose 部署](../deploy/compose/README_zh.md)：启动 openGauss、oGMemory HTTP/MCP 和 AGFS。
