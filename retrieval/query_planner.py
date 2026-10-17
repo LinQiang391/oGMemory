@@ -49,10 +49,24 @@ _NOISE_PATTERNS: list[re.Pattern[str]] = [
     re.compile(r"\[[\w\s:\-]+UTC\]\s*"),                    # timestamp like [Fri 2026-03-27 06:16 UTC]
 ]
 
+_BROWSER_CONTEXT_PREFIX = re.compile(
+    r"\A\s*<in-app-browser-context\b"
+    r"(?=[^>]*\bsource\s*=\s*['\"]ambient-ui-state['\"])[^>]*>"
+    r"[\s\S]*?</in-app-browser-context>\s*"
+)
+_USER_REQUEST_PREFIX = re.compile(r"\A## My request:[ \t]*(?:\r?\n|$)")
+
 
 def sanitize_query(raw: str) -> str:
     """Strip upstream metadata noise, keeping only user intent."""
     text = raw
+    # Codex Desktop prepends UI state to the prompt. It is not user intent
+    # and can route retrieval to RESOURCE or overwhelm the query embedding.
+    # Only strip a leading, explicitly marked ambient block; preserve quoted
+    # examples and ordinary user text containing the request heading.
+    text, removed = _BROWSER_CONTEXT_PREFIX.subn("", text, count=1)
+    if removed:
+        text = _USER_REQUEST_PREFIX.sub("", text, count=1)
     for pat in _NOISE_PATTERNS:
         text = pat.sub("", text)
     return text.strip()
