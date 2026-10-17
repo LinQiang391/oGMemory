@@ -198,14 +198,16 @@
       </div>
     </div>
 
-    <dialog id="settings-dialog" class="settings-dialog">
+    <dialog id="settings-dialog" class="settings-dialog" aria-labelledby="settings-title" aria-describedby="settings-description">
       <form id="settings-form">
         <div class="dialog-head">
-          <div><span class="section-label">连接</span><h2>查看范围</h2></div>
+          <div><h2 id="settings-title">连接 oGMemory</h2></div>
           <button id="settings-close" class="close-button" type="button" aria-label="关闭">×</button>
         </div>
-        <label>API Key<input id="api-key-input" type="password" placeholder="启用权限控制时填写" autocomplete="off"></label>
-        <button id="save-settings" class="primary-button" type="submit">保存并刷新</button>
+        <p id="settings-description" class="settings-description">请输入管理员为你分配的 oGMemory API Key。连接后将显示你有权限查看的内容。</p>
+        <label>API Key<input id="api-key-input" type="password" placeholder="请输入你的 API Key" autocomplete="off" aria-describedby="settings-help"></label>
+        <button id="save-settings" class="primary-button" type="submit">连接</button>
+        <p id="settings-help" class="settings-help">没有 API Key？请联系管理员获取。</p>
       </form>
     </dialog>
 
