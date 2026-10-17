@@ -211,7 +211,7 @@ docker restart ogmem
 
 ### 5. 打开管理界面
 
-在浏览器中访问 `http://<服务器IP>:8090/memory-viewer/`，将服务器 IP 和端口替换为实际部署值。在 **连接设置** 中填写 oGMemory API Key，点击 **保存并刷新**，即可通过左侧 **记忆** 查看目录和内容。
+在浏览器中访问 `http://<服务器IP>:8090/memory-viewer/`，将服务器 IP 和端口替换为实际部署值。在 **连接设置** 中填写管理员分配的 oGMemory API Key，点击 **连接**，即可通过左侧 **记忆** 查看目录和内容。
 
 完整操作步骤、SSH 隧道访问和常见问题见 [管理界面使用指南](../docs/memory_viewer_guide.md)。
 
