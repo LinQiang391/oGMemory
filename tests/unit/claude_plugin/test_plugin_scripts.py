@@ -19,9 +19,9 @@ from unittest.mock import MagicMock, patch
 import pytest
 
 # ---------------------------------------------------------------------------
-# Make claude-plugin/scripts importable
+# Make plugins/claude-code/scripts importable
 # ---------------------------------------------------------------------------
-_SCRIPTS_DIR = Path(__file__).resolve().parents[3] / "claude-plugin" / "scripts"
+_SCRIPTS_DIR = Path(__file__).resolve().parents[3] / "plugins/claude-code" / "scripts"
 _REDACTION_FIXTURES = (
     Path(__file__).resolve().parents[2] / "fixtures" / "trace" / "redaction_cases.json"
 )

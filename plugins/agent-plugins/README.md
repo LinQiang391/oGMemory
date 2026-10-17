@@ -42,7 +42,7 @@ For a generic MCP client, register this stdio command instead:
   "mcpServers": {
     "ogmemory": {
       "command": "node",
-      "args": ["/absolute/path/agent-plugins/servers/mcp-proxy.mjs"],
+      "args": ["/absolute/path/plugins/agent-plugins/servers/mcp-proxy.mjs"],
       "env": {"OGMEM_AGENT_PLUGIN_CONFIG": "/absolute/path/private/agent-plugin.json"}
     }
   }
@@ -62,7 +62,7 @@ intend to keep the same limited tool surface.
 ## 3. Verify
 
 ```bash
-node /absolute/path/agent-plugins/scripts/doctor.mjs
+node /absolute/path/plugins/agent-plugins/scripts/doctor.mjs
 ```
 
 Exit 0: all three tools found. Exit 2: connected but missing tools (for example a
@@ -78,13 +78,13 @@ memory before retrying. The proxy never automatically replays writes.
 ## Client guides and development
 
 See [Chinese guide](README_zh.md) and the repository's
-[four-client tutorial](../docs/integrations/agent-plugins.md). Release ZIPs include
+[four-client tutorial](../../docs/integrations/agent-plugins.md). Release ZIPs include
 that tutorial as `CLIENT-GUIDE.md`.
 
 ```bash
-node --test agent-plugins/tests/proxy.test.mjs
+node --test plugins/agent-plugins/tests/proxy.test.mjs
 python -m pytest tests/integration/test_agent_plugin_protocol.py
-python agent-plugins/scripts/package.py --output dist
+python plugins/agent-plugins/scripts/package.py --output dist
 ```
 
 The automated protocol fixture uses production MCP handlers with deterministic

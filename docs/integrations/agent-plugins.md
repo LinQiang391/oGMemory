@@ -35,7 +35,7 @@ mcp:
 
 ## 2. 获取插件与生成配置
 
-在 Agent 机器安装 Node.js 22+，并取得当前发布版本的 `agent-plugins/` 目录或 ZIP。
+在 Agent 机器安装 Node.js 22+，并取得当前发布版本的 `plugins/agent-plugins/` 目录或 ZIP。
 插件无 npm 依赖。使用仓库时，在包含本功能的分支或发布标签下操作。
 不要在功能尚未合入时从旧 `dev` 下载插件。
 
@@ -76,7 +76,7 @@ Agent 机器的 `~/.ogmemory/agent-plugin.json`。如果 CLI 不在本机，直�
 先自检：
 
 ```bash
-node /absolute/path/agent-plugins/scripts/doctor.mjs
+node /absolute/path/plugins/agent-plugins/scripts/doctor.mjs
 ```
 
 应显示 `connected: true`，并且只包含：
@@ -102,7 +102,7 @@ ogm_write_memory
     "ogmemory": {
       "type": "stdio",
       "command": "node",
-      "args": ["/absolute/path/agent-plugins/servers/mcp-proxy.mjs"],
+      "args": ["/absolute/path/plugins/agent-plugins/servers/mcp-proxy.mjs"],
       "env": {
         "OGMEM_AGENT_PLUGIN_CONFIG": "/absolute/path/private/agent-plugin.json"
       }
@@ -111,14 +111,14 @@ ogm_write_memory
 }
 ```
 
-Windows 路径可写为 `D:/tools/agent-plugins/servers/mcp-proxy.mjs`，不要使用 `${PLUGIN_ROOT}`；
+Windows 路径可写为 `D:/tools/plugins/agent-plugins/servers/mcp-proxy.mjs`，不要使用 `${PLUGIN_ROOT}`；
 这个变量只适用于加载标准 manifest 的客户端。
 也可使用 `claude mcp add-json ogmemory '<单个服务器 JSON 对象>'` 注册；
 PowerShell 包装脚本对引号和 `--` 的处理可能不同，文件配置更容易检查。
 
 ### 3.2 加载 Skill 并验证
 
-把 `agent-plugins/skills/ogmemory-memory/` 复制到测试项目的
+把 `plugins/agent-plugins/skills/ogmemory-memory/` 复制到测试项目的
 `.claude/skills/ogmemory-memory/`。启动 Claude Code，按客户端提示信任项目 MCP。
 
 建议在项目 `CLAUDE.md` 加入以下规则，避免仅发现 Skill 却未加载其写入状态约定：
@@ -144,7 +144,7 @@ claude mcp list
 ```toml
 [mcp_servers.ogmemory]
 command = "node"
-args = ["/absolute/path/agent-plugins/servers/mcp-proxy.mjs"]
+args = ["/absolute/path/plugins/agent-plugins/servers/mcp-proxy.mjs"]
 startup_timeout_sec = 30
 tool_timeout_sec = 180
 
@@ -194,7 +194,7 @@ OpenClaw 自身可能要求比插件更高的 Node.js 版本，应满足两者�
     "servers": {
       "ogmemory": {
         "command": "node",
-        "args": ["/absolute/path/agent-plugins/servers/mcp-proxy.mjs"],
+        "args": ["/absolute/path/plugins/agent-plugins/servers/mcp-proxy.mjs"],
         "env": {
           "OGMEM_AGENT_PLUGIN_CONFIG": "/absolute/path/private/agent-plugin.json"
         },
@@ -240,7 +240,7 @@ probe 只验证连接和发现，随后仍需在新会话中执行第 7 节。
         serverName: ogmemory
         command: node
         args:
-          - /absolute/path/agent-plugins/servers/mcp-proxy.mjs
+          - /absolute/path/plugins/agent-plugins/servers/mcp-proxy.mjs
         env:
           OGMEM_AGENT_PLUGIN_CONFIG: /absolute/path/private/agent-plugin.json
         toolCallTimeoutMs: 180000

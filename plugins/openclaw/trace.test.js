@@ -13,7 +13,7 @@ import {
 } from "./trace.js";
 import plugin, { resolveConfig } from "./index.js";
 
-const fixtureUrl = new URL("../tests/fixtures/trace/redaction_cases.json", import.meta.url);
+const fixtureUrl = new URL("../../tests/fixtures/trace/redaction_cases.json", import.meta.url);
 const redactionCases = JSON.parse(await readFile(fixtureUrl, "utf8"));
 const pluginDir = dirname(fileURLToPath(import.meta.url));
 const flushTraceUploads = () => new Promise((resolve) => setImmediate(resolve));

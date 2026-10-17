@@ -46,9 +46,9 @@ On Unix-like systems:
 
 ```bash
 mkdir -p ~/.config/opencode/plugins/ogmemory
-cp opencode-plugin/wrappers/ogmemory.js ~/.config/opencode/plugins/ogmemory.js
-cp opencode-plugin/index.mjs opencode-plugin/package.json ~/.config/opencode/plugins/ogmemory/
-cp -r opencode-plugin/lib ~/.config/opencode/plugins/ogmemory/
+cp plugins/opencode/wrappers/ogmemory.js ~/.config/opencode/plugins/ogmemory.js
+cp plugins/opencode/index.mjs plugins/opencode/package.json ~/.config/opencode/plugins/ogmemory/
+cp -r plugins/opencode/lib ~/.config/opencode/plugins/ogmemory/
 ```
 
 See [INSTALL-ZH.md](INSTALL-ZH.md) for Windows instructions.

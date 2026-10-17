@@ -14,7 +14,7 @@ import urllib.error
 import urllib.request
 from pathlib import Path
 
-# Sibling module must resolve even when cwd is not claude-plugin/scripts
+# Sibling module must resolve even when cwd is not plugins/claude-code/scripts
 _SCRIPT_DIR = Path(__file__).resolve().parent
 if str(_SCRIPT_DIR) not in sys.path:
     sys.path.insert(0, str(_SCRIPT_DIR))

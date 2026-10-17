@@ -269,7 +269,7 @@ class OpenClawHost(AgentHost):
         self.workspace.mkdir(parents=True, exist_ok=True)
         self.state.mkdir(parents=True, exist_ok=True)
         self.plugin_dir = self.runtime / "plugin"
-        _copy_tree(ROOT / "openclaw_context_engine_plugin", self.plugin_dir)
+        _copy_tree(ROOT / "plugins/openclaw", self.plugin_dir)
         for path in [self.runtime, self.home, self.state, self.workspace, self.plugin_dir]:
             path.chmod(0o700)
         for path in self.plugin_dir.rglob("*"):
@@ -438,7 +438,7 @@ class OpenCodeHost(AgentHost):
         self.env["HOME"] = str(self.runtime / "home")
         self.env["OPENCODE_CONFIG_CONTENT"] = json.dumps(
             {
-                "plugin": [str(ROOT / "opencode-plugin" / "index.mjs")],
+                "plugin": [str(ROOT / "plugins/opencode" / "index.mjs")],
                 "provider": {
                     "locomo": {
                         "npm": "@ai-sdk/openai-compatible",
@@ -513,7 +513,7 @@ class ClaudeCodeHost(AgentHost):
             }
         )
         self.plugin_dir = self.runtime / "plugin"
-        _copy_tree(ROOT / "claude-plugin", self.plugin_dir)
+        _copy_tree(ROOT / "plugins/claude-code", self.plugin_dir)
         result = self._run([self.args.claude_command, "--version"], "prepare-version", record=False)
         self.version = result.stdout.strip()
 
@@ -566,7 +566,7 @@ class HermesHost(AgentHost):
                 "OGMEMORY_TIMEOUT_SECONDS": str(self.args.agent_timeout),
             }
         )
-        _copy_tree(ROOT / "hermes_memory_plugin" / "ogmemory", self.home / "plugins" / "ogmemory")
+        _copy_tree(ROOT / "plugins/hermes" / "ogmemory", self.home / "plugins" / "ogmemory")
         _write_yaml(
             self.home / "config.yaml",
             {
@@ -630,7 +630,7 @@ class DshHost(AgentHost):
                 "--profile",
                 "headless",
                 "add",
-                str(ROOT / "deepseek-harness-plugin"),
+                str(ROOT / "plugins/deepseek-harness"),
             ],
             "prepare-plugin",
             timeout=max(self.args.agent_timeout, 600),

@@ -1,5 +1,7 @@
 # ContextEngine 快速启动指南
 
+> 文档入口：[文档总览](README.md)。本页保留 OpenClaw/AGFS 全链路启动、架构和排障内容；本地 CLI 入口见根目录 [README](../README.md)。
+
 ## 一键启动
 
 ```bash
@@ -55,7 +57,7 @@ pytest tests/ -v
 ### 安装插件
 
 ```bash
-cd openclaw_context_engine_plugin
+cd plugins/openclaw
 npm install
 ```
 
@@ -92,7 +94,7 @@ npm install
 
 ```bash
 # 安装插件到 OpenClaw
-openclaw plugins install -l ./openclaw_context_engine_plugin
+openclaw plugins install -l ./plugins/openclaw
 
 # 重启 OpenClaw
 openclaw restart

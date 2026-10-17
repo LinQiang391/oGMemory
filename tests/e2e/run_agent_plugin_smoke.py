@@ -30,7 +30,7 @@ async def main():
     node = shutil.which("node")
     if not node:
         raise SystemExit("Node.js is required")
-    server = StdioServerParameters(command=node, args=[str(ROOT / "agent-plugins/servers/mcp-proxy.mjs")], env=dict(os.environ))
+    server = StdioServerParameters(command=node, args=[str(ROOT / "plugins/agent-plugins/servers/mcp-proxy.mjs")], env=dict(os.environ))
     marker = "plugin-check-" + uuid4().hex[:12]
     fact = f"请记住：{marker} 项目固定在每周四北京时间20点发布，包管理工具统一使用 uv。"
     async with stdio_client(server) as (read, write):

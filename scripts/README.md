@@ -75,7 +75,7 @@ export OGMEM_API_KEY=sk-...
 ```
 
 说明：
-- 该脚本会直接调用 `openclaw_context_engine_plugin/bridge/memory_api.py` 的 `bootstrap -> after_turn -> assemble` 生命周期。
+- 该脚本会直接调用 `plugins/openclaw/bridge/memory_api.py` 的 `bootstrap -> after_turn -> assemble` 生命周期。
 - 默认要求 `OGMEM_API_KEY`（非 mock）。如果仅用于连通性排查，可加 `--allow-mock-llm`。
 - 会额外尝试检测本机 `openclaw` CLI（若已安装则输出 `--version` 与 `doctor` 结果）。
 

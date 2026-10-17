@@ -11,7 +11,7 @@ OpenClaw context-engine plugin backed by oG-Memory. It connects OpenClaw lifecyc
 ## Install
 
 ```bash
-cd openclaw_context_engine_plugin
+cd plugins/openclaw
 openclaw plugins install -l .
 ```
 
@@ -161,7 +161,7 @@ OpenClaw gateway
   |
   | lifecycle call
   v
-openclaw_context_engine_plugin/index.js
+plugins/openclaw/index.js
   |
   | HTTP
   v
@@ -195,7 +195,7 @@ retryable. A `session_deleting` conflict is never replayed, preventing a stale
 ## Project Structure
 
 ```
-openclaw_context_engine_plugin/
+plugins/openclaw/
 ├── index.js                 # Plugin entry, config resolver, HTTP bridge, lifecycle handlers
 ├── compaction-boundary.js   # Persists OpenClaw compaction boundary entries during takeover
 ├── process.js               # Local-mode health checks, port probing, process helpers
@@ -213,7 +213,7 @@ openclaw_context_engine_plugin/
 
 ```bash
 openclaw doctor
-npm test --prefix openclaw_context_engine_plugin
+npm test --prefix plugins/openclaw
 ```
 
 For a remote service, also verify oG-Memory directly:

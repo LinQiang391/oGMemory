@@ -86,14 +86,14 @@ def build_artifacts(adapter: str, connection: Connection) -> dict[str, str]:
             "agent_id": c.agent_id, "timeout_ms": 30000,
         })}
         steps = (
-            "1. Obtain the agent-plugins/ directory from the oGMemory repository or release ZIP. "
+            "1. Obtain the plugins/agent-plugins/ directory from the oGMemory repository or release ZIP. "
             "Install Node.js 22 or newer on the Agent machine.\n"
             "2. Copy agent-plugin.json to ~/.ogmemory/agent-plugin.json or set "
             "OGMEM_AGENT_PLUGIN_CONFIG to its absolute path. Replace any key placeholder.\n"
-            "3. Load agent-plugins/ in an Agent Plugins 1.0 client. For a generic MCP client, "
-            "configure command=node, args=[/absolute/path/agent-plugins/servers/mcp-proxy.mjs] "
+            "3. Load plugins/agent-plugins/ in an Agent Plugins 1.0 client. For a generic MCP client, "
+            "configure command=node, args=[/absolute/path/plugins/agent-plugins/servers/mcp-proxy.mjs] "
             "and load skills/ogmemory-memory/SKILL.md as a Skill or Agent instruction.\n"
-            "4. Run node /absolute/path/agent-plugins/scripts/doctor.mjs. "
+            "4. Run node /absolute/path/plugins/agent-plugins/scripts/doctor.mjs. "
             "The expected tools are ogm_query_memory, ogm_read_memory and ogm_write_memory. "
             "The service must enable memory writes for the third tool.\n"
             "5. Follow docs/integrations/agent-plugins.md for OpenClaw, DSH, Claude Code and Codex. "
@@ -116,7 +116,7 @@ def build_artifacts(adapter: str, connection: Connection) -> dict[str, str]:
         })}
         steps = (
             "1. If needed, install the plugin on the Agent machine:\n\n"
-            "       openclaw plugins install --link /path/to/oGMemory/openclaw_context_engine_plugin\n\n"
+            "       openclaw plugins install --link /path/to/oGMemory/plugins/openclaw\n\n"
             "2. Merge openclaw.config.patch.json into the active OpenClaw config "
             "(OPENCLAW_CONFIG_PATH, or the selected profile's openclaw.json). "
             "Preserve unrelated settings and entries. If a plugins.allow list exists, "
@@ -135,7 +135,7 @@ def build_artifacts(adapter: str, connection: Connection) -> dict[str, str]:
             "1. Merge the env entries from claude.settings.patch.json into the "
             "target project's .claude/settings.json or your user settings; preserve other settings.\n"
             "2. Load the oGMemory plugin. For a source checkout on the Agent machine:\n\n"
-            "       claude --plugin-dir /path/to/oGMemory/claude-plugin\n\n"
+            "       claude --plugin-dir /path/to/oGMemory/plugins/claude-code\n\n"
             "   If already installed through your marketplace, reload that plugin instead.\n"
             "3. Review/trust its hooks and open a new session. Hook scripts require Python 3.\n"
         )
@@ -171,7 +171,7 @@ def build_artifacts(adapter: str, connection: Connection) -> dict[str, str]:
             "2. Copy ogmemory-config.json to ~/.config/opencode/ogmemory-config.json "
             "(Windows: %USERPROFILE%/.config/opencode/ogmemory-config.json).\n"
             "3. Restart OpenCode; it installs the declared npm plugin. Requires OpenCode >= 1.15.11 "
-            "and Node.js >= 18. Source installation is described in opencode-plugin/INSTALL-ZH.md.\n"
+            "and Node.js >= 18. Source installation is described in plugins/opencode/INSTALL-ZH.md.\n"
         )
     elif adapter == "deepseek-harness":
         if urlsplit(c.url).scheme == "http" and urlsplit(c.url).hostname not in {"localhost", "127.0.0.1"}:
@@ -228,7 +228,7 @@ def build_artifacts(adapter: str, connection: Connection) -> dict[str, str]:
             "OGMEMORY_AGENT_ID": c.agent_id,
         }))
         steps = (
-            "1. If needed, copy the repository's hermes_memory_plugin/ogmemory/ directory "
+            "1. If needed, copy the repository's plugins/hermes/ogmemory/ directory "
             "to the active HERMES_HOME/plugins/ogmemory/ directory "
             "(default: ~/.hermes/plugins/ogmemory/) on the Agent machine.\n"
             "2. Merge hermes.config.patch.yaml into that profile's config.yaml. "
