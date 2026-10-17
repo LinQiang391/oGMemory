@@ -209,6 +209,12 @@ curl http://127.0.0.1:8090/api/v1/health
 docker restart ogmem
 ```
 
+### 5. 打开管理界面
+
+在浏览器中访问 `http://<服务器IP>:8090/memory-viewer/`，将服务器 IP 和端口替换为实际部署值。在 **连接设置** 中填写 oGMemory API Key，点击 **保存并刷新**，即可通过左侧 **记忆** 查看目录和内容。
+
+完整操作步骤、SSH 隧道访问和常见问题见 [管理界面使用指南](../docs/memory_viewer_guide.md)。
+
 ## 第三部分：OpenClaw
 
 本部分介绍 OpenClaw 的 Context Engine 和 MCP 两种接入方式。开始操作前，请确保 openGauss 和 oGMemory 已按前述步骤完成部署。
