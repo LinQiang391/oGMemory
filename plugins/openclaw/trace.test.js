@@ -1,7 +1,7 @@
 import assert from "node:assert/strict";
 import { spawnSync } from "node:child_process";
 import { readFile } from "node:fs/promises";
-import { dirname } from "node:path";
+import { dirname, join } from "node:path";
 import test from "node:test";
 import { fileURLToPath } from "node:url";
 
@@ -29,6 +29,15 @@ test("retains model text and exposed thinking from the completed turn", () => {
     { text: "Reading docs.", reasoning: "Inspect the API contract." },
     { text: "Use batches of 100.", reasoning: "" },
   ]);
+});
+
+test("local defaults resolve from the repository root after plugin migration", () => {
+  const repoRoot = dirname(dirname(pluginDir));
+  const config = resolveConfig({ mode: "local" });
+
+  assert.equal(config.projectRoot, repoRoot);
+  assert.equal(config.agfsServerDir, join(repoRoot, "agfs"));
+  assert.equal(config.agfsDataDir, join(repoRoot, "..", "data"));
 });
 
 test("maps supported OpenClaw hooks to canonical event types", () => {
