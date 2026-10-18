@@ -123,7 +123,7 @@ def _error_response(exc: Exception):
         return jsonify({"error": str(exc)}), 401
     if isinstance(exc, ControlPlaneDisabledError):
         return jsonify({"error": str(exc)}), 503
-    if isinstance(exc, FileNotFoundError):
+    if isinstance(exc, (FileNotFoundError, NodeNotFoundError)):
         return jsonify({"error": str(exc)}), 404
     if isinstance(exc, FileExistsError):
         return jsonify({"error": str(exc)}), 409
@@ -131,7 +131,7 @@ def _error_response(exc: Exception):
         return jsonify({"error": str(exc)}), 409
     if isinstance(exc, ValueError):
         return jsonify({"error": str(exc)}), 400
-    if isinstance(exc, AuthorizationError | PermissionError):
+    if isinstance(exc, (AuthorizationError, PermissionError, AccessDeniedError)):
         return jsonify({"error": str(exc)}), 403
     return jsonify({"error": str(exc)}), 500
 
