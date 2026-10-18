@@ -778,6 +778,10 @@ ContextFS / SQL 存储 + 向量索引
 - oGMemory 使用基于 AGFS 的分层存储，为 Session 范围内的记忆资源提供持久化能力
 - [AI Agent Memory Architectures](https://zylos.ai/research/2026-03-09-multi-agent-memory-architectures-shared-isolated-hierarchical) — Zylos Research, 2026
 
+## SWE-bench 测试参考
+
+参见 [SWE-bench Lite 测试指导与脚本](benchmarks/swebench/README.md)，对比 baseline 与使用 openGauss SQL 后端的 oGMemory，包含单题验证、连续执行、官方评分和用量统计。
+
 ## 许可证
 
 [Apache License 2.0](LICENSE)

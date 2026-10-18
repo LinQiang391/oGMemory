@@ -205,3 +205,7 @@ deploy/_artifacts/
 # Asciinema recordings (local demo artifacts, not source)
 *.cast
 *.gif
+
+# SWE-bench local configuration, caches, credentials and generated results
+/benchmarks/swebench/work/
+/benchmarks/swebench/config.yaml
