@@ -17,8 +17,9 @@ def post(path, body, timeout):
     print(json.dumps({'path': path, 'body': body}, ensure_ascii=False), file=sys.stderr)
     return {'ok': True, 'identityContext': '中文偏好：简洁回答。'}
 main.__globals__['_post_json'] = post
+main.__globals__['_get_json'] = lambda *args, **kwargs: None
 raise SystemExit(main())
-"""
+""".encode("ascii", "backslashreplace").decode("ascii")
 
 
 @pytest.mark.parametrize("encoding", ["gbk:surrogateescape", "utf-8"])
