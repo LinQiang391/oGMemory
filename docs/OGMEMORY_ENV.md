@@ -269,7 +269,7 @@ cp config/ogmem.reference.yaml config/ogmem.yaml
 
 说明：
 - 这个模式只要求本机 PostgreSQL 可连通。
-- `./scripts/start_sql.sh` 会优先读取仓库根目录 `./ogmem.yaml`，不必额外导出环境变量。
+- `./scripts/start_sql.sh` 会优先读取 `config/ogmem.yaml`，不必额外导出环境变量。
 - PostgreSQL 参数写在 `storage.connection_string`。
 - `vector_db.type: memory` 避免额外依赖 Chroma 或 openGauss vector 扩展。
 - `llm.provider: mock` 避免依赖外部 LLM API。

@@ -5,7 +5,6 @@
 ## 入门
 
 - [快速开始](QUICKSTART.md)：OpenClaw/AGFS 全链路启动、架构、数据流和排障。
-- [配置参考](OGMEMORY_ENV.md)：YAML 配置、环境变量和配置优先级。
 - [客户端接入总览](integrations/README.md)：HTTP、Python、MCP 和 Agent 插件的选择规则。
 
 ## 配置
