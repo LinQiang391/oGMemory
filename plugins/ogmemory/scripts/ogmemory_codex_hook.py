@@ -4,22 +4,33 @@
 from __future__ import annotations
 
 import hashlib
+import http.client
 import json
 import os
 import re
 import sys
 import tempfile
+import time
+import urllib.error
+import urllib.parse
 import urllib.request
 from datetime import UTC, datetime
 from functools import lru_cache
 from pathlib import Path
+from threading import Thread
 from typing import Any
 
-RECALL_TIMEOUT_SECONDS = 10
+RECALL_TIMEOUT_SECONDS = 9
 WRITE_TIMEOUT_SECONDS = 10
 TRACE_TIMEOUT_SECONDS = 3
 SESSION_END_STEP_TIMEOUT_SECONDS = 1
 MAX_CONTEXT_CHARS = 9500
+SKILL_MATCH_THRESHOLD = 0.20
+SKILL_CONTEXT_TIMEOUT_SECONDS = 2.0
+MAX_ADDITIONAL_CONTEXT_CHARS = 2400
+MAX_MEMORY_CONTEXT_OUTPUT_CHARS = 1550
+MAX_SKILL_CONTEXT_OUTPUT_CHARS = 800
+MAX_SKILL_QUERY_URL_BYTES = 1800
 MAX_TRACE_TEXT_CHARS = 12000
 MAX_TRACE_EVENT_BODY_BYTES = 60000
 
@@ -36,8 +47,12 @@ SENSITIVE_KEYS = {
     "token",
 }
 SECRET_PATTERNS = (
-    re.compile(r"(?i)\b(authorization\s*:\s*bearer\s+)[^\s,;]+"),
-    re.compile(r"(?i)\b(password|secret|api[_-]?key|access[_-]?token)(\s*[:=]\s*)[^\s,;]+"),
+    re.compile(r"(?i)\b(authorization\s*:\s*[a-z]+[ \t]+)[^\r\n]+"),
+    re.compile(
+        r"(?i)\b(?!authorization\s*:\s*[a-z]+[ \t]+)((?:[a-z0-9]+[_-])*(?:"
+        + "|".join(re.escape(key).replace("_", "[_-]") for key in sorted(SENSITIVE_KEYS)) + r"))"
+        r'''(["']?\s*[:=]\s*)(?:"(?:\\.|[^"\\])*"|'(?:\\.|[^'\\])*'|[^\s,;]+)'''
+    ),
     re.compile(r"\bsk-[A-Za-z0-9_-]{12,}\b"),
 )
 
@@ -148,6 +163,95 @@ def _post_json(path: str, body: dict[str, Any], timeout: int) -> dict[str, Any] 
         return None
 
 
+def _get_json(path: str, timeout: float = 3) -> dict[str, Any] | None:
+    request = urllib.request.Request(
+        f"{_base_url()}{path}", headers=_headers(), method="GET"
+    )
+    try:
+        with urllib.request.urlopen(request, timeout=timeout) as response:
+            payload = json.loads(response.read().decode("utf-8"))
+            return payload if isinstance(payload, dict) else None
+    except urllib.error.HTTPError as exc:
+        if exc.code in {401, 403}:
+            _log(
+                f"Skill HTTP {exc.code}: enable server auth.role_control_enabled and configure API keys; "
+                "set api_key, account_id, user_id and agent_id in ~/.ogmemory/codex-plugin.json "
+                "using credentials authorized for the target agent."
+            )
+        else:
+            _log(f"Skill HTTP {exc.code}")
+        return None
+    except (OSError, ValueError, http.client.HTTPException):
+        return None
+
+
+def _skill_query_url_part(query: str) -> str:
+    """Redact and bound the search query before putting it in a request URL."""
+    safe_query = str(_redact(query))[:2000]
+    while safe_query and len(
+        urllib.parse.quote(safe_query, safe="").encode("ascii")
+    ) > MAX_SKILL_QUERY_URL_BYTES:
+        safe_query = safe_query[:-1]
+    return urllib.parse.quote(safe_query, safe="")
+
+
+def _skill_context(query: str) -> str | None:
+    deadline = time.monotonic() + SKILL_CONTEXT_TIMEOUT_SECONDS
+    result: list[str | None] = []
+
+    def read() -> None:
+        result.append(_read_skill_context(query, deadline))
+
+    # Daemon lifetime is bounded by this one-shot hook process.
+    worker = Thread(target=read, daemon=True)
+    worker.start()
+    worker.join(max(0.0, deadline - time.monotonic()))
+    if worker.is_alive():
+        _log("Skill recall exceeded its deadline")
+        return None
+    return result[0] if result else None
+
+
+def _read_skill_context(query: str, deadline: float) -> str | None:
+    """Return published Skill metadata and one matching body for this prompt."""
+    agent_id = urllib.parse.quote(_identity("unknown")["agentId"], safe="")
+    encoded = _skill_query_url_part(query)
+    catalog = _get_json(
+        f"/api/v1/skills?q={encoded}&limit=3&agent_id={agent_id}",
+        timeout=max(0.1, deadline - time.monotonic()),
+    )
+    rows = [row for row in (catalog or {}).get("skills", []) if isinstance(row, dict)]
+    if not rows:
+        return None
+    lines = [
+        f"- {str(row.get('name', ''))[:40]}: {str(row.get('description', ''))[:60]}"
+        for row in rows[:3]
+    ]
+    context = "[oGMemory published Skills]\n" + "\n".join(lines)
+    best = rows[0]
+    try:
+        score = float(best.get("score") or 0)
+    except (TypeError, ValueError):
+        score = 0.0
+    if score < SKILL_MATCH_THRESHOLD or not best.get("name"):
+        return context
+    name = urllib.parse.quote(str(best["name"]), safe="")
+    source = urllib.parse.quote(str(best.get("source") or "generated"), safe="")
+    if time.monotonic() >= deadline:
+        return context
+    detail = _get_json(
+        f"/api/v1/skills/{name}?source={source}&agent_id={agent_id}&include_files=false",
+        timeout=max(0.1, deadline - time.monotonic()),
+    )
+    body = str((detail or {}).get("content") or "").strip()
+    body = re.sub(r"\A---[ \t]*\r?\n.*?^---[ \t]*(?:\r?\n|\Z)", "", body,
+                  count=1, flags=re.MULTILINE | re.DOTALL).strip()
+    if body:
+        context += "\n\n[Matching Skill; use only when applicable]\n"
+        context += body[:MAX_SKILL_CONTEXT_OUTPUT_CHARS - len(context)]
+    return context
+
+
 def _data_root() -> Path:
     configured = os.environ.get("PLUGIN_DATA") or os.environ.get("CLAUDE_PLUGIN_DATA")
     if configured:
@@ -209,7 +313,8 @@ def _redact(value: Any) -> Any:
         return [_redact(item) for item in value]
     if not isinstance(value, str):
         return value
-    redacted = SECRET_PATTERNS[0].sub(r"\1[REDACTED]", value)
+    redacted = re.sub(r"(?im)\b(cookie\s*:\s*)[^\r\n]+", r"\1[REDACTED]", value)
+    redacted = SECRET_PATTERNS[0].sub(r"\1[REDACTED]", redacted)
     redacted = SECRET_PATTERNS[1].sub(r"\1\2[REDACTED]", redacted)
     return SECRET_PATTERNS[2].sub("[REDACTED]", redacted)
 
@@ -390,6 +495,15 @@ def _recall(session_id: str, query: str, event_name: str) -> dict[str, Any] | No
         RECALL_TIMEOUT_SECONDS,
     )
     context = _memory_context(payload) if payload else None
+    skills = None
+    if event_name == "UserPromptSubmit":
+        skills = _skill_context(query)
+    if skills:
+        memory = context[:MAX_MEMORY_CONTEXT_OUTPUT_CHARS] if context else ""
+        skill = skills[:MAX_SKILL_CONTEXT_OUTPUT_CHARS]
+        context = f"{memory}\n\n{skill}" if memory else skill
+    elif context:
+        context = context[:MAX_ADDITIONAL_CONTEXT_CHARS]
     if not context:
         return None
     return {
