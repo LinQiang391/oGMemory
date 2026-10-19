@@ -491,6 +491,7 @@ class OgMemConfig:
     openai_embedding_api_key_command: SecretCommandSpec | None = field(default=None, repr=False)
     embedding_multimodal: bool = False
     embedding_max_input_chars: int = 30_000
+    embedding_batch_size: int = 2048
     st_model: str = "BAAI/bge-m3"
 
     # -- Vector DB -------------------------------------------------------------
@@ -794,6 +795,12 @@ class OgMemConfig:
                 "tool_output_filter_output_max_chars must be at least the read and bash min chars"
             )
         embedding_max_input_chars = self.embedding_max_input_chars
+        if (
+            isinstance(self.embedding_batch_size, bool)
+            or not isinstance(self.embedding_batch_size, int)
+            or not 1 <= self.embedding_batch_size <= 2048
+        ):
+            raise ValueError("embedding_batch_size must be an integer between 1 and 2048")
         if isinstance(embedding_max_input_chars, bool) or not isinstance(
             embedding_max_input_chars, int
         ):
@@ -1210,6 +1217,9 @@ class OgMemConfig:
                 int,
             ),
             st_model=_resolve(emb.get("st_model"), "ST_MODEL", "BAAI/bge-m3"),
+            embedding_batch_size=_resolve(
+                emb.get("batch_size"), "OGMEM_EMBEDDING_BATCH_SIZE", 2048, int,
+            ),
             # Vector DB. Env vars are named VECTOR_DB_* because the backend
             # may be openGauss OR PostgreSQL+pgvector (see OpenGaussVectorIndex);
             # the historical OPENGAUSS_* spellings still work as legacy aliases.

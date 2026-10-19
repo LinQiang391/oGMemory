@@ -128,6 +128,15 @@ class M3RuntimeConfig:
     vector_index_connection_string: str | None = None
     vector_index_table_name: str = "m3_episodic_vectors"
     vector_index_pool_size: int = 5
+    embedding_batch_size: int = 2048
+
+    def __post_init__(self):
+        if (
+            isinstance(self.embedding_batch_size, bool)
+            or not isinstance(self.embedding_batch_size, int)
+            or not 1 <= self.embedding_batch_size <= 2048
+        ):
+            raise ValueError("embedding_batch_size must be an integer between 1 and 2048")
 
 
 def _load_yaml_config(config_path: str | None = None) -> dict[str, Any]:
@@ -272,6 +281,7 @@ def load_m3_runtime_config(config_path: str | None = None) -> M3RuntimeConfig:
         embedding_model=str(_pick(embedding_base, "model", "text-embedding-ada-002")),
         embedding_base_url=_pick(embedding_base, "base_url"),
         embedding_api_key=_pick(embedding_base, "api_key"),
+        embedding_batch_size=_pick(embedding_base, "batch_size", 2048),
         embedding_dimension=(
             int(_pick(embedding_base, "dimension"))
             if _pick(embedding_base, "dimension") is not None
