@@ -1,7 +1,5 @@
 # 仓库目录说明
 
-本文按运行时、功能扩展、客户端集成、部署与验证四类说明仓库目录职责。
-
 ## 核心运行时
 
 | 目录 | 职责 |
@@ -16,6 +14,8 @@
 | `service/` | 记忆 API、代码资源和生命周期服务 |
 | `server/` | HTTP、MCP、认证和服务编排入口 |
 | `session/` | 会话状态、压缩和归档 |
+| `agfs/` | AGFS 服务、文件系统插件和 Go SDK |
+| `cli/` | `ogmem` 命令和本地服务管理 |
 
 ## 功能扩展
 
@@ -38,7 +38,9 @@
 | `plugins/hermes/` | Hermes Memory Provider |
 | `integrations/deepagents/` | LangChain Deep Agents Python 中间件 |
 
-插件分类和验证顺序见 [Agent Plugin 目录布局与验证顺序](agent-plugin-layout.md)。
+`plugins/` 提供可独立安装的 Agent 插件；`integrations/` 提供进程内 Python 集成。
+Deep Agents 中间件的导入路径为 `integrations.deepagents`。各客户端安装与配置见
+[接入总览](../integrations/README.md)。
 
 ## 部署、工具与验证
 
@@ -52,4 +54,13 @@
 | `tests/` | contract、unit、integration、e2e 和 benchmark |
 | `perf/` | 性能脚本和结果处理 |
 
-根目录 README 只列主要类别；具体文件入口以 `docs/README.md` 为准。
+## 文档
+
+| 目录 | 内容 |
+| --- | --- |
+| `docs/architecture/` | 仓库布局、存储格式、抽取流程和异步索引设计 |
+| `docs/integrations/` | HTTP、Python、MCP 和 Agent 客户端接入 |
+| `docs/deployment/` | 镜像构建、源码部署和运维操作 |
+| `docs/testing/` | LoCoMO 评测和 Jenkins 测试方案 |
+
+[文档总览](../README.md)提供快速开始、配置和各专题入口。

@@ -1,8 +1,5 @@
 # AGFS Directory Specification v1
 
-> Phase 0 frozen — this spec is the contract between write-path, DFX, and Repair Job.
-> Modifications require broadcast notification to all teammates.
-
 ## Overview
 
 ContextEngine stores ContextNodes as directories in AGFS (Adaptive Globally-addressable File System). Each node corresponds to a URI and contains multiple files representing different content layers and metadata.

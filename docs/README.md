@@ -1,32 +1,32 @@
 # oGMemory 文档
 
-按任务选择入口。根目录的 [README](../README.md) 介绍项目能力；本页维护文档导航，避免同一操作在多个文件重复维护。
-
 ## 入门
 
-- [快速开始](QUICKSTART.md)：OpenClaw/AGFS 全链路启动、架构、数据流和排障。
+- [快速开始](QUICKSTART.md)：本地 CLI 启动，以及 Compose、ARM64 和 OpenClaw 部署入口。
 - [客户端接入总览](integrations/README.md)：HTTP、Python、MCP 和 Agent 插件的选择规则。
 
 ## 配置
 
 - [oGMemory 配置参考](OGMEMORY_ENV.md)：字段说明、环境变量映射和 SQL 直连示例。
-- [环境变量兼容说明](ENV.md)：历史环境变量和迁移提示。
 - [配置模板](../config/ogmem.reference.yaml)：所有部署模式共用的参考 YAML。
 
 ## 部署与运维
 
 - [Compose 部署](../deploy/compose/README_zh.md)：openGauss、oGMemory、HTTP 和 MCP 的容器部署。
-- [部署运维指南](deployment/deployment_operations_guide.md)：生产部署、升级、备份和故障处理。
+- [部署运维指南](deployment/deployment_operations_guide.md)：OpenClaw 容器部署、日志、健康检查和故障处理。
 - [Docker 部署说明](deployment/docker_deployment_guide.md)：镜像构建和容器运行参考。
 - [OpenClaw Context Engine 部署](deployment/openclaw_context_engine_quickstart_zh.md)：OpenClaw 单机接入。
-- [基础部署指南](deployment.md)：传统本地部署流程和环境准备。
+- [部署方式选择](deployment.md)：Compose、ARM64、源码和镜像部署。
+- [Memory Viewer 使用指南](memory_viewer_guide.md)：连接账户、浏览记忆和查看运行状态。
 
 ## 集成
 
 - [集成总览](integrations/README.md)
+- [Agent 接入配置生成](integrations/plugin-config.md)
 - [HTTP REST](integrations/http-rest.md)
 - [Python API](integrations/python-api.md)
 - [MCP](integrations/mcp.md)
+- [MCP 协议兼容性](integrations/mcp-protocol-compatibility.md)
 - [通用 Agent Plugin](integrations/agent-plugins.md)
 - [Claude Code](integrations/claude-code.md)
 - [Codex](integrations/codex.md)
@@ -36,28 +36,18 @@
 - [Deep Agents](integrations/deepagents.md)
 - [OpenClaw](integrations/openclaw.md)
 
-## 架构与协议
+## 架构
 
 - [仓库目录说明](architecture/repository-layout.md)
-- [Agent Plugin 目录布局与验证顺序](architecture/agent-plugin-layout.md)
-- [AGFS 目录规范](agfs_directory_spec.md)
-- [记忆卡片格式](memory_card_format.md)
-- [目录摘要流程](directory_summarizer_flow.md)
-- [节点处理流程](node_processing.md)
-- [MCP 协议兼容性](mcp_protocol_compatibility.md)
-- [Memory Viewer 使用指南](memory_viewer_guide.md)
+- [AGFS 目录规范](architecture/agfs-directory-spec.md)
+- [记忆卡片格式](architecture/memory-card-format.md)
+- [目录摘要流程](architecture/directory-summarizer-flow.md)
+- [节点处理流程](architecture/node-processing.md)
+- [异步索引设计](architecture/async-indexing.md)
 
 ## 开发与测试
 
 - [脚本与测试指南](../scripts/README.md)
-- [测试指南](TEST_GUIDE_zh.md)
-- [测试策略与 Jenkins](test_strategy_jenkins.md)
-- [异步处理索引](index_asyn_process.md)
-- [LoCoMo 评测](openclaw_mcp_locomo_eval.md)
-
-## 目录职责
-
-代码目录的职责摘要见[仓库目录说明](architecture/repository-layout.md)。插件源码分散在
-`plugins/`、`plugins/agent-plugins/`、
-`plugins/claude-code/`、`plugins/openclaw/`、`plugins/opencode/`、
-`plugins/deepseek-harness/` 和 `plugins/hermes/`；各插件的安装入口以对应 README 为准。
+- [ARM64 LoCoMO 评测](testing/locomo-guide-zh.md)：使用一键部署实例执行评测并查看结果。
+- [OpenClaw MCP LoCoMO 评测](testing/openclaw-mcp-locomo.md)：运行源码评测程序和独立 Judge。
+- [Jenkins 测试方案](testing/jenkins-test-strategy.md)：测试分层、触发矩阵和流水线设计。

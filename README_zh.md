@@ -600,46 +600,7 @@ result = write_api.commit_session(messages, ctx)
 
 ### 仓库结构
 
-```
-ContextEngine/
-├── core/                   # 领域模型、Protocol 接口、枚举、错误类型
-├── features/               # 可选产品能力与功能开关
-├── scene/                  # 场景工作流与策略
-├── integrations/           # 共用集成工具与客户端适配器
-├── fs/sql_adapter/         # ContextFS → PostgreSQL 适配器（原子 upsert、RLS 租户隔离）
-├── extraction/             # CandidateExtractor（ReAct 循环 + YAML SchemaRegistry）
-│   ├── prompts/            #   LLM 提示模板
-│   └── schemas/            #   各上下文类型的 YAML 抽取 Schema
-├── commit/                 # 写入链路：PolicyRouter → MergePolicy → ContextWriter
-├── index/                  # 异步索引：OutboxWorker → IndexRecordBuilder → VectorDB
-├── retrieval/              # 读取链路：IntentClassifier → SeedRetriever → ResultRanker
-├── providers/              # 外部适配：LLM、Embedder、VectorIndex、RelationStore
-│   ├── llm/                #   OpenAI 兼容 LLM 提供商
-│   ├── embedder/           #   4 种嵌入后端（OpenAI、火山引擎等）
-│   ├── vector_index/       #   InMemory / ChromaDB / pgvector
-│   └── relation_store/     #   PostgreSQL 关系存储
-├── service/                # API 层：MemoryWriteAPI、MemoryReadAPI、多租户
-├── server/                 # HTTP REST 服务（Flask）、认证/RBAC、会话管理
-├── session/                # SessionManager、TopicBuffer、RollingCompressor
-├── tests/
-│   ├── contract/           # 跨团队契约测试（不变量检查）
-│   ├── unit/               # 各包单元测试
-│   ├── integration/        # 端到端集成测试
-│   ├── e2e/                # LoCoMo 基准评测框架
-│   └── fixtures/           # 共享测试数据
-├── docs/                   # 架构、部署、快速上手指南
-├── examples/               # 使用示例（SDK、Claude Code 集成）
-├── cli/                    # 统一管理 CLI（ogmem 命令）
-├── plugins/                # 独立客户端与 Agent 插件
-│   ├── agent-plugins/      # 通用 Agent Plugin 包与发布的 Skill
-│   ├── claude-code/        # Claude Code Hooks 插件
-│   ├── deepseek-harness/   # DeepSeek Harness 适配器
-│   ├── hermes/             # Hermes Agent 适配器
-│   ├── ogmemory/            # Codex 插件（全生命周期 HTTP Hooks）
-│   ├── openclaw/            # OpenClaw 插件（TypeScript 桥接）
-│   └── opencode/            # OpenCode npm 插件
-└── scripts/                # 辅助脚本
-```
+[源码目录](docs/architecture/repository-layout.md) · [文档总览](docs/README.md) · [客户端接入](docs/integrations/README.md)
 
 ---
 
