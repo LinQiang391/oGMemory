@@ -457,7 +457,7 @@ def _list_visible_page(service, context, *, limit: int, cursor: str | None):
         skills, has_more = _list_skill_page(service, context, limit=limit, cursor=cursor)
         return skills, has_more, skills[-1]["uri"] if has_more and skills else None
     if cursor:
-        parsed = parse_ogmemory_uri(cursor)
+        parsed = parse_ogmemory_uri(cursor.partition("#")[0])
         if parsed.kind != "item" or parsed.memory_type == "skill":
             raise ValueError("cursor must reference a memory item")
 
@@ -844,7 +844,7 @@ def _list_target_page(
         return [summary], False, None
 
     if cursor:
-        parsed = parse_ogmemory_uri(cursor)
+        parsed = parse_ogmemory_uri(cursor.partition("#")[0])
         if parsed.kind != "item" or parsed.memory_type != memory_type:
             raise ValueError("cursor must reference the requested memory directory")
         if memory_type == "pattern" and parsed.owner_scope != (
