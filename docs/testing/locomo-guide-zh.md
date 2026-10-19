@@ -1,6 +1,6 @@
 # oGMemory LoCoMO 测试指南
 
-完成[一键部署](../deploy/user-quickstart/README_zh.md)后，在同一台 Linux ARM64 服务器上，使用执行部署的用户打开 Bash 终端。部署生成的 `$HOME/ogmemory-runtime.env` 提供实例名、模型配置和服务凭据。
+完成[一键部署](../../deploy/user-quickstart/README_zh.md)后，在同一台 Linux ARM64 服务器上，使用执行部署的用户打开 Bash 终端。部署生成的 `$HOME/ogmemory-runtime.env` 提供实例名、模型配置和服务凭据。
 
 ## 1. 下载测试脚本
 

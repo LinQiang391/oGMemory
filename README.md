@@ -599,46 +599,7 @@ Key environment variables (see [docs/OGMEMORY_ENV.md](docs/OGMEMORY_ENV.md) for 
 
 ### Repository Layout
 
-```
-ContextEngine/
-├── core/                   # Domain models, Protocol interfaces, enums, errors
-├── features/               # Optional product capabilities and feature flags
-├── scene/                  # Scene-specific workflows and policies
-├── integrations/           # Shared integration helpers and client-facing adapters
-├── fs/sql_adapter/         # ContextFS → PostgreSQL adapter (atomic upsert, RLS tenant isolation)
-├── extraction/             # CandidateExtractor (ReAct loop + YAML SchemaRegistry)
-│   ├── prompts/            #   LLM prompt templates
-│   └── schemas/            #   YAML extraction schemas per context type
-├── commit/                 # Write chain: PolicyRouter → MergePolicy → ContextWriter
-├── index/                  # Async indexing: OutboxWorker → IndexRecordBuilder → VectorDB
-├── retrieval/              # Read chain: IntentClassifier → SeedRetriever → ResultRanker
-├── providers/              # External adapters: LLM, Embedder, VectorIndex, RelationStore
-│   ├── llm/                #   OpenAI-compatible LLM provider
-│   ├── embedder/           #   4 embedder backends (OpenAI, Volcengine, etc.)
-│   ├── vector_index/       #   InMemory / ChromaDB / pgvector
-│   └── relation_store/     #   PostgreSQL relation store
-├── service/                # API layer: MemoryWriteAPI, MemoryReadAPI, multi-tenant
-├── server/                 # HTTP REST server (Flask), auth/RBAC, sessions
-├── session/                # SessionManager, TopicBuffer, RollingCompressor
-├── tests/
-│   ├── contract/           # Cross-team contract tests (invariants)
-│   ├── unit/               # Per-package unit tests
-│   ├── integration/        # End-to-end integration tests
-│   ├── e2e/                # LoCoMo benchmark evaluation framework
-│   └── fixtures/           # Shared test data
-├── docs/                   # Architecture, deployment, quickstart guides
-├── examples/               # Usage examples (SDK, Claude Code integration)
-├── cli/                    # Unified management CLI (ogmem command)
-├── plugins/                # Standalone client and Agent plugins
-│   ├── agent-plugins/      # Generic Agent Plugin package and published skills
-│   ├── claude-code/        # Claude Code hooks plugin
-│   ├── deepseek-harness/   # DeepSeek Harness adapter
-│   ├── hermes/             # Hermes Agent adapter
-│   ├── ogmemory/            # Codex plugin (full-lifecycle HTTP hooks)
-│   ├── openclaw/            # OpenClaw plugin (TypeScript bridge)
-│   └── opencode/            # OpenCode npm plugin
-└── scripts/                # Auxiliary scripts
-```
+[Source directories](docs/architecture/repository-layout.md) · [Documentation](docs/README.md) · [Client integrations](docs/integrations/README.md)
 
 ---
 
@@ -755,7 +716,7 @@ Evaluated on [LoCoMo](https://arxiv.org/abs/2402.10790) long-context conversatio
 
 **Documentation:** [docs/OGMEMORY_ENV.md](docs/OGMEMORY_ENV.md) (environment setup) | [Client integrations](docs/integrations/README.md) | [Codex](docs/integrations/codex.md) | [DeepSeek Harness](docs/integrations/deepseek-harness.md) | [Hermes Agent](docs/integrations/hermes.md) | [Quickstart](docs/QUICKSTART.md) | [Deployment](docs/deployment/deployment_operations_guide.md) | [OpenClaw Plugin](plugins/openclaw/README.md) | [Benchmark](tests/e2e/) (LoCoMO evaluation)
 
-**MCP:** [Protocol compatibility](docs/mcp_protocol_compatibility.md)
+**MCP:** [Protocol compatibility](docs/integrations/mcp-protocol-compatibility.md)
 
 **Testing:** `pytest tests/contract/ -v` (core invariants) | `pytest tests/ -v` (all tests) | `pytest tests/ --cov=core --cov=fs --cov=service --cov-report=html`
 
