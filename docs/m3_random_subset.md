@@ -56,7 +56,7 @@ Supported environment overrides:
 | `CONFIG` | `data/ogmem_test_lyj.resolved.yaml` |
 | `ANNOTATIONS` | `data/m3/annotations/robot.json` |
 | `VIDEOS_ROOT` | `data/m3/videos` |
-| `CV_SERVICE_URL` | `http://localhost:8081` |
+| `CV_SERVICE_URL` | Optional explicit override; otherwise use `cv_service.base_url` in the selected YAML (fallback `http://127.0.0.1:8081`). |
 | `ASR_BASE_URL` | Unset: retain the pipeline ASR backend. Set to your OpenAI-compatible ASR base URL to select `openai_http`. |
 | `NO_AUDIO` | `false`; set `true` if the episodic LLM cannot accept raw audio. ASR text remains enabled. |
 | `EXCLUDE` | Optional comma-separated annotated video IDs |

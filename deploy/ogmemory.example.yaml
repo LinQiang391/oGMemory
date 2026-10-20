@@ -55,6 +55,19 @@ embedding:
   #   command: ["/usr/local/bin/op", "read", "op://team/ogmemory/embedding-api-key"]
   # st_model: "BAAI/bge-large-en-v1.5"
 
+# ---- CV 人脸检测 / 人脸特征服务（M3）----
+# 默认连接自带 Compose cv 服务的宿主机发布端口；服务需要单独启动：
+# docker compose -f deploy/docker-compose.cv.yml up -d --build --wait cv
+# 外部 GPU 服务：将 base_url 改为该服务的根地址（不要附加 /detect/faces）。
+# 服务必须兼容 POST /detect/faces，图片二进制输入，detections JSON 输出。
+# 桥接网络容器若与 cv 在同一网络，使用 http://cv:8081。
+# 显式 CLI/pipeline 参数 > 已导出的 OGMEM_CV_SERVICE_URL > 此处配置 > 默认。
+cv_service:
+  base_url: "http://127.0.0.1:8081"
+  timeout_seconds: 30
+  # 可选 Bearer token；自带服务不需要认证。不要将真实 token 提交到仓库。
+  # auth_token: "${OGMEM_CV_AUTH_TOKEN}"
+
 # ---- Storage Backend ----
 # Picks the FS adapter used for context files, grants, outbox, subscriptions, etc.
 #   backend: sql   — context data lives in the relational DB (openGauss is PG-wire

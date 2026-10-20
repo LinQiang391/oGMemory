@@ -8,10 +8,12 @@ working directory (where ``data/annotations/robot.json`` and
 
 from __future__ import annotations
 
+import math
 import os
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
+from urllib.parse import urlsplit
 
 # Tenant id used for all M3-Bench data inside oG-Memory's graph.
 # All videos for a benchmark run share one account so multi-tenant
@@ -165,6 +167,64 @@ def _expand_env_ref(value: Any) -> Any:
 def _pick(mapping: dict[str, Any], key: str, default: Any = None) -> Any:
     value = _expand_env_ref(mapping.get(key))
     return default if value in (None, "") else value
+
+
+@dataclass(frozen=True)
+class CVServiceConfig:
+    """Connection to the bundled or an externally deployed compatible CV service."""
+
+    base_url: str = "http://127.0.0.1:8081"
+    timeout_seconds: float = 30.0
+    auth_token: str | None = field(default=None, repr=False)
+
+
+def load_cv_service_config(
+    config_path: str | None = None,
+    *,
+    base_url: str | None = None,
+    timeout_seconds: float | None = None,
+    auth_token: str | None = None,
+) -> CVServiceConfig:
+    """Resolve explicit options > exported environment > YAML > Compose defaults.
+
+    Like the other M3 loaders, this does not source deploy/.env. YAML values
+    may reference exported environment variables using ${NAME}.
+    """
+    block = _load_yaml_config(config_path).get("cv_service")
+    if block is None:
+        block = {}
+    if not isinstance(block, dict):
+        raise ValueError("cv_service must be a mapping")
+    url = base_url or os.environ.get("OGMEM_CV_SERVICE_URL") or _pick(
+        block, "base_url", "http://127.0.0.1:8081",
+    )
+    if not isinstance(url, str):
+        raise ValueError("cv_service.base_url must be an HTTP(S) service URL")
+    try:
+        parsed = urlsplit(url)
+        valid_url = parsed.scheme in ("http", "https") and parsed.hostname and parsed.port != 0
+    except ValueError:
+        valid_url = False
+    if not valid_url:
+        raise ValueError("cv_service.base_url must be an HTTP(S) service URL")
+
+    timeout = timeout_seconds if timeout_seconds is not None else _pick(
+        block, "timeout_seconds", 30.0,
+    )
+    try:
+        if isinstance(timeout, bool):
+            raise ValueError
+        timeout = float(timeout)
+        if not math.isfinite(timeout) or timeout <= 0:
+            raise ValueError
+    except (TypeError, ValueError):
+        raise ValueError("cv_service.timeout_seconds must be a positive finite number") from None
+    token = auth_token if auth_token is not None else (
+        os.environ.get("OGMEM_CV_AUTH_TOKEN") or _pick(block, "auth_token")
+    )
+    if token is not None and not isinstance(token, str):
+        raise ValueError("cv_service.auth_token must be a string")
+    return CVServiceConfig(base_url=url.rstrip("/"), timeout_seconds=timeout, auth_token=token)
 
 
 def _model_from_block(block: dict[str, Any], *, default_provider: str, default_model: str, default_temperature: float) -> M3ModelConfig:
