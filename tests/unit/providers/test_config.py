@@ -199,6 +199,7 @@ def test_create_llm_uses_openai_factory(monkeypatch: pytest.MonkeyPatch):
         model="gpt-4o",
         temperature=0.1,
         max_tokens=42,
+        request_timeout_seconds=120.0,
         json_mode=False,  # Default llm_json_mode
         reasoning_effort=None,
         is_reasoning_model=None,

@@ -543,6 +543,10 @@ result = write_api.commit_session([
 ```bash
 # Configure .env, then follow deploy/compose/README_zh.md.
 bash deploy/compose/deploy.sh start
+
+# Multimodal stack: see deploy/README.md.
+cd deploy
+docker compose --profile with-db up
 ```
 
 The Compose stack runs oGMemory and openGauss images and preserves memory and database data in host directories.

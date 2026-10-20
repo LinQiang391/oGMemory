@@ -1,0 +1,120 @@
+name: video_episodic_qa
+version: 1
+description: "End-to-end one-video pipeline with episodic-memory retrieval + QA via the adapter."
+
+# This is the "everything" pipeline: chops the source video, indexes
+# the EpisractedNodes, then runs OGMemoryControlAdapter against each
+# question in the annotations file and writes m3_qa_results.jsonl.
+# The qa stage is enabled by default — disable it for indexing-only
+# runs (--disable-stage qa).
+#
+# Stages mirror video_episodic.yaml with qa appended after build_index
+# (so the EpisrictedNode embeddings are already in the graph when the
+# adapter runs [Search]).
+#
+# Use this pipeline when you have a real M3-Bench annotations file
+# with a populated qa_list — pass it via
+# --set qa.params.annotations=/path/to/robot.json. Without an
+# override, qa reads the auto-generated annotations artifact
+# ({work_dir}/annotations/one_video.json) which has an empty
+# qa_list and produces zero QA records.
+
+artifacts:
+  selected_video: "{work_dir}/videos/robot/{video_id}.mp4"
+  annotations: "{work_dir}/annotations/one_video.json"
+  clips_root: "{work_dir}/clips"
+  frames_root: "{work_dir}/frames"
+  audio_root: "{work_dir}/audio"
+  data_jsonl: "{work_dir}/data.jsonl"
+  frames_jsonl: "{work_dir}/frames.jsonl"
+  audio_jsonl: "{work_dir}/audio.jsonl"
+  faces_jsonl: "{work_dir}/faces.jsonl"
+  episodic_jsonl: "{work_dir}/episodic_memory.jsonl"
+  index_jsonl: "{work_dir}/episodic_index.jsonl"
+  qa_results: "{work_dir}/m3_qa_results.jsonl"
+  summary_json: "{work_dir}/pipeline_summary.json"
+
+stages:
+  - id: trim
+    type: video.trim
+    params:
+      seconds: "{seconds}"
+
+  - id: annotate
+    type: m3.write_single_annotation
+    needs: [trim]
+
+  - id: preprocess
+    type: m3.preprocess
+    needs: [annotate]
+    params:
+      clip_seconds: 30
+
+  - id: load_clips
+    type: m3.load_clips
+    needs: [preprocess]
+    params:
+      clip_seconds: 30
+
+  - id: extract_audio
+    type: m3.extract_audio
+    enabled: true
+    needs: [load_clips]
+    params:
+      sample_rate: 16000
+      channels: 1
+
+  - id: extract_frames
+    type: m3.extract_frames
+    needs: [load_clips]
+    params:
+      fps: 1
+      max_frames: 8
+      resize: 512
+      jpeg_quality: 80
+      keyframes_only: false
+
+  - id: detect_faces
+    type: m3.detect_faces
+    enabled: false
+    needs: [extract_frames]
+    params:
+      backend: http
+      min_confidence: 0.5
+      max_faces: 20
+      cv_timeout: 30
+
+  - id: episodic_memory
+    type: m3.episodic_memory
+    needs: [extract_frames]
+    params:
+      max_frames: 8
+      no_audio: true
+
+  - id: create_memory_nodes
+    type: m3.memory.from_episodic
+    needs: [episodic_memory]
+
+  - id: build_index
+    type: m3.index_episodic
+    enabled: false
+    needs: [episodic_memory]
+    params:
+      embedder: mock
+      embedding_dimension: 384
+
+  - id: qa
+    type: m3.qa
+    enabled: true
+    needs: [build_index]
+    # Override at the CLI: --set qa.params.annotations=/path/to/robot.json
+    # Default (no override) reads {work_dir}/annotations/one_video.json
+    # which has an empty qa_list — produces zero QA records.
+    params:
+      max_iterations: 5
+      embedder: mock
+      embedding_dimension: 384
+      llm: mock
+      temperature: 0.2
+      # default_video_id: ""      # uncomment to scope [Search] to one video
+      # annotations: ""           # uncomment to override the annotations file

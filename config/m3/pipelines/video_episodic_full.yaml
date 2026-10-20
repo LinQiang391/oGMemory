@@ -1,0 +1,201 @@
+name: video_episodic_full
+version: 1
+description: "End-to-end M3 pipeline: video + audio + face + voice + semantic consolidation + QA on the indexed graph."
+
+# The "full" pipeline. Mirrors video_episodic_faces.yaml but additionally
+# runs voice_segmentation, voice_clustering, semantic_memory_consolidator,
+# and the qa stage (via OGMemoryControlAdapter). Use this when you want
+# to demo the *whole* stack: extraction → raw → extracted → memory →
+# same_identity / co_occurs_in / evolves edges → indexed graph → search
+# retrieval → ReAct QA.
+
+artifacts:
+  selected_video: "{work_dir}/videos/robot/{video_id}.mp4"
+  annotations: "{work_dir}/annotations/one_video.json"
+  clips_root: "{work_dir}/clips"
+  frames_root: "{work_dir}/frames"
+  audio_root: "{work_dir}/audio"
+  data_jsonl: "{work_dir}/data.jsonl"
+  frames_jsonl: "{work_dir}/frames.jsonl"
+  audio_jsonl: "{work_dir}/audio.jsonl"
+  faces_jsonl: "{work_dir}/faces.jsonl"
+  face_clusters: "{work_dir}/face_clusters.jsonl"
+  voice_segments: "{work_dir}/voice_segments.jsonl"
+  voice_clusters: "{work_dir}/voice_clusters.jsonl"
+  voice_asr: "{work_dir}/voice_asr.jsonl"
+  semantic_memories: "{work_dir}/semantic_memories.jsonl"
+  episodic_jsonl: "{work_dir}/episodic_memory.jsonl"
+  index_jsonl: "{work_dir}/episodic_index.jsonl"
+  qa_results: "{work_dir}/m3_qa_results.jsonl"
+  summary_json: "{work_dir}/pipeline_summary.json"
+
+stages:
+  - id: trim
+    type: video.trim
+    params:
+      seconds: "{seconds}"
+
+  - id: annotate
+    type: m3.write_single_annotation
+    needs: [trim]
+
+  - id: preprocess
+    type: m3.preprocess
+    needs: [annotate]
+    params:
+      clip_seconds: 30
+
+  - id: load_clips
+    type: m3.load_clips
+    needs: [preprocess]
+    params:
+      clip_seconds: 30
+
+  - id: extract_audio
+    type: m3.extract_audio
+    enabled: true
+    needs: [load_clips]
+    params:
+      sample_rate: 16000
+      channels: 1
+
+  - id: extract_frames
+    type: m3.extract_frames
+    needs: [load_clips]
+    params:
+      fps: 1
+      max_frames: 16
+      resize: 512
+      jpeg_quality: 80
+      keyframes_only: false
+
+  - id: detect_faces
+    type: m3.detect_faces
+    enabled: true
+    needs: [extract_frames]
+    params:
+      backend: http
+      min_confidence: 0.5
+      max_faces: 20
+      cv_timeout: 30
+
+  # ---- Real ASR (Whisper) + speaker diarization + ECAPA-TDNN ----
+  #
+  # These three stages replace the 8-dim spectral fingerprint
+  # voice_clustering falls back on. They're enabled by default
+  # in the "full" pipeline because that's what the bench-scale
+  # M3-Bench run expects. They require:
+  #   * faster-whisper / pyannote / speechbrain deps installed
+  #     (``uv pip install -e ".[cv,asr]"``)
+  #   * ~1.5 GB Whisper model + ~80 MB ECAPA model downloads
+  #     on first use
+  #   * $HUGGINGFACE_TOKEN env var for pyannote (with EULA
+  #     accepted at huggingface.co/pyannote/speaker-diarization-3.1)
+  # If $HUGGINGFACE_TOKEN isn't set, speaker_diarization will
+  # raise at run time — flip it to ``enabled: false`` for a
+  # smoke run that doesn't need real speaker labels. voice_asr
+  # has no such dep and should stay enabled.
+  #
+  # On an NPU box you can skip the local Whisper download by
+  # pointing voice_asr at a remote server:
+  #   --set voice_asr.params.backend=openai_http
+  #   --set voice_asr.params.asr_base_url=http://npu:8000/v1
+  #   --set voice_asr.params.asr_api_key=$ASR_TOKEN
+  # voice_clustering auto-picks the ECAPA threshold (0.5)
+  # when speaker_embedding ExtractedNodes exist.
+  #
+  # Stage ordering matters: these run BEFORE episodic_memory (so the
+  # transcript is available for the LLM prompt) and BEFORE
+  # voice_clustering (so ECAPA vectors exist when it clusters).
+  # When disabled, the runner marks them ok=skipped and downstream
+  # stages proceed with their fallbacks (vision-only episodic,
+  # 8-dim spectral voice_clustering).
+
+  - id: voice_asr
+    type: m3.voice_asr
+    enabled: true
+    needs: [extract_audio]
+    params:
+      backend: faster_whisper
+      model: large-v3-turbo
+      language: en
+      beam_size: 5
+
+  - id: speaker_diarization
+    type: m3.speaker_diarization
+    enabled: true
+    needs: [voice_asr]
+    params:
+      backend: pyannote
+      model: pyannote/speaker-diarization-3.1
+      # hf_token comes from $HUGGINGFACE_TOKEN
+
+  - id: speaker_embedding
+    type: m3.speaker_embedding
+    enabled: true
+    needs: [speaker_diarization]
+    params:
+      backend: speechbrain
+      model: speechbrain/spkrec-ecapa-voxceleb
+      embedding_dim: 192
+
+  - id: episodic_memory
+    type: m3.episodic_memory
+    needs: [extract_frames, extract_audio, voice_asr]
+    params:
+      max_frames: 16
+
+  - id: create_memory_nodes
+    type: m3.memory.from_episodic
+    needs: [episodic_memory]
+
+  - id: build_index
+    type: m3.index_episodic
+    enabled: true
+    needs: [episodic_memory]
+    params: {}
+
+  - id: face_clustering
+    type: m3.face_clustering
+    enabled: true
+    needs: [detect_faces]
+    params:
+      threshold: 0.4
+
+  - id: voice_segmentation
+    type: m3.voice_segmentation
+    enabled: true
+    needs: [extract_audio]
+    params:
+      energy_threshold_dbfs: -40.0
+      min_segment_sec: 0.25
+      max_segment_sec: 30.0
+      pad_sec: 0.1
+
+  - id: voice_clustering
+    type: m3.voice_clustering
+    enabled: true
+    needs: [voice_segmentation, speaker_embedding]
+    params:
+      threshold: 0.3
+
+  - id: semantic_memory_consolidator
+    type: m3.semantic_memory_consolidator
+    enabled: true
+    needs: [episodic_memory]
+    params: {}
+
+  - id: qa
+    type: m3.qa
+    enabled: true
+    needs: [build_index]
+    params:
+      # The QA LLM and embedder are sourced from m3.qa_llm / m3.embedding in
+      # ogmemory.yaml — don't hardcode providers here or you'll shadow config.
+      max_iterations: 6
+      timeout_seconds: 90
+      # annotations is intentionally omitted so qa_stage falls back to the
+      # auto-generated {work_dir}/annotations/one_video.json (the smoke
+      # fixture for the single-video run). For M3-Bench, pass:
+      #   --set qa.params.annotations=/data3/m3/annotations/robot.json
+      output_jsonl: "{work_dir}/m3_qa_results.jsonl"

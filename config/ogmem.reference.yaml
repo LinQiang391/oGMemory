@@ -323,3 +323,24 @@ agent_memory:
 cache:
   enabled: true                  # [all]
   max_size: 1000                 # [all]
+
+# ---- M3 long-video benchmark [all] ----
+# Configuration for the M3 episodic-memory pipeline. ``embedding``
+# overrides the top-level block for M3 retrieval; ``vector_index``
+# configures the dedicated OpenGaussVectorIndex that backs
+# ``GraphService.search_by_embedding`` so QA can push the
+# ``ClipScope`` filter down to SQL instead of scanning JSONB.
+# The vector-index connection string is inherited from the
+# top-level ``vector_db.connection_string`` — no separate
+# ``m3.vector_index.connection_string`` key exists.
+m3:
+  embedding:
+    provider: openai              # [all]
+    model: "BAAI/bge-large-zh-v1.5"  # [all]
+    base_url: null                # [all]
+    api_key: null                 # [all]
+    dimension: 1024               # [all]
+  vector_index:
+    backend: opengauss            # [all] openGauss is still the recommended production target; ``pgvector`` is the convenience alias for PostgreSQL+pgvector deployments that want to share one DB
+    table_name: m3_episodic_vectors  # [all] partition by run if you share a DB
+    pool_size: 5                  # [all]

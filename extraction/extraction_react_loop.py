@@ -129,6 +129,16 @@ class ExtractionReActResult:
     trace: ExtractionTrace | None = None
     read_versions: dict[str, int] = field(default_factory=dict)
     read_nodes: dict[str, ContextNode] = field(default_factory=dict)
+    # Pass-through of the underlying loop's finish state so callers
+    # (and tests) can detect transport failures (``finish_reason ==
+    # "llm_error"``) without sniffing the trace. The base
+    # :class:`core.react_loop.ReactLoopResult` carries these; the
+    # extraction subclass previously dropped them on the floor.
+    finish_reason: str = ""
+    completed: bool = False
+    # Original :class:`LLMCallError` if the underlying loop terminated
+    # due to a transport failure. ``None`` for other finish reasons.
+    llm_error: Exception | None = None
 
 
 class ExtractionReActLoop(ReactLoop):
@@ -196,7 +206,6 @@ class ExtractionReActLoop(ReactLoop):
     ) -> ExtractionReActResult:
         check_deadline()
         # Reset runtime state
-        self._read_uris = set()
         self._did_safety_reread = False
         self._read_versions = dict(prefetch_result.read_versions) if prefetch_result else {}
         self._read_nodes = deepcopy(prefetch_result.read_nodes) if prefetch_result else {}
@@ -206,10 +215,6 @@ class ExtractionReActLoop(ReactLoop):
         self._edit_errors = []
         self._extraction_errors = []
         self._ctx = ctx
-
-        # Track prefetch URIs if provided
-        if prefetch_result:
-            self._read_uris.update(prefetch_result.read_uris)
 
         task_ctx = ExtractionTaskContext(
             conversation_text=conversation_text,
@@ -268,6 +273,10 @@ class ExtractionReActLoop(ReactLoop):
 
         # Add prefetch context if available
         if prefetch_result:
+            # Base run() resets read tracking before building messages. Seed it
+            # here so prefetched memories survive that reset, without leaking
+            # URIs from previous runs.
+            self._read_uris.update(prefetch_result.read_uris)
             if prefetch_result.is_lazy and prefetch_result.uri_hints:
                 # Lazy mode: add lightweight URI hints, LLM reads on demand
                 hints_block = self._format_prefetch_hints(prefetch_result.uri_hints)
@@ -812,4 +821,7 @@ class ExtractionReActLoop(ReactLoop):
             read_uris=self._read_uris.copy(),
             read_versions=self._read_versions.copy(), read_nodes=deepcopy(self._read_nodes),
             trace=trace,
+            finish_reason=loop_result.finish_reason,
+            completed=loop_result.completed,
+            llm_error=loop_result.llm_error,
         )

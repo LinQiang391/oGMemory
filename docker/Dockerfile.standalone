@@ -1,4 +1,4 @@
-FROM python:3.11-slim-bookworm
+FROM python:3.11-slim-bookworm AS runtime
 
 # Use USTC Debian mirror for faster downloads in China
 RUN sed -i 's|deb.debian.org|mirrors.ustc.edu.cn|g' /etc/apt/sources.list.d/debian.sources 2>/dev/null; \
@@ -13,7 +13,7 @@ RUN pip install --no-cache-dir \
     -i https://mirrors.aliyun.com/pypi/simple/ --trusted-host mirrors.aliyun.com \
     --timeout 120 \
     flask gunicorn openai psycopg2-binary pyagfs rich requests apscheduler httpx pyyaml jinja2 \
-    pydantic python-dotenv json-repair "jsonschema>=4.20.0" rank-bm25 nltk \
+    pydantic python-dotenv json-repair networkx "jsonschema>=4.20.0" rank-bm25 nltk \
     "mcp[cli]==2.0.0" "volcengine-python-sdk[ark]"
 
 # Copy oGMemory source
@@ -35,25 +35,21 @@ COPY perf/       /opt/ogmem/perf/
 COPY features/   /opt/ogmem/features/
 COPY scene/      /opt/ogmem/scene/
 
-# Copy AGFS binary and config
-COPY agfs/agfs-server          /opt/agfs/agfs-server
-COPY config/agfs/config.reference.yaml /opt/agfs/config.yaml
-
-# Copy entrypoint
-COPY docker/entrypoint-standalone.sh /opt/entrypoint.sh
-RUN sed -i 's/\r$//' /opt/entrypoint.sh && chmod 755 /opt/entrypoint.sh /opt/agfs/agfs-server
+# Copy entrypoint (chmod at COPY time keeps the image one layer lighter).
+COPY --chmod=755 docker/entrypoint-standalone.sh /opt/entrypoint.sh
 
 # Copy default config (user can override via volume mount)
 COPY deploy/ogmemory.example.yaml /etc/ogmem/config.yaml
 
-# Create data directory
-RUN mkdir -p /data/agfs && useradd -m ogmem && chown -R ogmem:ogmem /data/agfs /opt/agfs /opt/ogmem /etc/ogmem
-RUN chmod -R 755 /opt/agfs /opt/ogmem
+# Create writable data and config directories for the unprivileged runtime.
+RUN mkdir -p /data/ogmem /etc/ogmem && \
+    useradd -m ogmem && \
+    chown -R ogmem:ogmem /data/ogmem /opt/ogmem /etc/ogmem
+RUN chmod -R 755 /opt/ogmem
 
 # Environment defaults (kept for backward compat; YAML config takes priority)
 ENV PYTHONPATH=/opt/ogmem
 ENV OGMEM_CONFIG=/etc/ogmem/config.yaml
-ENV AGFS_BASE_URL=http://127.0.0.1:1833
 ENV AGFS_MOUNT_PREFIX=/local/plugin
 ENV CONTEXTENGINE_PROVIDER=openai
 ENV VECTOR_DB_TYPE=opengauss
@@ -96,3 +92,19 @@ USER ogmem
 EXPOSE 8090 8091
 
 ENTRYPOINT ["/opt/entrypoint.sh"]
+
+# Opt-in compatibility stages; BuildKit skips these for the default target.
+FROM golang:1.25-bookworm AS agfs-builder
+WORKDIR /src/agfs
+COPY agfs/ ./
+RUN CGO_ENABLED=1 go build -trimpath -ldflags="-w -s" -o /agfs-server ./cmd/server
+
+FROM runtime AS standalone-agfs
+COPY --chown=ogmem:ogmem --from=agfs-builder /agfs-server /opt/agfs/agfs-server
+COPY --chown=ogmem:ogmem config/agfs/config.reference.yaml /opt/agfs/config.yaml
+USER root
+RUN mkdir -p /data/agfs && chown -R ogmem:ogmem /data/agfs /opt/agfs
+USER ogmem
+
+# Last stage is the default: no dependency on the Go/AGFS stages.
+FROM runtime AS standalone-no-agfs
