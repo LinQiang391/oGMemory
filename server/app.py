@@ -63,6 +63,7 @@ app.config["MAX_CONTENT_LENGTH"] = _MAX_HTTP_BODY_BYTES
 _service: MemoryService | None = None
 _service_lock = threading.Lock()
 _operator_service = None
+_operator_service_lock = threading.Lock()
 _perf_emit_warned = False  # log first perf failure as WARNING, subsequent as DEBUG
 _MAX_TRACE_EVENT_BODY_BYTES = 64 * 1024
 _MAX_TRACE_EVENT_DEPTH = 64
@@ -157,54 +158,48 @@ def _get_operator_service():
     global _operator_service
     if _operator_service is not None:
         return _operator_service
-    from service.operator_service import OperatorService
-    from service.graph_service import GraphService
-    from extraction.operators import default_registry
+    with _operator_service_lock:
+        if _operator_service is not None:
+            return _operator_service
+        from service.operator_service import OperatorService
+        from service.graph_service import GraphService
+        from extraction.operators import default_registry
 
-    cfg = get_config()
-    # Resolve the graph store the same way the rest of the system does.
-    # For AGFS mode we use the in-memory store (no SQL graph tables
-    # wired yet); for SQL mode we use the SQL store. Production users
-    # wiring operator output into a real graph should set the store
-    # via this hook.
-    storage_backend = getattr(cfg, "storage_backend", "agfs")
-    if storage_backend == "sql":
-        try:
+        cfg = get_config()
+        if cfg.storage_backend == "sql":
             from providers.graph_store import SQLGraphStore
-            store = SQLGraphStore.from_config(cfg)
-        except Exception as exc:
-            logger.warning("SQLGraphStore unavailable (%s); falling back to in-memory", exc)
+            store = SQLGraphStore(
+                connection_string=cfg.sql_connection_string,
+                pool_size=cfg.sql_pool_size,
+            )
+        else:
             from providers.graph_store import MemoryGraphStore
             store = MemoryGraphStore()
-    else:
-        from providers.graph_store import MemoryGraphStore
-        store = MemoryGraphStore()
-    graph_service = GraphService(store)
+        graph_service = GraphService(store)
 
-    # Register built-in operators (uses MockBackend by default; deployments
-    # can override by populating ``operators:`` in config/operators.yaml).
-    registry = default_registry()
-    try:
-        from extraction.operators.builtin import register_all_defaults
-        register_all_defaults(registry)
-    except Exception as exc:
-        logger.warning("Failed to register default operators: %s", exc)
-
-    # Optionally load operators from YAML if configured.
-    yaml_path = getattr(cfg, "operators_config_path", None) or "config/operators.yaml"
-    import os
-    if os.path.exists(yaml_path):
+        # Register built-in operators (uses MockBackend by default; deployments
+        # can override by populating ``operators:`` in config/operators.yaml).
+        registry = default_registry()
         try:
-            registry.load_from_config(yaml_path, override=True)
+            from extraction.operators.builtin import register_all_defaults
+            register_all_defaults(registry)
         except Exception as exc:
-            logger.warning("Failed to load operators from %s: %s", yaml_path, exc)
+            logger.warning("Failed to register default operators: %s", exc)
 
-    _operator_service = OperatorService(
-        graph_service=graph_service,
-        registry=registry,
-    )
-    logger.info("OperatorService initialized (graph_store=%s)", type(store).__name__)
-    return _operator_service
+        # Optionally load operators from YAML if configured.
+        yaml_path = getattr(cfg, "operators_config_path", None) or "config/operators.yaml"
+        if os.path.exists(yaml_path):
+            try:
+                registry.load_from_config(yaml_path, override=True)
+            except Exception as exc:
+                logger.warning("Failed to load operators from %s: %s", yaml_path, exc)
+
+        _operator_service = OperatorService(
+            graph_service=graph_service,
+            registry=registry,
+        )
+        logger.info("OperatorService initialized (graph_store=%s)", type(store).__name__)
+        return _operator_service
 
 
 def _build_authenticated_context(params: dict):
