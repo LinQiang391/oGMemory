@@ -9,6 +9,13 @@ from scene.config import (
     SceneConfigProvider,
     SceneConfigSnapshot,
 )
+from scene.jobs import (
+    InMemorySceneJobStore,
+    SceneJob,
+    SceneJobStatus,
+    SceneJobStore,
+    SceneLeaseLostError,
+)
 from scene.models import SceneCluster, SceneContribution
 from scene.store import SceneNodeSource, SceneProjectionStore, SceneSnapshotRepository, SceneStore
 
@@ -26,4 +33,9 @@ __all__ = [
     "InMemorySceneConfigProvider",
     "ConfigRevisionConflict",
     "ConfigRevisionError",
+    "SceneJob",
+    "SceneJobStatus",
+    "SceneJobStore",
+    "SceneLeaseLostError",
+    "InMemorySceneJobStore",
 ]
