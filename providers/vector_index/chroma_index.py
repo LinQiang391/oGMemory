@@ -372,3 +372,46 @@ class ChromaVectorIndex(VectorIndex):
                 return self._collection.count()
             result = self._collection.get(where=self._build_where(filters), include=[])
             return len(result.get("ids") or [])
+
+    def get_record(self, record_id: str) -> IndexRecord | None:
+        """Fetch one :class:`IndexRecord` by id.
+
+        Returns ``None`` when no row matches. Mirrors the
+        :class:`OpenGaussVectorIndex` implementation: ``text`` comes
+        back as the full stored document, and ``metadata`` carries
+        the per-record scope columns (``extracted_node_id``,
+        ``video_id``, ``clip_id``, ``before_clip``).
+
+        Chroma's ``collection.get`` returns documents by id in one
+        round-trip; we then rehydrate the ``IndexRecord`` shape so
+        callers don't need to know which backend they're on.
+        """
+        if not record_id:
+            return None
+        result = self._collection.get(
+            ids=[record_id], include=["documents", "metadatas", "embeddings"]
+        )
+        ids = (result or {}).get("ids") or []
+        if not ids:
+            return None
+        meta = ((result.get("metadatas") or [{}])[0]) or {}
+        doc = ((result.get("documents") or [""])[0]) or ""
+        emb = ((result.get("embeddings") or [[]])[0]) or []
+        # Mirror the OpenGauss path: surface a stable ``filters``
+        # shape with account_id / owner_space so callers can re-derive
+        # the scope without inspecting raw metadata.
+        filters = {
+            "account_id": meta.get("account_id", ""),
+            "owner_space": meta.get("owner_space", ""),
+        }
+        metadata = dict(meta)
+        if emb and "_embedding" not in metadata:
+            metadata["_embedding"] = [float(x) for x in emb]
+        return IndexRecord(
+            id=str(ids[0]),
+            uri=str(meta.get("uri", "")),
+            level=int(meta.get("level", 2)),
+            text=doc,
+            filters=filters,
+            metadata=metadata,
+        )

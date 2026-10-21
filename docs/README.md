@@ -48,6 +48,5 @@
 ## 开发与测试
 
 - [脚本与测试指南](../scripts/README.md)
-- [ARM64 LoCoMO 评测](testing/locomo-guide-zh.md)：使用一键部署实例执行评测并查看结果。
-- [OpenClaw MCP LoCoMO 评测](testing/openclaw-mcp-locomo.md)：运行源码评测程序和独立 Judge。
+- [记忆评测教程](testing/memory-evaluation-guide-zh.md)：六个 Agent 宿主、MCP、LoCoMO 与自备数据的预检、四阶段命令、全部参数和结果口径。
 - [Jenkins 测试方案](testing/jenkins-test-strategy.md)：测试分层、触发矩阵和流水线设计。

@@ -53,6 +53,9 @@
     "entries": {
       "og-memory-context-engine": {
         "enabled": true,
+        "hooks": {
+          "allowConversationAccess": true
+        },
         "config": {
           "mode": "remote",
           "memoryApiBaseUrl": "__OGMEM_URL__",
@@ -67,6 +70,14 @@
       "memory-core": {
         "enabled": false
       }
+    },
+    "allow": [
+      "og-memory-context-engine"
+    ]
+  },
+  "discovery": {
+    "mdns": {
+      "mode": "off"
     }
   }
 }

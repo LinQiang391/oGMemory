@@ -65,6 +65,7 @@ $RECYCLE.BIN/
 .env.*
 !.env.example
 !config/env.example
+!deploy/.env.example
 *.pem
 *.key
 *.p12
@@ -178,6 +179,10 @@ docs/prd/
 .tmp/
 opencode-verification/
 
+# Root-level config & external repos (never commit)
+/ogmem.yaml
+/locomo-eval-kit/
+
 # pre-commit 本地隔离环境（由 setup-pre-commit.sh 创建，不提交）
 .pre-commit-venv/
 
@@ -186,3 +191,17 @@ opencode-verification/
 
 # Persistent advisory lock inodes for deployment management
 .ogmemory-*.lock
+
+deploy/ogmemory.yaml
+# legacy, kept ignored for users who still have it
+deploy/deploy.env
+
+# docker-compose local artifacts
+deploy/.env
+deploy/docker-compose.override.yml
+deploy/docker-compose.tenants.yml
+deploy/_artifacts/
+
+# Asciinema recordings (local demo artifacts, not source)
+*.cast
+*.gif

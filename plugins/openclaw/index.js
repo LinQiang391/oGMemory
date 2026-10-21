@@ -157,9 +157,9 @@ export function resolveConfig(pluginConfig = {}) {
         process.env.OGMEM_TOOL_RESULT_SEMANTIC_TURN_MODE,
     ),
     // Identity
-    accountId: pluginConfig.accountId || "",
-    userId: pluginConfig.userId || "",
-    agentId: pluginConfig.agentId || "",
+    accountId: pluginConfig.accountId || process.env.OGMEM_ACCOUNT_ID || "",
+    userId: pluginConfig.userId || process.env.OGMEM_USER_ID || "",
+    agentId: pluginConfig.agentId || process.env.OGMEM_AGENT_ID || "",
     // LLM (passed as env vars to CE server)
     llmProvider: pluginConfig.llmProvider || process.env.CONTEXTENGINE_PROVIDER || "mock",
     llmApiKey:

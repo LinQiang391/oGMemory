@@ -35,7 +35,7 @@ ogmem stop local
 适合在 ARM64 Linux 服务器创建独立实例：
 
 - [用户一键部署与体验指南](../deploy/user-quickstart/README_zh.md)
-- [ARM64 LoCoMO 评测](testing/locomo-guide-zh.md)
+- [记忆评测教程](testing/memory-evaluation-guide-zh.md#10-一键部署实例)
 
 ## OpenClaw 源码部署
 
@@ -63,6 +63,5 @@ ogmem stop local
 pytest tests/unit -q
 ```
 
-一键部署后的评测见 [ARM64 LoCoMO 评测](testing/locomo-guide-zh.md)，源码评测见
-[OpenClaw MCP LoCoMO 评测](testing/openclaw-mcp-locomo.md)。测试分层和流水线设计见
+Agent 插件、MCP、LoCoMO 和自备数据评测见[记忆评测教程](testing/memory-evaluation-guide-zh.md)。测试分层和流水线设计见
 [Jenkins 测试方案](testing/jenkins-test-strategy.md)。

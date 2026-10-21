@@ -34,6 +34,14 @@ These are only needed when `mode=local`.
 
 Explicit JSON `false` overrides the environment. These settings are read when the
 plugin registers; restart the Gateway or use a new local CLI process after changes.
+For the Docker deployment, the startup renderer writes nonempty
+`OGMEM_AUTO_CAPTURE` / `OGMEM_AUTO_RECALL` values into the plugin config, overriding
+persisted values for these two keys. Unset or empty variables leave existing
+config unchanged. Compose defaults both to `false`; set them explicitly to
+`true` to enable automatic capture/recall. Recreate the container after changing
+its environment, rather than only restarting it. The entrypoint also refreshes
+the image-managed plugin files in the state volume; do not edit that bundled
+extension in place.
 `autoCapture=false` is not a global write ban: explicit compact, existing-buffer
 cleanup, trace upload and tool-result externalization retain their own behavior.
 See the evaluation procedure in [README.md](README.md#evaluation-phase-control).

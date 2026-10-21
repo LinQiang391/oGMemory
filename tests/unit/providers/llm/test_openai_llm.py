@@ -12,9 +12,10 @@ from unittest.mock import Mock
 import httpx
 import pytest
 
+from core.errors import LLMCallError
 import providers.llm as llm_package
 import providers.llm.openai_llm as openai_llm_module
-from core.errors import LLMTransientError, ToolCallProtocolError
+from core.errors import LLMOutputTruncatedError, LLMTransientError, ToolCallProtocolError
 
 
 def _chat_response(
@@ -167,6 +168,40 @@ class TestOpenAILLM:
         assert parameters["stream"] is True
         llm.token_tracker.record_llm.assert_called_once_with(
             20, 10, 0, 0, usage_known=True, model="review-model")
+    def test_custom_request_timeout(self, fake_openai_ctor):
+        openai_llm_module.OpenAILLM(api_key="test-key", request_timeout_seconds=300)
+        fake_openai_ctor.assert_called_once_with(timeout=300, api_key="test-key")
+
+    @pytest.mark.parametrize("timeout", [0, -1])
+    def test_rejects_nonpositive_timeout(self, timeout):
+        with pytest.raises(ValueError, match="must be positive"):
+            openai_llm_module.OpenAILLM(api_key="test-key", request_timeout_seconds=timeout)
+
+    @pytest.mark.parametrize("use_messages", [False, True])
+    @pytest.mark.parametrize("tool_calls", [
+        None,
+        [SimpleNamespace(function=SimpleNamespace(
+            name="extract_event", arguments='{"private":"partial',
+        ))],
+    ])
+    def test_truncated_tool_output_fails_without_retry_or_partial_repair(
+        self, fake_client, tool_calls, caplog, use_messages,
+    ):
+        fake_client.chat.completions.create.return_value = _chat_response(
+            content="private text", tool_calls=tool_calls, finish_reason="length",
+        )
+        llm = openai_llm_module.OpenAILLM(api_key="test-key")
+        with pytest.raises(LLMOutputTruncatedError, match="token limit"):
+            if use_messages:
+                llm.complete_with_tools_messages(
+                    [{"role": "user", "content": "prompt"}], [],
+                    tool_choice="required",
+                )
+            else:
+                llm.complete_with_tools("prompt", [], tool_choice="required")
+        assert fake_client.chat.completions.create.call_count == 1
+        assert "private text" not in caplog.text
+        assert llm._max_tokens == 4096
 
     def test_lazy_loader_returns_classes(self):
         openai_llm, cached_llm = llm_package.get_openai_llm()
@@ -334,6 +369,45 @@ class TestOpenAILLM:
         result = openai_llm_module.OpenAILLM._extract_json_values_from_text(content)
 
         assert result == records
+    @pytest.mark.parametrize("prefix", ["Note [unfinished ", "Note {unfinished "])
+    def test_complete_json_skips_unmatched_prefix(self, fake_client: Mock, prefix):
+        fake_client.chat.completions.create.return_value = _chat_response(
+            content=prefix + '{"value": "ok"}'
+        )
+        llm = openai_llm_module.OpenAILLM(api_key="test-key")
+        assert llm.complete_json(
+            "Extract text memory", {"type": "object", "required": ["value"]}
+        ) == {"value": "ok"}
+
+    def test_json_recovery_does_not_extract_from_unfinished_reasoning(self):
+        with pytest.raises(ValueError):
+            openai_llm_module.OpenAILLM._extract_json_from_text(
+                '<think>unfinished [{"value": "not a final answer"}'
+            )
+
+    def test_json_recovery_uses_final_answer_not_reasoning(self):
+        assert openai_llm_module.OpenAILLM._extract_json_from_text(
+            '<think>{"value": "scratch"}</think>'
+            'Note [unfinished {"value": "final"}'
+        ) == {"value": "final"}
+
+    def test_failed_json_reports_truncation_without_logging_private_text(
+        self, fake_client: Mock, caplog,
+    ):
+        response = _chat_response(
+            content="<think>private conversation", finish_reason="length",
+        )
+        response.usage = SimpleNamespace(
+            prompt_tokens=10, completion_tokens=4096,
+            completion_tokens_details=SimpleNamespace(reasoning_tokens=4096),
+        )
+        fake_client.chat.completions.create.return_value = response
+        llm = openai_llm_module.OpenAILLM(api_key="test-key")
+        with pytest.raises(LLMOutputTruncatedError) as caught:
+            llm.complete_json("Extract text memory", {"type": "object"})
+        assert "finish_reason=length" in str(caught.value)
+        assert "max_tokens=4096" in str(caught.value)
+        assert "private conversation" not in caplog.text
 
     @pytest.mark.parametrize(
         "content",
@@ -348,7 +422,7 @@ class TestOpenAILLM:
         assert result == {"text": "literal,}"}
 
     def test_complete_json_raises_for_invalid_json(self, fake_client: Mock):
-        # Use truly unparseable JSON that can't be recovered by any fallback
+        # Use truly unparsable JSON that can't be recovered by any fallback
         fake_client.chat.completions.create.return_value = _chat_response(content="not even trying")
         # json_mode=False means it will use text fallback
         llm = openai_llm_module.OpenAILLM(api_key="test-key", json_mode=False)
@@ -556,7 +630,7 @@ class TestOpenAILLM:
         )
         llm = openai_llm_module.OpenAILLM(api_key="test-key")
 
-        with pytest.raises(RuntimeError, match="Invalid tool schema"):
+        with pytest.raises(LLMCallError, match="Invalid tool schema"):
             llm.complete_with_tools("prompt", tools=[{
                 "name": "extract_event",
                 "description": "Extract event",
@@ -567,11 +641,90 @@ class TestOpenAILLM:
         assert llm._required_tool_choice_capability == "unknown"
 
     def test_complete_with_tools_wraps_client_errors(self, fake_client: Mock):
+        from core.errors import LLMCallError
+
         fake_client.chat.completions.create.side_effect = RuntimeError("tool boom")
         llm = openai_llm_module.OpenAILLM(api_key="test-key")
 
-        with pytest.raises(RuntimeError, match="OpenAI API error: tool boom"):
+        # Tool-calling paths wrap runtime errors in LLMCallError so the
+        # ReactLoop can detect them and finish with
+        # finish_reason="llm_error" instead of silently swallowing.
+        with pytest.raises(LLMCallError, match="OpenAI API error: tool boom"):
             llm.complete_with_tools("prompt", tools=[])
+
+    def test_complete_with_tools_raises_llm_call_error_on_400(self, fake_client: Mock):
+        """A 400 (BadRequestError) is surface as LLMCallError(400) so
+        the driver can distinguish a 400 protocol mismatch from a 500
+        upstream failure."""
+        from openai import BadRequestError
+
+        from core.errors import LLMCallError
+
+        fake_response = Mock(status_code=400)
+        fake_client.chat.completions.create.side_effect = BadRequestError(
+            message="tool schema rejected",
+            response=fake_response,
+            body={"error": {"message": "no such tool"}},
+        )
+        llm = openai_llm_module.OpenAILLM(api_key="test-key")
+
+        with pytest.raises(LLMCallError) as exc_info:
+            llm.complete_with_tools(
+                "prompt",
+                tools=[{"name": "missing", "description": "x",
+                        "input_schema": {"type": "object"}}],
+            )
+        assert exc_info.value.status_code == 400
+        assert "BadRequestError" in str(exc_info.value)
+        assert isinstance(exc_info.value.cause, BadRequestError)
+
+    def test_complete_with_tools_messages_raises_llm_call_error_on_400(
+        self, fake_client: Mock,
+    ):
+        """The messages-based tool path must surface the same typed
+        signal — this is the path the ReactLoop drives."""
+        from openai import BadRequestError
+
+        from core.errors import LLMCallError
+
+        fake_response = Mock(status_code=400)
+        fake_client.chat.completions.create.side_effect = BadRequestError(
+            message="tool schema rejected",
+            response=fake_response,
+            body={"error": {"message": "no such tool"}},
+        )
+        llm = openai_llm_module.OpenAILLM(api_key="test-key")
+
+        with pytest.raises(LLMCallError) as exc_info:
+            llm.complete_with_tools_messages(
+                messages=[{"role": "user", "content": "hi"}],
+                tools=[{"name": "missing", "description": "x",
+                        "input_schema": {"type": "object"}}],
+            )
+        assert exc_info.value.status_code == 400
+        assert "BadRequestError" in str(exc_info.value)
+
+    def test_complete_with_tools_messages_raises_transient_error_on_500(
+        self, fake_client: Mock,
+    ):
+        """A 500 retains the retryable provider error and its status."""
+        from openai import APIStatusError
+
+        fake_response = Mock(status_code=500)
+        fake_client.chat.completions.create.side_effect = APIStatusError(
+            message="upstream down",
+            response=fake_response,
+            body={"error": {"message": "boom"}},
+        )
+        llm = openai_llm_module.OpenAILLM(api_key="test-key")
+
+        with pytest.raises(LLMTransientError) as exc_info:
+            llm.complete_with_tools_messages(
+                messages=[{"role": "user", "content": "hi"}],
+                tools=[{"name": "x", "description": "x",
+                        "input_schema": {"type": "object"}}],
+            )
+        assert exc_info.value.__cause__.status_code == 500
 
     def test_complete_with_tools_empty_required_tool_calls_does_not_log_text_content(
         self,
@@ -588,7 +741,10 @@ class TestOpenAILLM:
         llm = openai_llm_module.OpenAILLM(api_key="test-key")
 
         with caplog.at_level(logging.WARNING, logger="providers.llm.openai_llm"):
-            with pytest.raises(RuntimeError, match="Required tool call returned no tool_calls"):
+            # A successful HTTP response without the required tool call is
+            # a protocol failure, not a transport failure.
+            from core.errors import ToolCallProtocolError
+            with pytest.raises(ToolCallProtocolError, match="Required tool call returned no tool_calls"):
                 llm.complete_with_tools(
                     prompt="Extract private memory",
                     tools=[
@@ -666,3 +822,143 @@ class TestCachedOpenAILLM:
         llm.clear_cache()
 
         assert llm.cache_stats == {"size": 0, "hits": 0, "misses": 0, "hit_rate": 0}
+
+
+# ---------------------------------------------------------------------------
+# complete_multimodal
+# ---------------------------------------------------------------------------
+
+class TestOpenAILLMCompleteMultimodal:
+    def test_complete_multimodal_with_json_mode(self, fake_client, fake_openai_ctor):
+        llm = openai_llm_module.OpenAILLM(
+            api_key="test-key", model="gpt-4o", json_mode=True,
+        )
+        fake_client.chat.completions.create.return_value = _chat_response(
+            content='{"description": "robot picks cup", "characters": [{"name": "robot_arm"}]}',
+        )
+
+        messages = [{
+            "role": "user",
+            "content": [
+                {"type": "text", "text": "describe"},
+                {"type": "image_url", "image_url": {"url": "data:image/jpeg;base64,AAA"}},
+                {"type": "input_audio", "input_audio": {"data": "BBB", "format": "wav"}},
+            ],
+        }]
+        schema = {
+            "type": "object",
+            "properties": {
+                "description": {"type": "string"},
+                "characters": {"type": "array"},
+            },
+        }
+        result = llm.complete_multimodal(messages, schema)
+
+        assert result["description"] == "robot picks cup"
+        # The OpenAI client received the multimodal messages + json_object.
+        call = fake_client.chat.completions.create.call_args
+        sent_messages = call.kwargs["messages"]
+        # System message is schema-driven; user message is verbatim.
+        assert sent_messages[0]["role"] == "system"
+        assert "description" in sent_messages[0]["content"]  # schema embedded
+        assert sent_messages[1] == messages[0]  # user multimodal content forwarded
+        assert call.kwargs["response_format"] == {"type": "json_object"}
+
+    def test_complete_multimodal_drops_caller_system_messages(self, fake_client, fake_openai_ctor):
+        """Caller-supplied system messages are dropped — the schema-derived
+        system message is authoritative for JSON-mode guarantees."""
+        llm = openai_llm_module.OpenAILLM(
+            api_key="test-key", model="gpt-4o", json_mode=True,
+        )
+        fake_client.chat.completions.create.return_value = _chat_response(
+            content='{"description": "ok"}',
+        )
+        messages = [
+            {"role": "system", "content": "ignore me"},
+            {"role": "user", "content": "describe"},
+        ]
+        llm.complete_multimodal(messages, {"type": "object"})
+        sent = fake_client.chat.completions.create.call_args.kwargs["messages"]
+        # Only one system message (the schema-driven one), no caller system.
+        assert all(m["role"] != "system" or "JSON" not in m["content"]
+                   for m in sent if m.get("content") == "ignore me")
+
+    def test_complete_multimodal_text_fallback_on_bad_request(
+        self, fake_client, fake_openai_ctor,
+    ):
+        from openai import BadRequestError
+        llm = openai_llm_module.OpenAILLM(
+            api_key="test-key", model="gpt-4o", json_mode=True,
+        )
+        # First call: json_object rejected. Second call (text fallback):
+        # JSON-extracted from free text. BadRequestError.__init__ accesses
+        # several httpx-style attributes on response; using Mock() with
+        # spec avoids the SimpleNamespace attribute tax.
+        from unittest.mock import Mock
+        fake_response = Mock(status_code=400)
+        fake_client.chat.completions.create.side_effect = [
+            BadRequestError(
+                message="json_object not supported",
+                response=fake_response,
+                body={"error": {"message": "no json"}},
+            ),
+            _chat_response(content='{"description": "fallback ok"}'),
+        ]
+        result = llm.complete_multimodal(
+            [{"role": "user", "content": "describe"}],
+            {"type": "object", "properties": {"description": {"type": "string"}}},
+        )
+        assert result["description"] == "fallback ok"
+        # Two calls: structured + text fallback.
+        assert fake_client.chat.completions.create.call_count == 2
+        # Second call has no response_format (text mode).
+        second_kwargs = fake_client.chat.completions.create.call_args_list[1].kwargs
+        assert "response_format" not in second_kwargs
+
+
+@pytest.mark.parametrize('json_mode', [False, True])
+@pytest.mark.parametrize('model,reasoning', [('gpt-4o-mini', False), ('o3', True)])
+def test_multimodal_uses_shared_completion_parameters(fake_client, json_mode, model, reasoning):
+    fake_client.chat.completions.create.return_value = _chat_response(content='{"value":"blue"}')
+    llm = openai_llm_module.OpenAILLM(
+        api_key='test', model=model, json_mode=json_mode, max_tokens=4321,
+        reasoning_effort='high', extra_body={'custom': True},
+    )
+    assert llm.complete_multimodal(
+        [{'role': 'user', 'content': [{'type': 'image_url', 'image_url': {'url': 'data:image/png;base64,AA=='}}]}],
+        {'type': 'object'},
+    ) == {'value': 'blue'}
+    kwargs = fake_client.chat.completions.create.call_args.kwargs
+    assert kwargs['extra_body'] == {'custom': True}
+    if reasoning:
+        assert kwargs['max_completion_tokens'] == 4321
+        assert kwargs['reasoning_effort'] == 'high'
+        assert 'temperature' not in kwargs and 'max_tokens' not in kwargs
+    else:
+        assert kwargs['max_tokens'] == 4321
+        assert kwargs['temperature'] == 0.7
+
+
+def test_multimodal_format_rejection_keeps_reasoning_parameters(fake_client):
+    fake_client.chat.completions.create.side_effect = [
+        _bad_request('unsupported json_object'), _chat_response(content='{"value":"ok"}'),
+    ]
+    llm = openai_llm_module.OpenAILLM(api_key='test', model='o3', json_mode=True,
+                                    reasoning_effort='low', extra_body={'custom': 1})
+    assert llm.complete_multimodal([], {'type': 'object'}) == {'value': 'ok'}
+    for call in fake_client.chat.completions.create.call_args_list:
+        assert call.kwargs['reasoning_effort'] == 'low'
+        assert call.kwargs['extra_body'] == {'custom': 1}
+        assert 'temperature' not in call.kwargs and 'max_tokens' not in call.kwargs
+
+
+@pytest.mark.parametrize('value', ['blue', '<think>blue</think>', '<think>blue',
+                                  '</think>blue', '&quot;blue&quot;', 'escaped "<think>blue</think>"'])
+@pytest.mark.parametrize('wrapper', ['{}', '```json\n{}\n```', '<think>private</think>\n{}', 'Answer: {}'])
+def test_json_values_preserve_literal_content(value, wrapper):
+    import json
+
+    payload = {'text': value, 'nested': [{'memory': value}]}
+    assert openai_llm_module.OpenAILLM._extract_json_from_text(
+        wrapper.format(json.dumps(payload)),
+    ) == payload

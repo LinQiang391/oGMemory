@@ -895,8 +895,36 @@ class OutboxStore:
         return counts
 
     def _count_unfinished_recursive(self, path: str, counts: dict[str, int]) -> None:
-        entries = self._client.ls(path)
+        try:
+            entries = self._client.ls(path)
+        except Exception as exc:
+            name = path.rstrip("/").rsplit("/", 1)[-1]
+            if self._is_resource_lock_directory(name) and (
+                self._is_not_found_error(exc) or "no such directory" in str(exc).lower()
+            ):
+                return
+            raise
         self._count_unfinished_entries(path, entries, counts)
+
+    @staticmethod
+    def _is_resource_lock_directory(name: str) -> bool:
+        """Identify mutation lease names whose directory can disappear mid-scan."""
+
+        if not name.startswith("."):
+            return False
+        for suffix in (".resource-mutation-lock", ".update-lock"):
+            if name.endswith(suffix) and len(name) > len(suffix) + 1:
+                return True
+        for marker in (".resource-mutation-lock-", ".update-lock-"):
+            prefix, separator, token = name.rpartition(marker)
+            if (
+                separator
+                and len(prefix) > 1
+                and len(token) == 32
+                and all(char in "0123456789abcdef" for char in token)
+            ):
+                return True
+        return False
 
     @staticmethod
     def _is_atomic_resource_staging_directory(name: str) -> bool:
@@ -952,7 +980,12 @@ class OutboxStore:
             if is_dir or not name.endswith(".json") or name.startswith("."):
                 continue
             event_id = name[:-5]
-            raw = self._client.read(outbox_path.rstrip("/") + "/" + name)
+            try:
+                raw = self._client.read(outbox_path.rstrip("/") + "/" + name)
+            except Exception as exc:
+                if self._is_not_found_error(exc):
+                    continue
+                raise
             data = self._load_event_json(raw)
             if data.get("event_id") != event_id:
                 raise ValueError("Outbox event id does not match its file name")

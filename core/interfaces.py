@@ -9,6 +9,20 @@ from typing import Any, Protocol
 
 from typing_extensions import runtime_checkable
 
+from core.graph_enums import (
+    GraphEdgeType,
+    GraphNodeType,
+    RawDataType,
+)
+from core.graph_models import (
+    GraphEdge,
+    GraphNode,
+    GraphStats,
+    MemoryNode,
+    RawNode,
+    SubgraphResult,
+    SupportingChain,
+)
 from core.models import (
     CandidateMemory,
     ContextNode,
@@ -168,6 +182,38 @@ class MergePolicy(Protocol):
         ...
 
 
+class TranscriptIndex(Protocol):
+    """Optional transcript-only recall capability, independent of vectors.
+
+    Implementations must require account_id and video_id and apply all scope
+    filters before limiting candidates. Unsupported backends must not silently
+    substitute vector reranking or search descriptions.
+    """
+
+    def search_by_transcript(
+        self, query: str, filters: dict[str, Any], top_k: int,
+    ) -> list[SeedHit]:
+        ...
+
+
+class ClipRecordIndex(Protocol):
+    """Optional scoped batch read of complete records at exact clip ordinals."""
+
+    def get_records_by_clips(
+        self, filters: dict[str, Any], clip_ids: list[int],
+    ) -> list[IndexRecord]:
+        ...
+
+
+class TemporalRecordIndex(Protocol):
+    """Optional tenant/video-scoped interval lookup, independent of ranking."""
+
+    def get_records_at_time(
+        self, filters: dict[str, Any], timestamp: float,
+    ) -> list[IndexRecord]:
+        ...
+
+
 class VectorIndex(Protocol):
     """Vector similarity search interface.
 
@@ -239,6 +285,23 @@ class VectorIndex(Protocol):
         """
         ...
 
+    def get_record(self, record_id: str) -> "IndexRecord | None":
+        """Fetch one :class:`IndexRecord` by id (round-trip).
+
+        Returns ``None`` when no row matches. ``search_by_vector``
+        only returns a 200-char abstract to keep the SeedHit payload
+        small; callers that need the full ``text`` field (M3 QA's
+        :class:`EpisodicSearcher`) use this method to recover it.
+
+        Default implementation raises :class:`NotImplementedError`;
+        backends with cheap by-id lookup (InMemoryVectorIndex,
+        OpenGaussVectorIndex, ChromaVectorIndex) override it.
+        """
+        raise NotImplementedError(
+            f"{type(self).__name__} does not implement get_record; "
+            "either override it or use a backend that does."
+        )
+
     def delete_by_owner_space(
         self, account_id: str, owner_space: str
     ) -> int:
@@ -279,6 +342,33 @@ class LLM(Protocol):
 
         Schema format: {"type": "object", "properties": {...}}
         Returns parsed JSON dict.
+        """
+        ...
+
+    def complete_multimodal(self, messages: list[dict], schema: dict) -> dict:
+        """Complete a multimodal message list and return JSON matching schema.
+
+        Each message dict has ``role`` (``system`` | ``user`` | ``assistant``)
+        and ``content``. ``content`` may be:
+
+        - ``str`` — plain text
+        - ``list[dict]`` — multimodal content parts. Each part has a
+          ``type`` discriminator and a type-specific payload. Recognised
+          types follow OpenAI's Chat Completions API:
+            * ``{"type": "text", "text": str}``
+            * ``{"type": "image_url", "image_url": {"url": str,
+              "detail": "low"|"high"|"auto"}}`` — ``url`` may be a
+              ``data:image/...;base64,...`` URI for inline images.
+            * ``{"type": "input_audio", "input_audio": {"data": str,
+              "format": "wav"|"mp3"}}}`` — ``data`` is base64 audio.
+
+        Schema format: ``{"type": "object", "properties": {...}}``.
+        Returns parsed JSON dict.
+
+        Implementations should accept arbitrary-length messages and
+        multimodal content; providers without multimodal capability
+        should raise ``NotImplementedError`` rather than silently
+        dropping content.
         """
         ...
 
@@ -488,5 +578,403 @@ class OutboxStore(Protocol):
         Args:
             event: OutboxEvent to release
             node_uri: URI of the associated node
+        """
+        ...
+
+
+@runtime_checkable
+class GraphStore(Protocol):
+    """Heterogeneous graph storage for multimodal memory system.
+
+    Provides CRUD operations for raw nodes, extracted nodes, memory nodes,
+    and edges between them. Implements incremental PageRank updates.
+
+    Multi-tenant isolation is enforced via account_id in RequestContext.
+    """
+
+    # === Node CRUD ===
+
+    def create_node(self, payload: dict[str, Any], ctx: RequestContext) -> GraphNode:
+        """Create a new graph node from a serialized node payload.
+
+        Args:
+            payload: JSON-ready node payload. Callers with a typed GraphNode
+                should pass ``node.serialize()``. Custom callers may pass any
+                dict with the required base fields (``node_type``, ``account_id``;
+                ``node_id`` is generated when absent) plus node-type-specific
+                fields such as ``raw_type``/``content``, ``extracted_content``,
+                or ``summary``.
+            ctx: RequestContext for access control
+
+        Returns:
+            The created node with generated ID
+
+        Raises:
+            AccessDeniedError: If account_id mismatch
+            ValidationError: If node data is invalid
+        """
+        ...
+
+    def create_node_with_edges(
+        self, payload: dict[str, Any], edges: list[GraphEdge], ctx: RequestContext,
+    ) -> GraphNode:
+        """Create a new node and its provenance edges as one logical operation.
+
+        SQL stores override this with a single transaction. The default is a
+        compensating rollback for simple stores; existing nodes are never
+        overwritten/deleted by this operation.
+        """
+        from core.errors import AccessDeniedError, NodeNotFoundError
+        node_id = payload["node_id"]
+        if self.get_node(node_id, ctx) is not None:
+            raise FileExistsError(f"Graph node already exists: {node_id}")
+        endpoints = {}
+        for edge in edges:
+            if edge.account_id != ctx.account_id:
+                raise AccessDeniedError(edge.edge_id, ctx.account_id)
+            if node_id not in (edge.source_id, edge.target_id):
+                raise ValueError("Provenance edge must connect the new node")
+            for endpoint in (edge.source_id, edge.target_id):
+                if endpoint == node_id:
+                    continue
+                node = self.get_node(endpoint, ctx)
+                if node is None:
+                    raise NodeNotFoundError(endpoint)
+                endpoints[endpoint] = (node, node.pagerank)
+        node = self.create_node(payload, ctx)
+        try:
+            for edge in edges:
+                self.create_edge(edge, ctx)
+        except Exception:
+            self.delete_node(node.node_id, ctx)
+            for existing, pagerank in endpoints.values():
+                existing.pagerank = pagerank
+                self.update_node(existing.serialize(), ctx)
+            raise
+        return node
+
+    def get_node(self, node_id: str, ctx: RequestContext) -> GraphNode | None:
+        """Get a node by ID.
+
+        Args:
+            node_id: UUID of the node
+            ctx: RequestContext for access control
+
+        Returns:
+            GraphNode if found and accessible, None otherwise
+        """
+        ...
+
+    def update_node(self, payload: dict[str, Any], ctx: RequestContext) -> GraphNode:
+        """Update an existing node from a serialized node payload.
+
+        Args:
+            payload: JSON-ready node payload. Must include ``node_id`` for the
+                node to update. Callers with a typed GraphNode should pass
+                ``node.serialize()``.
+            ctx: RequestContext for access control
+
+        Returns:
+            The updated node
+        """
+        ...
+
+    def delete_node(self, node_id: str, ctx: RequestContext) -> None:
+        """Delete a node and all its edges.
+
+        Args:
+            node_id: UUID of the node to delete
+            ctx: RequestContext for access control
+        """
+        ...
+
+    def list_nodes(
+        self,
+        node_type: GraphNodeType | None,
+        ctx: RequestContext,
+        limit: int = 100,
+        offset: int = 0,
+        raw_type: "RawDataType | None" = None,
+        extractor_type: str | None = None,
+        parent_audio_node_ids: "list[str] | None" = None,
+    ) -> list[GraphNode]:
+        """List nodes of a specific type.
+
+        Args:
+            node_type: Filter by node type (None for all types)
+            ctx: RequestContext for access control
+            limit: Maximum number of nodes to return. ``None`` means
+                "no LIMIT clause" — use only when the caller has
+                pre-narrowed the result set via ``extractor_type``
+                or ``parent_audio_node_ids`` so the unfiltered
+                scan is bounded.
+            offset: Number of nodes to skip
+            raw_type: For ``node_type == RAW``, filter by raw data
+                type. Pushed into the SQL WHERE so pagination does
+                not silently drop nodes of a different type.
+            extractor_type: For ``node_type == EXTRACTED``, filter by
+                ``extractor_type``. Pushed into the SQL WHERE for
+                the same reason — without it, a generic
+                ``node_type='extracted'`` query has to share its
+                LIMIT budget across face / voice_asr /
+                episodic_memory / etc., and the oldest extractor
+                type silently disappears once the table grows past
+                ``limit``.
+            parent_audio_node_ids: For ``node_type == EXTRACTED``,
+                filter to rows whose ``extracted_content.source_audio_node_id``
+                matches one of the given ids. Pushed into the SQL
+                WHERE as ``extracted_content->>'source_audio_node_id'
+                = ANY(...)``. Use this when you need the children of
+                a known set of audio raw nodes (e.g. one video's
+                ASR segments) without traversing the whole
+                ``extractor_type='voice_asr'`` corpus.
+
+        Returns:
+            List of matching nodes
+        """
+        ...
+
+    # === Edge CRUD ===
+
+    def list_identity_pairs(
+        self, source_ids: list[str], ctx: RequestContext,
+    ) -> list[tuple[str, str]]:
+        """Account-scoped identity endpoints, without loading neighboring nodes."""
+        ...
+
+    def ensure_identity_edges(self, edges: list[GraphEdge], ctx: RequestContext) -> int:
+        """Insert missing identity pairs in bulk; existing edges are unchanged."""
+        ...
+
+    def create_edge(self, edge: GraphEdge, ctx: RequestContext) -> GraphEdge:
+        """Create a new edge between nodes.
+
+        Automatically triggers incremental PageRank update for affected nodes.
+
+        Args:
+            edge: GraphEdge to create
+            ctx: RequestContext for access control
+
+        Returns:
+            The created edge
+        """
+        ...
+
+    def delete_edge(self, edge_id: str, ctx: RequestContext) -> None:
+        """Delete an edge by ID.
+
+        Args:
+            edge_id: UUID of the edge to delete
+            ctx: RequestContext for access control
+        """
+        ...
+
+    def get_edge(self, edge_id: str, ctx: RequestContext) -> GraphEdge | None:
+        """Get an edge by ID.
+
+        Args:
+            edge_id: UUID of the edge
+            ctx: RequestContext for access control
+
+        Returns:
+            GraphEdge if found, None otherwise
+        """
+        ...
+
+    # === Graph Traversal ===
+
+    def get_neighbors(
+        self,
+        node_id: str,
+        ctx: RequestContext,
+        edge_types: list[GraphEdgeType] | None = None,
+        direction: str = "both",  # "incoming", "outgoing", "both"
+    ) -> list[tuple[GraphNode, GraphEdge, str]]:
+        """Get neighboring nodes and edges.
+
+        Args:
+            node_id: UUID of the center node
+            ctx: RequestContext for access control
+            edge_types: Filter by edge types (None for all)
+            direction: "incoming", "outgoing", or "both"
+
+        Returns:
+            List of (neighbor_node, edge, direction) tuples
+        """
+        ...
+
+    def traverse(
+        self,
+        start_node_id: str,
+        depth: int,
+        ctx: RequestContext,
+        edge_types: list[GraphEdgeType] | None = None,
+    ) -> SubgraphResult:
+        """BFS traversal from a starting node.
+
+        Args:
+            start_node_id: UUID of the starting node
+            depth: Maximum traversal depth
+            ctx: RequestContext for access control
+            edge_types: Filter by edge types (None for all)
+
+        Returns:
+            SubgraphResult with nodes and edges within depth limit
+        """
+        ...
+
+    def get_supporting_chain(
+        self, memory_id: str, ctx: RequestContext
+    ) -> SupportingChain:
+        """Get the evidence chain for a memory node.
+
+        Returns the memory and all supporting raw/extracted nodes
+        with their relationships.
+
+        Args:
+            memory_id: UUID of the memory node
+            ctx: RequestContext for access control
+
+        Returns:
+            SupportingChain with memory, supporting nodes, and edges
+        """
+        ...
+
+    # === PageRank ===
+
+    def compute_pagerank(
+        self,
+        ctx: RequestContext,
+        node_ids: list[str] | None = None,
+        damping: float = 0.85,
+    ) -> dict[str, float]:
+        """Compute PageRank scores for nodes.
+
+        Args:
+            node_ids: Specific nodes to compute for (None = all nodes)
+            ctx: RequestContext for access control
+            damping: Damping factor (default 0.85)
+
+        Returns:
+            Dict mapping node_id to PageRank score
+        """
+        ...
+
+    def get_node_pagerank(self, node_id: str, ctx: RequestContext) -> float:
+        """Get the PageRank score for a specific node.
+
+        Args:
+            node_id: UUID of the node
+            ctx: RequestContext for access control
+
+        Returns:
+            PageRank score
+        """
+        ...
+
+    # === Search ===
+
+    def search_memories(
+        self,
+        query: str,
+        ctx: RequestContext,
+        min_confidence: float = 0.0,
+        topic: str | None = None,
+        tags: list[str] | None = None,
+        top_k: int = 10,
+    ) -> list[MemoryNode]:
+        """Search memory nodes by text and filters.
+
+        Args:
+            query: Text search query
+            ctx: RequestContext for access control
+            min_confidence: Minimum confidence threshold
+            topic: Filter by topic
+            tags: Filter by tags (OR logic)
+            top_k: Maximum number of results
+
+        Returns:
+            List of matching memory nodes sorted by confidence
+        """
+        ...
+
+    def search_by_embedding(
+        self,
+        query_vector: list[float],
+        ctx: RequestContext,
+        *,
+        node_types: tuple[str, ...] = ("extracted",),
+        extractor_types: tuple[str, ...] | None = None,
+        video_id: str | None = None,
+        before_clip: int | None = None,
+        before_sec: float | None = None,
+        top_k: int = 10,
+    ) -> list[tuple[str, float]]:
+        """Cosine-similarity search over node embeddings.
+
+        Today only :class:`ExtractedNode` carries an embedding
+        (under ``extracted_content["embedding"]``). Implementations MUST:
+
+        - Filter by ``account_id`` from ``ctx`` (tenant isolation).
+        - Skip nodes whose embedding is missing, malformed, or has the
+          wrong dimension relative to ``query_vector``.
+        - Apply the clip / video / extractor / node-type filters.
+        - If before_sec is set (absolute video seconds), exclude complete
+          source intervals ending later or lacking valid temporal provenance,
+          before ranking/top_k.
+        - Sort by cosine similarity desc and return at most ``top_k``
+          ``(node_id, score)`` pairs.
+
+        Implementations SHOULD be best-effort: a single malformed row
+        must not poison the result set.
+
+        Args:
+            query_vector: 1-D query vector.
+            ctx: Request context (provides ``account_id`` for isolation).
+            node_types: Tuple of node-type strings (``"raw"``, ``"extracted"``,
+                ``"memory"``). Unknown values are silently ignored.
+            extractor_types: Optional whitelist of ``extractor_type``.
+            video_id: Optional ``extracted_content["_video_id"]`` match.
+            before_clip: Optional ordinal upper bound on
+                ``extracted_content["_clip_id"]``. Rows missing the key
+                or exceeding the bound are excluded.
+            top_k: Maximum number of results to return.
+
+        Returns:
+            ``[(node_id, score), ...]`` sorted by score desc, capped at
+            ``top_k``. Empty when ``top_k <= 0`` or no candidates pass.
+        """
+        ...
+
+    def search_raw_nodes(
+        self,
+        raw_type: RawDataType | None,
+        ctx: RequestContext,
+        query: str | None = None,
+        top_k: int = 10,
+    ) -> list[RawNode]:
+        """Search raw nodes by type and optional text query.
+
+        Args:
+            raw_type: Filter by raw data type
+            ctx: RequestContext for access control
+            query: Optional text search
+            top_k: Maximum number of results
+
+        Returns:
+            List of matching raw nodes
+        """
+        ...
+
+    # === Statistics ===
+
+    def get_graph_stats(self, ctx: RequestContext) -> GraphStats:
+        """Get statistics about the graph.
+
+        Args:
+            ctx: RequestContext for access control
+
+        Returns:
+            GraphStats with node and edge counts, top memories
         """
         ...
