@@ -22,6 +22,7 @@ from core.models import (
     TypedQuery,
 )
 from retrieval.identity import memory_identity, memory_unit_key
+from scene.retrieval import select_scene_evidence
 
 logger = logging.getLogger(__name__)
 
@@ -211,6 +212,7 @@ class ResultRanker:
         *,
         fill_content_for_top_k: int = 0,
         context_reader=None,
+        direct_evidence_reserve: float | None = None,
     ) -> list[RetrievedBlock]:
         candidates = list(leaf_hits) if leaf_hits else []
 
@@ -232,7 +234,12 @@ class ResultRanker:
             l2_only = [hit for hit in l2_only if is_visible(hit.uri, ctx)]
 
         ranked = self._ranker.rank(typed_query, l2_only)
-        top = ranked[: typed_query.top_k]
+        top = select_scene_evidence(
+            ranked, typed_query.top_k, direct_evidence_reserve,
+            lambda item: bool(item.hit.metadata.get("scene_expanded")),
+        )
+        if direct_evidence_reserve is not None:
+            top.sort(key=lambda item: (item.rank_score, item.hit.score), reverse=True)
 
         blocks: list[RetrievedBlock] = []
         for item in top:
