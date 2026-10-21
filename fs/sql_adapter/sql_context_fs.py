@@ -332,6 +332,27 @@ class SQLContextFS(PoolAdapterMixin):
             conn.rollback()
             self._return_connection(conn)
 
+    def find_archive_uri(self, archive_id: str, ctx: RequestContext) -> str | None:
+        """Resolve a unique canonical archive under the caller's account and owner."""
+        if not (ctx.user_id or ctx.agent_id):
+            return None
+        conn = self._get_connection()
+        try:
+            self.bind_tenant(conn, ctx.account_id)
+            with conn.cursor() as cur:
+                cur.execute(
+                    "SELECT uri FROM context_nodes WHERE account_id = %s AND category = 'history' "
+                    "AND status = 'ACTIVE' AND metadata->>'archive_id' = %s "
+                    "AND metadata->>'owner_user_id' = %s "
+                    "AND (%s = '' OR metadata->>'owner_agent_id' = %s) LIMIT 2",
+                    (ctx.account_id, archive_id, ctx.user_id, ctx.agent_id, ctx.agent_id),
+                )
+                rows = cur.fetchall()
+            return rows[0][0] if len(rows) == 1 else None
+        finally:
+            conn.rollback()
+            self._return_connection(conn)
+
     def scan_session_recovery(self, account_id, *, cursor=None, limit=32):
         """Page through canonical session metadata for the service recovery worker."""
         limit = max(1, min(int(limit), 50))

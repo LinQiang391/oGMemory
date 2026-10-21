@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from collections.abc import Iterator, Mapping, Sequence
+from collections.abc import Callable, Iterator, Mapping, Sequence
 from dataclasses import dataclass
 from typing import Protocol, runtime_checkable
 
@@ -25,6 +25,21 @@ class SceneSnapshotRepository(Protocol):
     def load_snapshot(self, account_id: str, owner_space: str) -> SceneSnapshot: ...
 
     def compare_and_swap(self, expected: SceneSnapshot, replacement: SceneSnapshot) -> bool: ...
+
+
+class SceneEvidenceRepository(SceneSnapshotRepository, Protocol):
+    """Publication port sharing the canonical writers' transaction or mutation lock."""
+
+    def compare_and_swap_checked(
+        self, expected: SceneSnapshot, replacement: SceneSnapshot, check: Callable[[], bool],
+    ) -> bool:
+        """Hold canonical mutation protection across check and snapshot CAS.
+
+        The backend acquires protection for the account/owner's evidence first,
+        invokes check inside that boundary, and commits only when it returns True.
+        A failed check returns False. All canonical writers share this protection.
+        """
+        ...
 
 
 @dataclass(frozen=True)
