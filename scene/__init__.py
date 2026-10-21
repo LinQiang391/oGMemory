@@ -17,6 +17,14 @@ from scene.jobs import (
     SceneLeaseLostError,
 )
 from scene.models import SceneCluster, SceneContribution
+from scene.retrieval import (
+    SceneEvidenceSearchSource,
+    SceneHit,
+    SceneMemberSource,
+    SceneRanker,
+    SceneRanking,
+    SceneSearchSource,
+)
 from scene.store import SceneNodeSource, SceneProjectionStore, SceneSnapshotRepository, SceneStore
 
 __all__ = [
@@ -38,4 +46,10 @@ __all__ = [
     "SceneJobStore",
     "SceneLeaseLostError",
     "InMemorySceneJobStore",
+    "SceneHit",
+    "SceneRanking",
+    "SceneSearchSource",
+    "SceneMemberSource",
+    "SceneEvidenceSearchSource",
+    "SceneRanker",
 ]
