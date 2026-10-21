@@ -2,10 +2,13 @@
 
 from __future__ import annotations
 
+import logging
 from collections.abc import Callable, Mapping
 from dataclasses import asdict, dataclass, replace
 from threading import RLock
 from typing import Protocol
+
+logger = logging.getLogger(__name__)
 
 
 @dataclass(frozen=True)
@@ -176,8 +179,7 @@ class InMemorySceneConfigProvider:
             self._snapshots[key] = next_snapshot
             self._history.setdefault(key, {})[next_snapshot.revision] = next_snapshot
             listeners = tuple(self._listeners)
-        for listener in listeners:
-            listener(account_id, owner_space, next_snapshot)
+        self._notify(listeners, account_id, owner_space, next_snapshot)
         return next_snapshot
 
     def rollback(
@@ -189,7 +191,10 @@ class InMemorySceneConfigProvider:
         key = (account_id, owner_space)
         with self._lock:
             history = self._history.get(key, {})
-            target = history.get(target_revision)
+            target = (
+                SceneConfigSnapshot(self._default, 0, "system")
+                if target_revision == 0 else history.get(target_revision)
+            )
             if target is None:
                 raise ValueError(f"unknown configuration revision: {target_revision}")
             current = self.get_effective(account_id, owner_space)
@@ -197,9 +202,21 @@ class InMemorySceneConfigProvider:
             self._snapshots[key] = next_snapshot
             self._history.setdefault(key, {})[next_snapshot.revision] = next_snapshot
             listeners = tuple(self._listeners)
-        for listener in listeners:
-            listener(account_id, owner_space, next_snapshot)
+        self._notify(listeners, account_id, owner_space, next_snapshot)
         return next_snapshot
+
+    def _notify(
+        self,
+        listeners: tuple[Callable[[str, str, SceneConfigSnapshot], None], ...],
+        account_id: str,
+        owner_space: str,
+        snapshot: SceneConfigSnapshot,
+    ) -> None:
+        for listener in listeners:
+            try:
+                listener(account_id, owner_space, snapshot)
+            except Exception:
+                logger.exception("Scene configuration notification failed at revision %s", snapshot.revision)
 
     def subscribe(self, listener: Callable[[str, str, SceneConfigSnapshot], None]) -> None:
         with self._lock:
@@ -236,5 +253,8 @@ class SceneConfigCache:
             return current
 
     def _replace(self, account_id: str, owner_space: str, snapshot: SceneConfigSnapshot) -> None:
+        key = (account_id, owner_space)
         with self._lock:
-            self._snapshots[(account_id, owner_space)] = snapshot
+            current = self._snapshots.get(key)
+            if current is None or snapshot.revision >= current.revision:
+                self._snapshots[key] = snapshot
