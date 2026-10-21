@@ -95,6 +95,13 @@ def llm() -> MockLLM:
     return MockLLM()
 
 
+@pytest.fixture
+def offline_transcript_tokenizer(monkeypatch):
+    from tests.unit.m3.test_transcript_rerank import _mock_tokenize
+
+    monkeypatch.setattr("retrieval.bm25_index._tokenize", _mock_tokenize)
+
+
 def _scripted(script: list[dict]) -> _ScriptedLLM:
     return _ScriptedLLM(script)
 
@@ -1233,6 +1240,7 @@ class TestMergeHitsByNode:
 # Tests: dual-path retrieval end-to-end
 # ---------------------------------------------------------------------------
 
+@pytest.mark.usefixtures("offline_transcript_tokenizer")
 class TestDualPathRetrieval:
     """The headline P1 #6 fix: when the question names a person whose
     correct clip doesn't make the first top-k (cosine drops because the
