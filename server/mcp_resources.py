@@ -202,11 +202,15 @@ def iter_internal_uri_candidates(
     uri: str, ctx: RequestContext, context_fs: Any = None,
 ) -> Iterator[str]:
     candidates = external_to_internal_uri_candidates(uri, ctx)
-    yield from candidates
     parsed = parse_ogmemory_uri(uri)
     if parsed.memory_type in {"skill", "profile"} or not hasattr(context_fs, "list_children"):
+        yield from candidates
         return
-    for base_uri in dict.fromkeys(candidate.rsplit("/", 1)[0] for candidate in candidates):
+    by_owner: dict[str, list[str]] = {}
+    for candidate in candidates:
+        by_owner.setdefault(candidate.rsplit("/", 1)[0], []).append(candidate)
+    for base_uri, owner_candidates in by_owner.items():
+        yield from owner_candidates
         try:
             children = context_fs.list_children(base_uri, ctx)
         except Exception as exc:
@@ -216,7 +220,7 @@ def iter_internal_uri_candidates(
         matches = {
             child for child in children
             if child.rsplit("/", 1)[0] == base_uri
-            and child not in candidates
+            and child not in owner_candidates
             and unquote(child.rsplit("/", 1)[1]) == parsed.memory_id
         }
         if len(matches) > 1:

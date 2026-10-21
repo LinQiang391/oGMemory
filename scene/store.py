@@ -13,11 +13,25 @@ SceneSourceState = tuple[int, object]
 ResolvedArchiveSource = tuple[str, float]
 
 
+@runtime_checkable
+class SceneSnapshotRepository(Protocol):
+    """Persistence port for one scoped scene snapshot.
+
+    Implementations own transactions, tenant isolation, locking, and the
+    serialization format. Scene retrieval and decision code only depends on
+    this port.
+    """
+
+    def load_snapshot(self, account_id: str, owner_space: str) -> SceneSnapshot: ...
+
+    def compare_and_swap(self, expected: SceneSnapshot, replacement: SceneSnapshot) -> bool: ...
+
+
 @dataclass(frozen=True)
 class SceneDecisionInput:
-    """Detached scenes, complete member evidence and indexed vectors at one revision.
+    """Detached scenes and a bounded evidence window at one revision.
 
-    Nodes include every existing scene member and the offered new evidence.
+    Nodes include offered evidence and complete members of selected scene candidates.
     Embeddings use node URIs as keys. Adapters return caller-owned node and vector
     copies so a decision can operate independently of subsequent backend changes.
     """
@@ -31,13 +45,22 @@ class SceneDecisionInput:
 class SceneDecisionStore(Protocol):
     """Consistent snapshot reads and atomic publication scoped by account and owner.
 
-    Scene changes and source-memory changes advance the same monotonic scope
-    revision, including manual edits and deletions. Adapters own transactions
-    and synchronization across readers and writers.
+    Scene changes advance the monotonic scope revision. Adapters validate source
+    versions during publication and own transactions across readers and writers.
     """
 
-    def load_input(self, account_id: str, owner_space: str) -> SceneDecisionInput:
-        """Read scene state, member nodes and indexed vectors from one revision."""
+    def load_input(
+        self,
+        account_id: str,
+        owner_space: str,
+        *,
+        node_uris: Sequence[str] | None = None,
+    ) -> SceneDecisionInput:
+        """Read one revision and the bounded evidence window for a job.
+
+        Adapters should include the offered URIs plus existing scene members
+        and any evidence required to compare or merge those scenes.
+        """
         ...
 
     def compare_and_swap(self, expected: SceneSnapshot, replacement: SceneSnapshot) -> bool:
