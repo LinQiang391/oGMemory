@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from collections import OrderedDict
 from collections.abc import Callable, Iterable
 from contextvars import ContextVar
 from dataclasses import asdict, dataclass, replace
@@ -103,7 +104,7 @@ class InMemorySceneJobStore:
 
     def __init__(self, *, clock: Callable[[], datetime] = _utcnow) -> None:
         self._jobs: dict[str, SceneJob] = {}
-        self._scopes: dict[tuple[str, str], dict] = {}
+        self._scopes: OrderedDict[tuple[str, str], dict] = OrderedDict()
         self._clock = clock
         self._lock = RLock()
         self._notices: set[tuple[str, str, str]] = set()
@@ -207,6 +208,7 @@ class InMemorySceneJobStore:
                                       worker_id=worker_id, lease_token=uuid4().hex,
                                       lease_until=now + timedelta(seconds=lease_seconds), next_run_at=None)
                     self._jobs[job.job_id] = claimed
+                    self._scopes.move_to_end((account_id, owner_space))
                     return claimed
         return None
 

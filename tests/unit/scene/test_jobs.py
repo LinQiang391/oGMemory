@@ -6,6 +6,25 @@ import pytest
 from scene.jobs import InMemorySceneJobStore, SceneJobStatus, job_from_dict, job_to_dict
 
 
+@pytest.mark.parametrize("supply", ["writes", "backlog"])
+def test_claim_rotates_busy_accounts_and_owners(supply):
+    store = InMemorySceneJobStore()
+    scopes = [("acct", "user:a"), ("acct", "user:b"), ("other", "user:a")]
+    for account, owner in scopes:
+        nodes = [f"n{i}" for i in range(4)] if supply == "backlog" else ["n0"]
+        store.enqueue(account, owner, nodes, token_count=len(nodes), max_pending_nodes=1)
+    claimed_scopes = []
+    for index in range(12):
+        job = store.claim("worker")
+        assert job is not None
+        claimed_scopes.append((job.account_id, job.owner_space))
+        if supply == "writes":
+            store.enqueue(job.account_id, job.owner_space, [f"fresh-{index}"],
+                          token_count=1, max_pending_nodes=1)
+        store.mark_succeeded(job)
+    assert claimed_scopes == scopes * 4
+
+
 def test_enqueue_coalesces_until_trigger_and_claims_atomically():
     store = InMemorySceneJobStore()
     assert store.enqueue("acct", "user:a", ["n1"], token_count=3, trigger_tokens=10) is None
@@ -17,6 +36,61 @@ def test_enqueue_coalesces_until_trigger_and_claims_atomically():
     assert claimed.status == SceneJobStatus.RUNNING
     assert claimed.attempt == 1
     assert store.claim("worker-2") is None
+
+
+@pytest.mark.parametrize("readiness", ["max_wait", "retry", "lease"])
+def test_rotation_serves_other_scopes_then_recovers_due_work(readiness):
+    clock = [datetime(2026, 1, 1, tzinfo=UTC)]
+    store = InMemorySceneJobStore(clock=lambda: clock[0])
+    store.enqueue("acct", "user:due", ["due"], token_count=1,
+                  trigger_tokens=2 if readiness == "max_wait" else 1, max_wait_seconds=10)
+    original = None
+    if readiness != "max_wait":
+        original = store.claim("first-worker", lease_seconds=10)
+        if readiness == "retry":
+            store.mark_retry(original, reason="temporary failure", delay_seconds=10)
+    for owner in ("user:busy", "user:ready"):
+        store.enqueue("acct", owner, [owner], token_count=1)
+    busy = store.claim("worker")
+    assert busy.owner_space == "user:busy"
+    store.enqueue("acct", "user:busy", ["next"], token_count=1)
+    store.mark_succeeded(busy)
+    ready = store.claim("worker")
+    assert ready.owner_space == "user:ready"
+    store.mark_succeeded(ready)
+    clock[0] += timedelta(seconds=10)
+    recovered = store.claim("worker")
+    assert recovered.owner_space == "user:due"
+    assert recovered.node_uris == ("due",)
+    if original is not None:
+        assert recovered.job_id == original.job_id
+        assert recovered.attempt == 2
+        assert recovered.lease_token != original.lease_token
+    assert store.mark_succeeded(recovered).status == SceneJobStatus.SUCCEEDED
+    following = store.claim("worker")
+    assert following.node_uris == ("next",)
+    store.mark_succeeded(following)
+    assert store.claim("worker") is None
+    store.enqueue("late", "user:new", ["fresh"], token_count=1)
+    late = store.claim("worker")
+    assert (late.account_id, late.owner_space, late.node_uris) == ("late", "user:new", ("fresh",))
+    store.mark_succeeded(late)
+
+
+def test_concurrent_workers_claim_distinct_scopes_across_rounds():
+    store = InMemorySceneJobStore()
+    scopes = [("acct", f"user:{i}") for i in range(8)]
+    for account, owner in scopes:
+        store.enqueue(account, owner, [f"n{i}" for i in range(5)],
+                      token_count=5, max_pending_nodes=1)
+    with ThreadPoolExecutor(max_workers=8) as workers:
+        for _ in range(5):
+            claims = list(workers.map(lambda i: store.claim(f"worker-{i}"), range(8)))
+            assert {(job.account_id, job.owner_space) for job in claims} == set(scopes)
+            assert len({job.job_id for job in claims}) == 8
+            completed = list(workers.map(store.mark_succeeded, claims))
+            assert all(job.status == SceneJobStatus.SUCCEEDED for job in completed)
+    assert store.claim("worker") is None
 
 
 def test_waiting_evidence_joins_next_threshold_window():
