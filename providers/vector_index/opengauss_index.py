@@ -703,6 +703,7 @@ class OpenGaussVectorIndex(PoolAdapterMixin, VectorIndex):
         uris: list[str],
         filters: dict[str, Any],
         level: int = 0,
+        *, expected_texts: dict[str, str] | None = None,
     ) -> dict[str, list[float]]:
         if not uris:
             return {}
@@ -712,7 +713,7 @@ class OpenGaussVectorIndex(PoolAdapterMixin, VectorIndex):
         try:
             with conn.cursor() as cur:
                 cur.execute(
-                    f"SELECT uri, embedding::text FROM {self._table_name} "
+                    f"SELECT uri, embedding::text{', text' if expected_texts is not None else ''} FROM {self._table_name} "
                     f"WHERE {where} AND uri=ANY(%(uris)s)",
                     params,
                 )
@@ -720,7 +721,9 @@ class OpenGaussVectorIndex(PoolAdapterMixin, VectorIndex):
         finally:
             self._return_connection(conn)
         output: dict[str, list[float]] = {}
-        for uri, raw in rows:
+        for uri, raw, *source in rows:
+            if expected_texts is not None and (not source or source[0] != expected_texts.get(str(uri))):
+                continue
             text = str(raw).strip().strip("[]")
             output[str(uri)] = [float(value) for value in text.split(",") if value]
         return output

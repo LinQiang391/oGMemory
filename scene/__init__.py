@@ -1,5 +1,6 @@
 """Persisted scene-memory discovery and retrieval weighting."""
 
+from scene.adapters import CanonicalSceneAdapter
 from scene.config import (
     ConfigRevisionConflict,
     ConfigRevisionError,
@@ -25,15 +26,23 @@ from scene.retrieval import (
     SceneRanking,
     SceneSearchSource,
 )
-from scene.store import SceneNodeSource, SceneProjectionStore, SceneSnapshotRepository, SceneStore
+from scene.store import (
+    SceneEvidenceRepository,
+    SceneNodeSource,
+    SceneProjectionStore,
+    SceneSnapshotRepository,
+    SceneStore,
+)
 
 __all__ = [
+    "CanonicalSceneAdapter",
     "SceneCluster",
     "SceneContribution",
     "SceneNodeSource",
     "SceneProjectionStore",
     "SceneStore",
     "SceneSnapshotRepository",
+    "SceneEvidenceRepository",
     "SceneConfig",
     "SceneConfigCache",
     "SceneConfigProvider",

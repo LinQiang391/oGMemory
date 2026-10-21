@@ -337,6 +337,10 @@ class SQLSessionArchiveStore(PoolAdapterMixin):
         if row is None:
             return None
 
+        return self._entry_from_row(row)
+
+    @staticmethod
+    def _entry_from_row(row) -> ArchiveEntry:
         (
             aid,
             sess_id,
@@ -366,6 +370,27 @@ class SQLSessionArchiveStore(PoolAdapterMixin):
             created_at=str(created_at) if created_at else "",
             metadata=meta,
         )
+
+    def read_archive_by_id(self, archive_id: str, ctx: RequestContext) -> ArchiveEntry | None:
+        """Resolve a unique archive within the requested account and owner."""
+        if not (ctx.user_id or ctx.agent_id):
+            return None
+        self.bind_context(ctx)
+        conn = self._get_connection()
+        try:
+            self.bind_tenant(conn, ctx.account_id)
+            with conn.cursor() as cur:
+                cur.execute(
+                    "SELECT archive_id, session_id, abstract, overview, messages, metadata, created_at "
+                    "FROM session_archives WHERE account_id = %s AND archive_id = %s "
+                    "AND owner_user_id = %s AND (%s = '' OR owner_agent_id = %s) LIMIT 2",
+                    (ctx.account_id, archive_id, ctx.user_id, ctx.agent_id, ctx.agent_id),
+                )
+                rows = cur.fetchall()
+        finally:
+            conn.rollback()
+            self._return_connection(conn)
+        return self._entry_from_row(rows[0]) if len(rows) == 1 else None
 
     def read_archive_abstract(
         self,

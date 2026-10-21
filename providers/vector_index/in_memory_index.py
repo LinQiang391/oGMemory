@@ -157,11 +157,14 @@ class InMemoryVectorIndex(VectorIndex):
         uris: list[str],
         filters: dict[str, Any],
         level: int = 0,
+        *, expected_texts: dict[str, str] | None = None,
     ) -> dict[str, list[float]]:
         wanted = set(uris)
         output: dict[str, list[float]] = {}
         for record_id, record in self._records.items():
             if record.uri not in wanted or record.level != level:
+                continue
+            if expected_texts is not None and record.text != expected_texts.get(record.uri):
                 continue
             if self._matches_raw_filters(record, filters):
                 output[record.uri] = list(self._vectors[record_id])
