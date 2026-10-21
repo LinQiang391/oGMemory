@@ -760,6 +760,10 @@ Evaluated on [LoCoMo](https://arxiv.org/abs/2402.10790) long-context conversatio
 - oGMemory uses an AGFS-backed hierarchical storage layer for durable, session-scoped memory resources
 - [AI Agent Memory Architectures](https://zylos.ai/research/2026-03-09-multi-agent-memory-architectures-shared-isolated-hierarchical) — Zylos Research, 2026
 
+## SWE-bench reference workflow
+
+See [SWE-bench Lite testing guide and scripts](benchmarks/swebench/README.md) for baseline versus oGMemory with openGauss SQL storage, official evaluation, and usage reporting (guide in Chinese).
+
 ## License
 
 [Apache License 2.0](LICENSE)
