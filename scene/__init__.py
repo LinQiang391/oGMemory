@@ -1,7 +1,16 @@
 """Persisted scene-memory discovery and retrieval weighting."""
 
+from scene.config import (
+    ConfigRevisionConflict,
+    ConfigRevisionError,
+    InMemorySceneConfigProvider,
+    SceneConfig,
+    SceneConfigCache,
+    SceneConfigProvider,
+    SceneConfigSnapshot,
+)
 from scene.models import SceneCluster, SceneContribution
-from scene.store import SceneNodeSource, SceneProjectionStore, SceneStore
+from scene.store import SceneNodeSource, SceneProjectionStore, SceneSnapshotRepository, SceneStore
 
 __all__ = [
     "SceneCluster",
@@ -9,4 +18,12 @@ __all__ = [
     "SceneNodeSource",
     "SceneProjectionStore",
     "SceneStore",
+    "SceneSnapshotRepository",
+    "SceneConfig",
+    "SceneConfigCache",
+    "SceneConfigProvider",
+    "SceneConfigSnapshot",
+    "InMemorySceneConfigProvider",
+    "ConfigRevisionConflict",
+    "ConfigRevisionError",
 ]
