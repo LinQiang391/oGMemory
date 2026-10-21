@@ -11,6 +11,7 @@ import re
 from dataclasses import dataclass
 from typing import Protocol
 
+from core.errors import AccessDeniedError, NodeBrokenError, NodeNotFoundError
 from core.models import (
     LeafHit,
     RequestContext,
@@ -226,6 +227,10 @@ class ResultRanker:
                 seen_uris[identity] = hit
         l2_only = list(seen_uris.values())
 
+        is_visible = getattr(context_reader, "is_visible", None)
+        if ctx is not None and callable(is_visible):
+            l2_only = [hit for hit in l2_only if is_visible(hit.uri, ctx)]
+
         ranked = self._ranker.rank(typed_query, l2_only)
         top = ranked[: typed_query.top_k]
 
@@ -249,6 +254,7 @@ class ResultRanker:
             )
 
         # Fill content_excerpt for top-K results (read full content from AGFS)
+        unavailable = set()
         if fill_content_for_top_k > 0 and context_reader and ctx:
             top_k_to_fill = min(fill_content_for_top_k, len(blocks))
             for i in range(top_k_to_fill):
@@ -262,8 +268,13 @@ class ResultRanker:
                         block.overview = content_block.overview
                     if content_block.content_excerpt:
                         block.content_excerpt = content_block.content_excerpt
+                except (AccessDeniedError, PermissionError, NodeNotFoundError, NodeBrokenError, FileNotFoundError):
+                    unavailable.add(i)
                 except Exception as exc:
                     logger.debug("content fill failed for %s: %s", block.uri, exc)
+
+        if unavailable:
+            blocks = [block for index, block in enumerate(blocks) if index not in unavailable]
 
         # Fill relations from relation store
         if self._relation_store and ctx:

@@ -21,6 +21,7 @@ from server.mcp_resources import (
     external_id_from_uri,
     external_to_internal_uri_candidates,
     internal_to_external_uri,
+    iter_internal_uri_candidates,
     parse_ogmemory_uri,
     public_type_from_internal,
     render_resource,
@@ -42,9 +43,41 @@ _FORBIDDEN_WRITE_FIELDS = {
     "type",
     "memory_type",
     "memory_id",
+    "category",
+    "context_type",
+    "owner_space",
+    "level",
+    "metadata",
     "uri",
     "abstract",
     "overview",
+    "owner_scope",
+    "routing_key",
+    "confidence",
+    "when",
+    "who",
+    "where",
+    "tool_stats",
+    "evidence_quote",
+    "attributed_speaker",
+    "attribution_basis",
+    "provenance_ids",
+    "object_name",
+    "scope_ref",
+    "target_uri",
+    "expected_version",
+    "legacy_routing_key",
+    "title",
+    "complete_occurrence_context",
+    "write_operation_id",
+    "source_occurrence_id",
+    "verified_routing_aliases",
+    "verified_object_aliases",
+    "source_contexts",
+    "node_draft_indices",
+}
+_WRITE_ARGUMENT_FIELDS = {
+    "session_id", "text", "messages", "agent_id", "client_request_id", "force_extract", "wait",
 }
 _REVIEWED_SKILL_NOTICE = (
     "This is a published Agent Skill from the oGMemory skill catalog. "
@@ -124,7 +157,7 @@ def list_memories(
     if limit < 1 or limit > 500:
         raise ValueError("limit must be between 1 and 500")
     if cursor:
-        parsed_cursor = parse_ogmemory_uri(cursor)
+        parsed_cursor = parse_ogmemory_uri(cursor.partition("#")[0])
         if parsed_cursor.kind != "item" or parsed_cursor.memory_type == "skill":
             raise ValueError("cursor must reference an ogmemory:// memory item")
 
@@ -261,7 +294,8 @@ def _memory_list_cursor_key(context_fs: Any, cursor: str | None, ctx: Any) -> st
         stored_cursor = f"{stored_cursor.rsplit('/', 1)[0]}/{stored_name}"
     elif "%" in public_cursor.rsplit("/", 1)[-1]:
         stored_cursor = next(
-            (uri for uri in cursor_uris if context_fs.exists(uri, ctx)),
+            (uri for uri in iter_internal_uri_candidates(public_cursor, ctx, context_fs)
+             if context_fs.exists(uri, ctx)),
             stored_cursor,
         )
     order_key = getattr(context_fs, "list_node_order_key", lambda uri: uri)
@@ -1320,7 +1354,7 @@ def read_memory(
         context_fs = service._get_context_fs()
         last_exc: Exception | None = None
         node = None
-        for internal_uri in external_to_internal_uri_candidates(uri, ctx):
+        for internal_uri in iter_internal_uri_candidates(uri, ctx, context_fs):
             try:
                 needs_full_node = unit_key is not None or (
                     level == "overview" and parsed.memory_type in {"tool_memory", "tool_evidence", "experience"})
@@ -1410,7 +1444,8 @@ def delete_memory(
     try:
         last_exc: Exception | None = None
         result = None
-        for internal_uri in external_to_internal_uri_candidates(uri, ctx):
+        context_fs = getattr(service, "_get_context_fs", lambda: None)()
+        for internal_uri in iter_internal_uri_candidates(uri, ctx, context_fs):
             try:
                 result = service.forget_memory(
                     internal_uri,
@@ -1529,8 +1564,8 @@ def _truncate_query_payload(payload: dict[str, Any], max_chars: int) -> dict[str
                 row[field] = value[: max(0, remaining)]
                 truncated = True
                 remaining = 0
-                break
-            remaining -= len(value)
+            else:
+                remaining -= len(value)
         if isinstance(row.get("grounding"), list):
             sources = row["grounding"]
             row["grounding"], used = _bounded_grounding(sources, remaining)
@@ -1955,12 +1990,18 @@ def write_memory(
     }
 
 
+def validate_write_arguments(arguments: Mapping[str, Any]) -> None:
+    unknown = sorted(set(arguments) - _WRITE_ARGUMENT_FIELDS)
+    if unknown:
+        raise ValueError(f"write_memory cannot set unsupported fields: {', '.join(unknown)}")
+
+
 def _normalize_write_messages(
     *,
     text: str | None,
     messages: list[dict[str, Any]] | None,
 ) -> list[dict[str, Any]]:
-    if text and messages:
+    if text is not None and messages is not None:
         raise ValueError("Provide either text or messages, not both")
     if text is not None:
         if not text.strip():

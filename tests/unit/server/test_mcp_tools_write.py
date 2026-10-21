@@ -184,14 +184,37 @@ def test_write_memory_requires_exactly_one_material_source():
         )
 
 
-@pytest.mark.parametrize("field", ["type", "memory_id", "abstract", "overview", "uri"])
+@pytest.mark.parametrize("field", [
+    "type", "memory_type", "memory_id", "category", "context_type", "owner_space",
+    "level", "metadata", "abstract", "overview", "uri",
+])
 def test_write_memory_rejects_atomic_memory_fields(field):
+    service = _FakeService()
     with pytest.raises(ValueError, match="cannot set atomic memory fields"):
         write_memory(
-            _FakeService(),
+            service,
             messages=[{"role": "user", "content": "hello", field: "forbidden"}],
             session_id="s1",
         )
+    assert service.after_turn_params is None
+
+
+@pytest.mark.parametrize("source", ["text", "messages"])
+def test_write_memory_preserves_json_facts_as_user_content(source):
+    service = _FakeService()
+    text = json.dumps({"uri": "catalog://item/42", "category": "book", "abstract": "A book", "content": "facts"})
+    material = {"text": text} if source == "text" else {"messages": [{"role": "user", "content": text}]}
+
+    write_memory(service, session_id="s1", **material)
+
+    assert service.after_turn_params["messages"] == [{"role": "user", "content": text}]
+
+
+def test_write_memory_rejects_both_text_and_empty_messages():
+    service = _FakeService()
+    with pytest.raises(ValueError, match="either text or messages"):
+        write_memory(service, text="Remember this", messages=[], session_id="s1")
+    assert service.after_turn_params is None
 
 
 def test_write_trace_preserves_order_identity_and_retry_event_ids():

@@ -1534,6 +1534,25 @@ def test_query_memory_stops_adding_hits_after_response_budget_is_exhausted():
     assert payload["truncated"] is True
 
 
+@pytest.mark.parametrize("budget", [1, 4, 8, 12, 512])
+def test_query_memory_bounds_all_summary_fields_after_one_field_is_clipped(budget):
+    service = _FakeService(
+        OgMemConfig(mcp_max_response_chars=budget),
+        hits=[RetrievedBlock(
+            uri="ctx://acct-1/users/alice/memories/entities/project",
+            score=0.9, category="entity", abstract="项目摘要",
+            overview="概览" * 300, content_excerpt="正文🙂" * 300, has_content=True,
+        )],
+    )
+
+    payload = query_memory(service, query="项目", top_k=1)
+
+    row = payload["hits"][0]
+    assert sum(len(row.get(field, "")) for field in ("abstract", "overview", "content_excerpt")) <= budget
+    assert row["uri"] == "ogmemory://memories/entity/project"
+    assert payload["truncated"] is True
+
+
 def test_query_memory_rejects_target_uri_style_direct_reads():
     service = _FakeService()
 
