@@ -19,6 +19,7 @@ from core.provenance_resolver import ProvenanceResolver
 from retrieval.context_reader import canonical_agent_node
 from retrieval.identity import canonical_uri
 from retrieval.owner_scope import allowed_owner_space_filter, expand_owner_space_aliases
+from retrieval.owner_scope import canonical_owner_space as _canonical_space
 from scene.candidate_index import SceneCandidateIndex
 from scene.config import SceneConfig, SceneConfigProvider
 from scene.models import SceneSnapshot
@@ -29,13 +30,6 @@ from scene.store import SceneDecisionInput, SceneEvidenceRepository
 @dataclass(frozen=True)
 class _EvidenceSnapshot(SceneSnapshot):
     evidence_fingerprints: tuple[tuple[str, str], ...] = field(default=(), compare=False)
-
-
-def _canonical_space(space: str) -> str:
-    for prefix in ("user_", "agent_"):
-        if space.startswith(prefix):
-            return space.replace(prefix, prefix[:-1] + ":", 1)
-    return space
 
 
 def _scope_context(account_id: str, owner_space: str) -> RequestContext:
