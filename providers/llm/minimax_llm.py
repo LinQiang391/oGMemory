@@ -67,6 +67,7 @@ class MiniMaxLLM(OpenAILLM):
         temperature: float = 0.7,
         max_tokens: int = 4096,
         json_mode: bool = True,
+        request_timeout_seconds: float = 120.0,
     ) -> None:
         # Read MiniMax-specific env first, then fall back to the
         # generic OpenAI env so a single OGMEM_API_KEY can power
@@ -92,6 +93,7 @@ class MiniMaxLLM(OpenAILLM):
             temperature=temperature,
             max_tokens=max_tokens,
             json_mode=json_mode,
+            request_timeout_seconds=request_timeout_seconds,
         )
 
 

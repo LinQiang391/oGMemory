@@ -103,6 +103,28 @@ pilot, not a definitive full-benchmark result.
 
 ## 模型过载重试与人脸聚类加速
 
+### 单次 LLM 请求超时
+
+M3 的 episodic、QA 和 judge 客户端继承顶层
+`llm.request_timeout_seconds`，也可以在各自的 `m3.*_llm` 中覆盖：
+
+```yaml
+llm:
+  request_timeout_seconds: 300
+m3:
+  episodic_llm:
+    request_timeout_seconds: 600
+```
+
+未配置时保留 120 秒默认值；配置值必须是正的有限数。该配置同时适用于
+OpenAI-compatible 和 MiniMax 客户端。它与 `--qa-timeout` 的控制循环时间
+预算不同，也不会扩大上下文窗口或 `max_tokens` 输出上限。SDK 内部重试
+可能进一步增加总耗时。
+
+此前 M3 模型工厂没有传递这个配置，导致 YAML 写了 300 秒，客户端仍在
+120 秒时超时。完整视频实验暴露并修复了该问题。修复只影响新建客户端，
+不会热更新正在运行的实验。
+
 ### Episodic memory：有上限的退避
 
 默认对明确的 HTTP 408、429、500、502、503、504、529 错误额外重试最多

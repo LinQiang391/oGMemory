@@ -102,6 +102,7 @@ class M3ModelConfig:
     model: str = ""
     temperature: float = 0.2
     max_tokens: int = 4096
+    request_timeout_seconds: float = 120.0
 
 
 @dataclass(frozen=True)
@@ -228,6 +229,17 @@ def load_cv_service_config(
 
 
 def _model_from_block(block: dict[str, Any], *, default_provider: str, default_model: str, default_temperature: float) -> M3ModelConfig:
+    timeout = _pick(block, "request_timeout_seconds", 120.0)
+    try:
+        if isinstance(timeout, bool):
+            raise ValueError
+        timeout = float(timeout)
+        if not math.isfinite(timeout) or timeout <= 0:
+            raise ValueError
+    except (TypeError, ValueError):
+        raise ValueError(
+            "M3 LLM request_timeout_seconds must be a positive finite number"
+        ) from None
     return M3ModelConfig(
         provider=str(_pick(block, "provider", default_provider)),
         api_key=_pick(block, "api_key"),
@@ -235,6 +247,7 @@ def _model_from_block(block: dict[str, Any], *, default_provider: str, default_m
         model=str(_pick(block, "model", default_model)),
         temperature=float(_pick(block, "temperature", default_temperature)),
         max_tokens=int(_pick(block, "max_tokens", 4096)),
+        request_timeout_seconds=timeout,
     )
 
 
