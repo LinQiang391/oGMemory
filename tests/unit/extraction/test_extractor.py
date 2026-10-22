@@ -18,7 +18,7 @@ from unittest.mock import Mock
 
 import pytest
 
-from core.errors import LLMOutputTruncatedError, ToolCallProtocolError
+from core.errors import LLMCallError, LLMOutputTruncatedError, ToolCallProtocolError
 from core.models import RequestContext, CandidateMemory
 from extraction.schemas.registry import SchemaRegistry
 from extraction.tool_builder import build_extraction_tools, build_tool_to_category
@@ -28,6 +28,27 @@ from providers.llm.mock_llm import MockLLM
 
 class TestExtractorEmptyResults:
     """Tests for Extractor with no tool calls."""
+
+    @pytest.mark.parametrize("original_error", [None, LLMCallError("output truncated")])
+    def test_lazy_llm_failure_is_not_successful_empty_extraction(self, monkeypatch, original_error):
+        from types import SimpleNamespace
+        loop = Mock()
+        loop.run.return_value = SimpleNamespace(
+            finish_reason="llm_error", llm_error=original_error, candidates=[],
+        )
+        monkeypatch.setattr(
+            "extraction.extraction_react_loop.ExtractionReActLoop",
+            Mock(return_value=loop),
+        )
+        extractor = Extractor(MockLLM(), mode="lazy")
+        extractor._structure_span_eager = Mock()
+        ctx = RequestContext(account_id="a", user_id="u", agent_id="g",
+                             session_id="s", trace_id="t")
+        with pytest.raises(LLMCallError) as error:
+            extractor._structure_span_lazy(_Span(start=0, end=0), "prompt", ctx)
+        if original_error is not None:
+            assert error.value is original_error
+        extractor._structure_span_eager.assert_not_called()
 
     @pytest.mark.parametrize("message_count", [1, 3])
     def test_span_prompt_and_schema_bound_outer_message_indices(self, message_count):

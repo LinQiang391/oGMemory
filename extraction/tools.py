@@ -32,6 +32,7 @@ from core.candidate_dedup import (
 )
 from core.errors import (
     ExtractionIncompleteError,
+    LLMCallError,
     LLMOutputTruncatedError,
     OperationDeadlineExceededError,
     ToolCallProtocolError,
@@ -1511,6 +1512,12 @@ class Extractor:
                 internal_tool_usage_tracker=self._internal_tool_usage_tracker,
             )
             result = loop.run(prompt, ctx, prefetch_result)
+            if result.finish_reason == "llm_error":
+                # ReactLoop returns failures as data. Do not turn a truncated
+                # or failed model call into a successful zero-memory ingest.
+                raise result.llm_error or LLMCallError(
+                    "Lazy extraction terminated due to an LLM failure"
+                )
             logger.info(
                 f"ReAct loop completed: {len(result.candidates)} candidates, "
                 f"{result.iterations} iterations, {len(result.read_uris)} reads"
@@ -1528,7 +1535,7 @@ class Extractor:
                 read_versions=dict(result.read_versions), read_nodes=dict(result.read_nodes),
             )
             return candidates
-        except OperationDeadlineExceededError:
+        except (LLMCallError, OperationDeadlineExceededError):
             raise
         except Exception as e:
             check_deadline()
