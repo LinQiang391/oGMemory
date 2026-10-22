@@ -4,15 +4,14 @@ from __future__ import annotations
 
 from collections.abc import Sequence
 from typing import Any
-from urllib.parse import urlsplit
 
 from jsonschema import Draft202012Validator, ValidationError
 
-from core.provenance_resolver import ProvenanceResolver
 from scene.config import SceneConfig
 from scene.decision_calls import CallBudget, SceneModelCaller
 from scene.decision_contracts import PreflightOutput, SceneEvidenceReader, SceneModelOutputError
 from scene.decision_prompts import PREFLIGHT_SYSTEM
+from scene.decision_sources import independent_sources, source_refs
 
 
 class ScenePreflight:
@@ -100,48 +99,8 @@ class ScenePreflight:
             )
         return PreflightOutput(status="READY", evidence_uris=offered)
 
-    @staticmethod
-    def _source_refs(card: dict[str, Any]) -> set[str]:
-        refs = set()
-        for key in ("source_refs", "provenance_ids"):
-            values = card.get(key, [])
-            if isinstance(values, str):
-                values = [values]
-            if isinstance(values, (list, tuple, set)):
-                refs.update(ref for ref in values if isinstance(ref, str) and ref.strip())
-        # A tool's source_ref locates the card; original provenance identifies its evidence.
-        reference = card.get("source_ref")
-        if not refs and isinstance(reference, str) and reference.strip():
-            refs.add(reference)
-        return refs
-
-    @staticmethod
-    def independent_sources(refs):
-        sources = set()
-        archive_ids = set()
-        for ref in refs:
-            try:
-                source = ProvenanceResolver.parse_id(ref)
-                kind, identifier = source["source_type"], source["source_id"]
-            except ValueError:
-                kind, identifier = "reference", ref
-            try:
-                parts = urlsplit(identifier)
-            except ValueError:
-                sources.add((kind, identifier))
-                continue
-            path = parts.path.strip("/").split("/")
-            if (kind in ("archive", "memory", "reference") and parts.scheme == "ctx" and parts.netloc
-                    and len(path) == 4 and path[0] == "sessions" and path[2] == "history"
-                    and path[1] and path[3]):
-                kind, identifier = "archive", f"ctx://{parts.netloc}/{'/'.join(path)}"
-                archive_ids.add(path[3])
-            elif (kind in ("reference", "memory", "archive") and parts.scheme == "ctx" and parts.netloc
-                    and len(path) >= 4 and path[0] in {"users", "agents"} and path[2] == "memories"):
-                kind = "memory"
-            sources.add((kind, identifier))
-        # Full archive URIs retain tenant/session scope; matching short IDs are aliases.
-        return sources - {("archive", archive_id) for archive_id in archive_ids}
+    _source_refs = staticmethod(source_refs)
+    independent_sources = staticmethod(independent_sources)
 
     @staticmethod
     def _tool_schemas() -> list[dict[str, Any]]:
