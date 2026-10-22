@@ -268,13 +268,23 @@ class OpenAILLM(LLM):
             "cache_write": cache_write,
         }
 
-    def _ensure_complete_response(self, response) -> None:
+    def _ensure_complete_response(self, response, *, kind: str = "structured") -> None:
+        """Keep dev's typed failure/deadline contract and metadata-only diagnostics."""
         check_deadline()
-        if response.choices[0].finish_reason == "length":
-            raise LLMOutputTruncatedError(
-                "LLM output exceeded the configured token limit; "
-                f"model={self._model}, max_tokens={self._max_tokens}, finish_reason=length"
-            )
+        if getattr(response.choices[0], "finish_reason", None) != "length":
+            return
+        usage = getattr(response, "usage", None)
+        details = getattr(usage, "completion_tokens_details", None)
+        message = (
+            f"LLM {kind} output truncated: exceeded the configured token limit; "
+            f"model={self._model} finish_reason=length max_tokens={self._max_tokens} "
+            f"completion_tokens={getattr(usage, 'completion_tokens', None)} "
+            f"reasoning_tokens={getattr(details, 'reasoning_tokens', None)}. "
+            "Review llm.max_tokens and llm.request_timeout_seconds; "
+            "validate a full input before retrying."
+        )
+        logger.error(message)
+        raise LLMOutputTruncatedError(message)
 
     def complete_json(self, prompt: str, schema: dict) -> dict:
         system_message = self._build_system_message(schema)
@@ -313,10 +323,29 @@ class OpenAILLM(LLM):
                 {"type": "input_audio", "input_audio": {"data": "<b64>", "format": "wav"}},
             ]}
 
-        Any ``system`` message in ``messages`` is dropped — the system
-        role is rebuilt from ``schema`` so JSON-mode guarantees hold.
+        Preserve caller system instructions (for example, which audiovisual
+        facts a memory must retain), then append the schema/output constraint.
+        JSON formatting must not silently erase the task's extraction policy.
         """
-        system_message = self._build_system_message(schema)
+        instructions = []
+        for message in messages:
+            if message.get("role") != "system":
+                continue
+            content = message.get("content")
+            if content is None:
+                continue
+            if isinstance(content, str):
+                instructions.append(content)
+            elif isinstance(content, list) and all(
+                isinstance(part, dict) and part.get("type") == "text"
+                and isinstance(part.get("text"), str) for part in content
+            ):
+                instructions.extend(part["text"] for part in content)
+            else:
+                raise ValueError("Multimodal system instructions must contain text only")
+        system_message = "\n\n".join([
+            *instructions, self._build_system_message(schema),
+        ])
         json_type = schema.get("type", "object")
         use_json_format = (
             self._json_mode
@@ -328,7 +357,7 @@ class OpenAILLM(LLM):
         for m in messages:
             role = m.get("role", "user")
             if role == "system":
-                # Schema-driven system_message is authoritative.
+                # Already retained in the combined system message above.
                 continue
             prepared.append({"role": role, "content": m.get("content")})
 
@@ -362,6 +391,7 @@ class OpenAILLM(LLM):
             **self._completion_parameters(self._temperature),
         )
         self._track_usage(response)
+        self._ensure_complete_response(response, kind="multimodal")
         content = response.choices[0].message.content
         result = self._extract_json_from_text(content or "")
         return self._validate_result(result, schema)
@@ -394,12 +424,14 @@ class OpenAILLM(LLM):
                 **self._completion_parameters(self._temperature),
             )
             self._track_usage(response)
+            self._ensure_complete_response(response, kind="multimodal")
             content = response.choices[0].message.content or ""
             result = self._extract_json_from_text(content)
             return self._validate_result(result, schema)
         except json.JSONDecodeError as e:
             raise ValueError(f"Failed to parse multimodal LLM response as JSON: {e}")
-        except (ValueError, TypeError):
+        except (LLMCallError, LLMOutputTruncatedError, LLMTransientError,
+                OperationDeadlineExceededError, UsagePersistenceError, ValueError, TypeError):
             raise
         except Exception as e:
             raise RuntimeError(f"OpenAI API error on multimodal: {e}") from e

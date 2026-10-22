@@ -660,7 +660,7 @@ def run_react_qa(args: argparse.Namespace, graph=None, embedder=None, llm=None) 
         "QA wrote %d answered records to %s (%d failed, %d skipped)",
         answered, output_path, failed, skipped,
     )
-    return 2 if failed and answered == 0 else 0
+    return 2 if failed else 0
 
 
 def parse_react_qa_args(argv: Iterable[str] | None = None) -> argparse.Namespace:

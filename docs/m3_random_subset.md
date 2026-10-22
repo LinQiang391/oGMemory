@@ -101,6 +101,25 @@ The aggregate mean is question-weighted; a per-video mean averaged across videos
 can be reported separately to give videos equal weight. This is a reproducible
 pilot, not a definitive full-benchmark result.
 
+The graph/ReAct QA driver returns exit code 2 if **any** question fails, while
+retaining completed records for targeted resume. An older implementation
+returned zero for a mixture of answered and failed questions; always inspect
+the per-question `error` and `finish_reason`, including for historical runs.
+
+Multimodal calls preserve the extraction operator's system instructions before
+appending the JSON schema requirement. The schema alone does not communicate
+the full policy for retaining speech facts, object identities, and locations.
+Responses with `finish_reason=length` are rejected before lenient JSON parsing;
+closing truncated braces must not turn an incomplete memory into a success.
+
+Repeated Search cache hits do not copy the entire evidence payload into the
+model conversation again when an identical full payload is still present there.
+The new tool message retains node references and points to that earlier tool
+call. Search results in the cache, `tools_used`, and the retrieval audit remain
+complete. If the earlier full result has been removed or changed, no compaction
+is performed. This prevents repeated cached searches from exhausting a context
+window without adding any information.
+
 ## 模型过载重试与人脸聚类加速
 
 ### 单次 LLM 请求超时

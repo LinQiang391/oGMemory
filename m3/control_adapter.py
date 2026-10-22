@@ -22,6 +22,7 @@ voice_segmentation) once those operators ship.
 
 from __future__ import annotations
 
+import json
 import logging
 import re
 import time
@@ -48,6 +49,53 @@ from m3.retrieval_core import (
 from service.graph_service import GraphService
 
 logger = logging.getLogger(__name__)
+
+
+def _compact_cached_search_messages(messages: list[dict], start_index: int) -> None:
+    """Reference duplicate evidence only when its full payload is still in history.
+
+    The search cache, tools_used results, and search_history audit stay unchanged.
+    No new or unique evidence is removed, and an absent/pruned first result
+    prevents compaction. This avoids copying many kilobytes on every cache hit.
+    """
+    groups = ("hits", "context_hits", "boundary_hits")
+    prior = []
+    for index, message in enumerate(messages):
+        if message.get("role") != "tool" or not isinstance(message.get("content"), str):
+            continue
+        try:
+            payload = json.loads(message["content"])
+        except (ValueError, TypeError):
+            continue
+        if not isinstance(payload, dict) or payload.get("evidence_payload_omitted"):
+            continue
+        values = [payload.get(group, []) for group in groups]
+        if not all(isinstance(value, list) for value in values):
+            continue
+        hits = [hit for value in values for hit in value]
+        if not hits or not all(isinstance(hit, dict) and hit.get("node_id") for hit in hits):
+            continue
+        reference = next((
+            call_id for call_id, previous in prior
+            if all(previous.get(group, []) == payload.get(group, []) for group in groups)
+        ), None)
+        if index >= start_index and payload.get("duplicate_query") and reference:
+            compact = dict(payload)
+            for group in groups:
+                compact[group] = [
+                    {key: hit[key] for key in ("node_id", "video_id", "clip_id") if key in hit}
+                    for hit in payload.get(group, [])
+                ]
+            compact["evidence_payload_omitted"] = True
+            compact["evidence_reference_tool_call_id"] = reference
+            compact["guidance"] = (
+                str(payload.get("guidance") or "")
+                + f" The identical full evidence is already present in tool result {reference}. "
+                "Refer to that earlier result; the references here are not new evidence."
+            ).strip()
+            message["content"] = json.dumps(compact, ensure_ascii=False)
+        elif message.get("tool_call_id"):
+            prior.append((message["tool_call_id"], payload))
 
 
 # ---------------------------------------------------------------------------
@@ -884,9 +932,11 @@ class OGMemoryControlAdapter(ReactLoop):
     def _execute_and_append_tool_calls(self, messages, tool_calls, tools_used,
                                        read_uris, ctx, round_id=""):
         was_answer_only = self._answer_only
+        start_index = len(messages)
         result = super()._execute_and_append_tool_calls(
             messages, tool_calls, tools_used, read_uris, ctx, round_id=round_id,
         )
+        _compact_cached_search_messages(messages, start_index)
         if self._answer_only and not was_answer_only and not self._final_answer:
             messages.append({"role": "user", "content": (
                 "Search is now closed: consecutive searches added no new evidence IDs. "

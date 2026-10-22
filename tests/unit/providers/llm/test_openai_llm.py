@@ -910,9 +910,8 @@ class TestOpenAILLMCompleteMultimodal:
         assert sent_messages[1] == messages[0]  # user multimodal content forwarded
         assert call.kwargs["response_format"] == {"type": "json_object"}
 
-    def test_complete_multimodal_drops_caller_system_messages(self, fake_client, fake_openai_ctor):
-        """Caller-supplied system messages are dropped — the schema-derived
-        system message is authoritative for JSON-mode guarantees."""
+    def test_complete_multimodal_preserves_task_instructions(self, fake_client, fake_openai_ctor):
+        """Schema formatting must not remove the memory extraction policy."""
         llm = openai_llm_module.OpenAILLM(
             api_key="test-key", model="gpt-4o", json_mode=True,
         )
@@ -920,14 +919,28 @@ class TestOpenAILLMCompleteMultimodal:
             content='{"description": "ok"}',
         )
         messages = [
-            {"role": "system", "content": "ignore me"},
+            {"role": "system", "content": "Preserve specific objects and locations from speech."},
+            {"role": "system", "content": [{"type": "text", "text": "Do not replace facts with generic room descriptions."}]},
             {"role": "user", "content": "describe"},
         ]
         llm.complete_multimodal(messages, {"type": "object"})
         sent = fake_client.chat.completions.create.call_args.kwargs["messages"]
-        # Only one system message (the schema-driven one), no caller system.
-        assert all(m["role"] != "system" or "JSON" not in m["content"]
-                   for m in sent if m.get("content") == "ignore me")
+        assert len(sent) == 2 and sent[0]["role"] == "system"
+        assert "Preserve specific objects and locations from speech." in sent[0]["content"]
+        assert "Do not replace facts with generic room descriptions." in sent[0]["content"]
+        assert "Respond ONLY with valid JSON" in sent[0]["content"]
+        assert sent[1] == messages[2]
+        assert messages[0]["content"] == "Preserve specific objects and locations from speech."
+
+    @pytest.mark.parametrize("json_mode", [True, False])
+    def test_truncated_multimodal_output_is_not_repaired_into_success(self, fake_client, json_mode):
+        llm = openai_llm_module.OpenAILLM(api_key="test-key", json_mode=json_mode)
+        fake_client.chat.completions.create.return_value = _chat_response(
+            content='{"description":"unfinished', finish_reason="length",
+        )
+        with pytest.raises(LLMOutputTruncatedError, match="multimodal output truncated"):
+            llm.complete_multimodal([{"role": "user", "content": "describe"}], {"type": "object"})
+        assert fake_client.chat.completions.create.call_count == 1
 
     def test_complete_multimodal_text_fallback_on_bad_request(
         self, fake_client, fake_openai_ctor,
@@ -951,7 +964,8 @@ class TestOpenAILLMCompleteMultimodal:
             _chat_response(content='{"description": "fallback ok"}'),
         ]
         result = llm.complete_multimodal(
-            [{"role": "user", "content": "describe"}],
+            [{"role": "system", "content": "Keep speech facts."},
+             {"role": "user", "content": "describe"}],
             {"type": "object", "properties": {"description": {"type": "string"}}},
         )
         assert result["description"] == "fallback ok"
@@ -960,6 +974,7 @@ class TestOpenAILLMCompleteMultimodal:
         # Second call has no response_format (text mode).
         second_kwargs = fake_client.chat.completions.create.call_args_list[1].kwargs
         assert "response_format" not in second_kwargs
+        assert "Keep speech facts." in second_kwargs["messages"][0]["content"]
 
 
 @pytest.mark.parametrize('json_mode', [False, True])
