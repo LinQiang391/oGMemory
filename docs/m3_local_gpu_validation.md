@@ -136,7 +136,7 @@ not the pipeline's default 16-frame setting.
 Example full-video invocation after creating an ignored local YAML:
 
 ```bash
-CUDA_VISIBLE_DEVICES=1 .venv/bin/python -m m3.run_video_pipeline \
+CUDA_VISIBLE_DEVICES=2 .venv/bin/python -m m3.run_video_pipeline \
   --config data/local_gpu_7b_20261022.yaml \
   --video data/m3/videos/robot/living_room_22.mp4 \
   --video-id living_room_22 --seconds 0 \
@@ -155,9 +155,11 @@ CUDA_VISIBLE_DEVICES=1 .venv/bin/python -m m3.run_video_pipeline \
   --set qa.params.include_neighbors=1
 ```
 
-GPU 1 also hosts the lightweight embedding service; run these stages
-sequentially and check available memory. The local 7B deployment uses
-tensor parallelism on GPU 0 and GPU 3, leaving face detection on GPU 2.
+The recorded pilot ran audio stages on GPU 1 before the text sidecar was
+deployed. For the current topology, use GPU 2 for audio alongside the idle
+face service, or stop the text sidecar before using GPU 1. Run stages
+sequentially and check available memory. Omni uses tensor parallelism on
+GPU 0 and GPU 3; the text sidecar now shares GPU 1 with embeddings.
 
 After running, check **every** stage's status and failure counts, the
 expected clip/question coverage, nonempty predictions, actual retrieval
@@ -175,19 +177,92 @@ source/configuration files are not modified.
 
 LoCoMo's `small` input has 50 questions, but this runner excludes category
 5, so the expected evaluation coverage is **35 questions**, not 50.
-The verified test uses a dedicated oGMemory instance on loopback port 4832
-and gateway on port 48544. Storage and vector indexing both use the fresh
-`ogmem_local_gpu_20261022_verified` database, not the existing application
-database. The account is `local-locomo-7b-20261022-v3`; the gateway state
-directory is `data/local_locomo_openclaw_20261022_verified`. Failed attempts
-remain in separate databases/state directories and are not mixed into the
-verified run.
 
-The test agent uses the minimal tool profile; remote automatic memory
-capture/recall remains enabled. Extraction uses local Omni-7B with
-temperature 0, JSON mode, 2048 output tokens, and a 600-second timeout.
-The ignored LoCoMo config is `configs/ogmem-local-7b.toml`, with results in
-`test_results/ogmem-local-7b-20261022-verified/`. Its judge override is local
-even though the unrelated default `env.toml` still has an external judge.
-The sibling deployment's `compose.evaluation.yaml` describes this isolated
-stack; its ignored env files contain credentials and must not be published.
+**Omni-only LoCoMo was not accepted as a completed benchmark.** Its third
+conversation truncated both 2048- and 4096-token JSON extraction outputs.
+Lazy/ReAct also hit a tool-output truncation. The lazy extractor now
+propagates that model error instead of treating an empty candidate list as
+successful extraction. These attempts remain in the `local_gpu` diagnostic
+databases/state directories; they are excluded from the final LoCoMo score.
+
+The final LoCoMo setup instead uses **local Qwen2.5-7B-Instruct-AWQ**
+(`text-7b`, port 8002) for extraction and answering, with local Omni-7B as
+judge. The text model revision is
+`b25037543e9394b818fdfca67ab2a00ecc7dd641`; both weight shards were hashed.
+It shares GPU 1 with TEI. On this T4/vLLM version, chunked prefill failed
+with a 96-KiB kernel shared-memory requirement versus a 64-KiB limit, so
+it is disabled. The separate 32768-context text deployment was validated
+by actual requests, not health checks alone.
+
+The text-model ingestion used database `ogmem_local_text7b_20261022` and
+account `local-locomo-text7b-20261022`. Failed Omni memories were not copied
+into it. All four input sessions used eager extraction, temperature 0,
+JSON mode, a 4096-token output ceiling, and a 600-second timeout.
+
+The LoCoMo runner currently hardcodes `memories: 0` in its oGMemory token
+delta helper. Do not use that printed counter as a memory-write count.
+The pre-QA SQL audit for the text-model run found 13 event memory nodes,
+4 raw session chunks, 4 summaries, 4 durable session archives, 42 vector
+rows, and no pending outbox events. All belonged to the dedicated account.
+Tracked LoCoMo code was deliberately left unchanged.
+
+### Freeze memory before QA
+
+The first text-model QA pass mistakenly retained automatic capture. It
+created 11 extra summaries and 11 extra raw session chunks from evaluation
+turns, allowing later questions to retrieve earlier answers. **Its 30/35
+judge result is excluded.**
+
+The final QA uses a separate database,
+`ogmem_local_text7b_frozen_20261022`. It was reconstructed from records
+created before the pre-QA cutoff `2026-10-22T05:30:07.776404+00:00`. The
+source memory nodes and vectors had not been updated since that cutoff.
+Only the clone was filtered; the original diagnostic database was retained.
+The copied 21 memory-related nodes, 42 vectors and 4 archives had identical
+source/clone hashes. This is a checked record-level reconstruction, not a
+PostgreSQL point-in-time recovery backup.
+
+Final gateway configuration uses `autoCapture=false`, `autoRecall=true`,
+fresh sessions, minimal tools, disabled tool-result externalization and
+disabled trace content capture. This is not a global SQL read-only mode:
+trace/usage bookkeeping can still change. After all 35 questions, SHA-256
+checks confirmed that memory content, vectors and archives were unchanged;
+the four archived user messages also exactly matched the dataset.
+
+The current isolated oGMemory endpoint is loopback port **4833**, with
+gateway **48545** and state directory
+`data/local_locomo_text_gateway_frozen_20261022`. Use the ignored config
+`configs/ogmem-local-text7b-frozen.toml`; final results are in
+`test_results/ogmem-local-text7b-frozen-20261022/`. It inherits the verified
+ingestion records, with snapshot provenance recorded separately. Run it
+with `--resume` for QA, not for a new ingestion while capture is disabled.
+
+The sibling deployment's `compose.evaluation.yaml` describes this frozen
+QA stack. Its ignored env files contain credentials and must not be
+published. The unrelated default `env.toml` still has an external judge;
+the experiment configs override it with local endpoints.
+
+## Final observed results and limits
+
+| Run | Execution coverage | Raw automatic judge result |
+| --- | --- | --- |
+| M3, Omni episodic memory + Omni QA | 15 clips, 13/13 answers and actual searches | 0.1923/1 mean |
+| M3, same memory + text-7b QA | 13/13 answers and actual searches | 0.1538/1 mean |
+| LoCoMo small, frozen memory | 4 archived input sessions, 35/35 nonempty answers, no pending failures | Omni judge: 33/35; text judge: 31/35 |
+
+**These scores are not accepted as verified accuracy.** The same 35
+LoCoMo predictions were independently passed through the two local judge
+paths, without modifying the original CSV. There were four disagreements.
+The text judge passed elementary date/number calibration but still made
+errors on real questions. For example, both judges accepted Saturday
+May 20 as the Sunday before May 25 (which was May 21); the Omni judge also
+accepted May 8 for May 7 and June 27 for the week before June 9.
+See `judge-comparison.json` and `judge-quality-findings.json` in the
+deployment results directory. Human-quality evaluation remains unresolved.
+
+The result is a completed **local integration/coverage/isolation
+validation**, not a claim of model-quality acceptance. It is one M3 video
+with four frames per clip and LoCoMo small excluding category 5, not the
+full M3/LoCoMo10 benchmarks. Relevant Python regressions passed **1611**
+tests; deployment/template tests passed **16**. API health was supplemented
+with real text, media, tool round-trip and embedding requests.
