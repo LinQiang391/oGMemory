@@ -168,6 +168,52 @@ class TestOpenAILLM:
         assert parameters["stream"] is True
         llm.token_tracker.record_llm.assert_called_once_with(
             20, 10, 0, 0, usage_known=True, model="review-model")
+
+    @pytest.mark.parametrize("use_messages", [False, True])
+    @pytest.mark.parametrize("tool_choice", ["required", "auto"])
+    @pytest.mark.parametrize("invalid_json", [False, True])
+    def test_vllm_required_output_array_error_is_protocol_only(
+        self, fake_client, use_messages, tool_choice, invalid_json,
+    ):
+        message = (
+            "1 validation error for list[function-wrap[__log_extra_fields__()]]\n"
+            "  Input should be a valid array [type=list_type, "
+            "input_value={'name': 'extract_event', 'arguments': {}}, input_type=dict]"
+        )
+        if invalid_json:
+            message = (
+                "1 validation error for list[function-wrap[__log_extra_fields__()]]\n"
+                "Invalid JSON: expected value at line 1 column 1 "
+                "[type=json_invalid, input_value='<tool>invalid</tool>', input_type=str]"
+            )
+        fake_client.chat.completions.create.side_effect = _bad_request(message)
+        llm = openai_llm_module.OpenAILLM(api_key="test-key")
+        tools = [{"name": "extract_event", "description": "Extract",
+                  "input_schema": {"type": "object"}}]
+        expected = ToolCallProtocolError if tool_choice == "required" else LLMCallError
+        with pytest.raises(expected):
+            if use_messages:
+                llm.complete_with_tools_messages(
+                    [{"role": "user", "content": "prompt"}], tools,
+                    tool_choice=tool_choice,
+                )
+            else:
+                llm.complete_with_tools("prompt", tools, tool_choice=tool_choice)
+        assert fake_client.chat.completions.create.call_count == 1
+        assert llm._required_tool_choice_capability == "unknown"
+
+    @pytest.mark.parametrize("message", [
+        "maximum context length exceeded",
+        "Invalid tool schema",
+        "Input should be a valid array [type=list_type, input_type=dict]",
+        "1 validation error for ChatCompletionRequest\n"
+        "Input should be a valid array [type=list_type, input_type=dict]",
+    ])
+    def test_request_errors_do_not_become_tool_output_errors(self, message):
+        assert not openai_llm_module.OpenAILLM._is_required_tool_output_parse_error(
+            _bad_request(message)
+        )
+
     def test_custom_request_timeout(self, fake_openai_ctor):
         openai_llm_module.OpenAILLM(api_key="test-key", request_timeout_seconds=300)
         fake_openai_ctor.assert_called_once_with(timeout=300, api_key="test-key")

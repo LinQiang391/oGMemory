@@ -843,6 +843,14 @@ class OpenAILLM(LLM):
                 raise
             except BadRequestError as e:
                 if (
+                    effective_tool_choice == "required"
+                    and self._is_required_tool_output_parse_error(e)
+                ):
+                    raise ToolCallProtocolError(
+                        "Server could not parse the generated required tool-call array",
+                        tool_choice="required",
+                    ) from e
+                if (
                     tool_choice == "required"
                     and effective_tool_choice == "required"
                     and self._is_required_tool_choice_unsupported(e)
@@ -902,6 +910,33 @@ class OpenAILLM(LLM):
         )
         return mentions_choice and mentions_required and (
             explicit_rejection or enumerates_allowed_values
+        )
+
+    @staticmethod
+    def _is_required_tool_output_parse_error(exc: BadRequestError) -> bool:
+        """Recognize vLLM's response-side FunctionDefinition list validation.
+
+        vLLM 0.10.2 can report a model-generated object instead of the required
+        tool-call array as HTTP 400. This is a protocol failure, not a rejected
+        input schema. Match the specific output validator and error type only;
+        unrelated request/auth/context errors must not trigger JSON fallback.
+        """
+        body = getattr(exc, "body", None)
+        if not isinstance(body, dict):
+            return False
+        error = body.get("error", body)
+        if not isinstance(error, dict):
+            return False
+        message = error.get("message", "")
+        return (
+            isinstance(message, str)
+            and "validation error for list[function-wrap[__log_extra_fields__()]]" in message
+            and (
+                ("Input should be a valid array [type=list_type," in message
+                 and "input_type=dict]" in message)
+                or ("Invalid JSON:" in message and "[type=json_invalid," in message
+                    and "input_type=str]" in message)
+            )
         )
 
     def complete_with_tools_messages(
@@ -965,6 +1000,14 @@ class OpenAILLM(LLM):
                 ToolCallProtocolError, UsagePersistenceError):
             raise
         except BadRequestError as e:
+            if (
+                api_tool_choice == "required"
+                and self._is_required_tool_output_parse_error(e)
+            ):
+                raise ToolCallProtocolError(
+                    "Server could not parse the generated required tool-call array",
+                    tool_choice="required",
+                ) from e
             raise LLMCallError(
                 f"OpenAI BadRequestError (400): {e}",
                 status_code=400,

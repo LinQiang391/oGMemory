@@ -681,9 +681,13 @@ class OGMemoryControlAdapter(ReactLoop):
 
         system = (
             "You are an expert video analyst answering questions about a "
-            "robot's point-of-view video. Use the [Search] tool to find "
+            "robot's point-of-view video. Use the Search function to find "
             "relevant episodic evidence in the graph memory, then call "
-            "[Answer] once you have enough to respond. Be concise — the "
+            "the Answer function once you have enough to respond. "
+            "Invoke these functions through the provided tool-call interface; "
+            "writing their names or an intended call as ordinary assistant text "
+            "does not execute a search. Do not put tool instructions, XML tags, "
+            "or code blocks in the final answer. Be concise — the "
             "evaluator scores verbatim against the ground truth.\n\n"
             "Search may return context_hits: exact neighboring clips linked by context_for. "
             "Read them for the preceding/following dialogue or action; adjacency alone "
@@ -698,7 +702,7 @@ class OGMemoryControlAdapter(ReactLoop):
             "hits first; if evidence is missing, search a different action, "
             "location, speaker, or synonym. Repeated queries reuse prior "
             "results and do not provide new evidence.\n"
-            "- Each [Search] hit has TWO fields: ``description`` (a visual "
+            "- Each Search hit has TWO fields: ``description`` (a visual "
             "summary written by the LLM) and ``speech_transcript`` (a list "
             "of {start_sec, end_sec, text} dicts from the Whisper ASR). "
             "The transcript is the strongest signal for dialogue-driven "
@@ -727,7 +731,7 @@ class OGMemoryControlAdapter(ReactLoop):
             "does not establish that mapping, and a speaker label from one "
             "clip does not establish identity across clips. State unresolved "
             "attribution instead of guessing a person or their gender.\n"
-            "- If the first [Search] returns no useful hits, broaden the "
+            "- If the first Search returns no useful hits, broaden the "
             "query with synonyms, the location, or the speaker's action "
             "before giving up."
         )

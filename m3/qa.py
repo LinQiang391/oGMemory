@@ -52,6 +52,12 @@ logger = logging.getLogger(__name__)
 # format the tool call, which lands verbatim in ``predicted_answer`` via
 # ``_parse_output``. These aren't real answers — flag them as invalid.
 _PROTOCOL_SCAFFOLDING_RE = re.compile(r"\[(Search|Answer)\]", re.IGNORECASE)
+_TOOL_CALL_LEAK_RE = re.compile(
+    r"\b(?:Search|Answer)\s*\("
+    r"|</?tool(?:s|_call)?(?:\s[^>]*)?>"
+    r'|"name"\s*:\s*"(?:Search|Answer)"',
+    re.IGNORECASE,
+)
 
 
 def _has_protocol_scaffolding(text: str) -> bool:
@@ -62,7 +68,9 @@ def _has_protocol_scaffolding(text: str) -> bool:
     depth — catches rows written by older drivers that didn't run the
     new check).
     """
-    return bool(text) and bool(_PROTOCOL_SCAFFOLDING_RE.search(text))
+    return bool(text) and bool(
+        _PROTOCOL_SCAFFOLDING_RE.search(text) or _TOOL_CALL_LEAK_RE.search(text)
+    )
 
 
 _ANSWER_TAG_RE = re.compile(r"\[Answer\]", re.IGNORECASE)
@@ -85,6 +93,8 @@ def _salvage_scaffolding(text: str) -> str:
     if not matches:
         return ""
     body = text[matches[-1].end():]
+    if _TOOL_CALL_LEAK_RE.search(body):
+        return ""
     cleaned = _PROTOCOL_SCAFFOLDING_RE.sub(" ", body)
     cleaned = re.sub(r"\s+", " ", cleaned).strip(" \t\n.-:|\\\"'")
     return cleaned

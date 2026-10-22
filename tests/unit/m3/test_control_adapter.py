@@ -186,6 +186,17 @@ def test_search_tool_schema_exposes_only_query_and_top_k(graph, embedder, llm):
     assert answer["input_schema"]["required"] == ["final_answer"]
 
 
+def test_prompt_uses_function_names_not_literal_protocol_tags(graph, embedder, llm):
+    adapter = OGMemoryControlAdapter(llm=llm, graph=graph, embedder=embedder)
+    messages = adapter._build_messages(_ctx(), M3TaskContext(question="Where?"))
+    system = messages[0]["content"]
+    assert "Search function" in system
+    assert "Answer function" in system
+    assert "provided tool-call interface" in system
+    assert "[Search]" not in system
+    assert "[Answer]" not in system
+
+
 @pytest.mark.parametrize("hits", [[], [{"description": "a bedroom"}]])
 def test_repeated_search_reuses_results_and_preserves_tool_messages(
     graph, embedder, llm, hits,

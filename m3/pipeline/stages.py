@@ -1121,6 +1121,7 @@ def voice_clustering_stage(ctx: PipelineContext, stage: StageSpec) -> StageResul
     )
     argv = [
         "--graph-store", ctx.graph_store,
+        "--account-id", ctx.account_id,
         "--output-jsonl", output_jsonl,
     ]
     if ctx.connection_string:

@@ -373,6 +373,11 @@ Analyze this conversation and identify contiguous message ranges (spans) \
 that contain personal information worth remembering.
 
 Rules:
+- There are exactly {message_count} indexed messages. Valid message indices \
+are 0 through {max_message_index}. Return at most {message_count} spans.
+- Only the outer [N] message prefixes are indices. Dialogue lines, speaker \
+names, lists, and paragraphs INSIDE one message are not additional messages. \
+Never invent an index or continue numbering beyond the supplied messages.
 - ONLY identify spans from non-assistant messages. Ignore lines starting \
 with "[N] assistant:".
 - Each span should contain a coherent unit of extractable information.
@@ -608,11 +613,23 @@ class Extractor:
         prompt = _SPAN_PROMPT.format(
             conversation=conversation,
             session_summary_block=summary_block,
+            message_count=len(messages),
+            max_message_index=max(0, len(messages) - 1),
         )
+        # A bundled chat transcript may be one user message containing many
+        # speaker turns. Bound the schema to real outer message indices so
+        # small models do not enumerate dialogue lines until token exhaustion.
+        schema = deepcopy(_SPAN_SCHEMA)
+        spans_schema = schema["properties"]["spans"]
+        spans_schema["maxItems"] = len(messages)
+        for name in ("start", "end"):
+            spans_schema["items"]["properties"][name].update(
+                minimum=0, maximum=max(0, len(messages) - 1),
+            )
 
         try:
             check_deadline()
-            result = self._llm.complete_json(prompt, schema=_SPAN_SCHEMA)
+            result = self._llm.complete_json(prompt, schema=schema)
             check_deadline()
             spans: list[_Span] = []
             n = len(messages)

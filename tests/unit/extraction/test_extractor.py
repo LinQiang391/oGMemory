@@ -22,12 +22,32 @@ from core.errors import LLMOutputTruncatedError, ToolCallProtocolError
 from core.models import RequestContext, CandidateMemory
 from extraction.schemas.registry import SchemaRegistry
 from extraction.tool_builder import build_extraction_tools, build_tool_to_category
-from extraction.tools import Extractor, _PreparedSpan, _Span
+from extraction.tools import Extractor, _PreparedSpan, _SPAN_SCHEMA, _Span
 from providers.llm.mock_llm import MockLLM
 
 
 class TestExtractorEmptyResults:
     """Tests for Extractor with no tool calls."""
+
+    @pytest.mark.parametrize("message_count", [1, 3])
+    def test_span_prompt_and_schema_bound_outer_message_indices(self, message_count):
+        llm = MockLLM()
+        llm.complete_json = Mock(return_value={"spans": []})
+        extractor = Extractor(llm)
+        messages = [{"role": "user", "content": "Alice: Hello\nBob: Hi\nAlice: I paint."}
+                    for _ in range(message_count)]
+        assert extractor._identify_spans(messages, None, "") == []
+        prompt = llm.complete_json.call_args.args[0]
+        schema = llm.complete_json.call_args.kwargs["schema"]
+        assert f"exactly {message_count} indexed messages" in prompt
+        assert "INSIDE one message are not additional messages" in prompt
+        spans = schema["properties"]["spans"]
+        assert spans["maxItems"] == message_count
+        for key in ("start", "end"):
+            assert spans["items"]["properties"][key]["minimum"] == 0
+            assert spans["items"]["properties"][key]["maximum"] == message_count - 1
+        assert "maxItems" not in _SPAN_SCHEMA["properties"]["spans"]
+        assert "maximum" not in _SPAN_SCHEMA["properties"]["spans"]["items"]["properties"]["start"]
 
     def test_default_lazy_react_timeout_is_long_enough_for_slow_tool_extraction(self):
         """Default ReAct timeout gives slow tool-calling extraction room to finish."""
