@@ -1,5 +1,5 @@
-# Copyright (c) 2026 Beijing Volcano Engine Technology Co., Ltd.
-# SPDX-License-Identifier: AGPL-3.0
+# Copyright (c) 2026 openGauss Community.
+# SPDX-License-Identifier: MulanPSL-2.0
 """Eager prefetch for existing memories before LLM extraction."""
 from __future__ import annotations
 

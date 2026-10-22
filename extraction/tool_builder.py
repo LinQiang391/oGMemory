@@ -1,5 +1,5 @@
-# Copyright (c) 2026 Beijing Volcano Engine Technology Co., Ltd.
-# SPDX-License-Identifier: AGPL-3.0
+# Copyright (c) 2026 openGauss Community.
+# SPDX-License-Identifier: MulanPSL-2.0
 """Dynamic tool definition builder from SchemaRegistry.
 
 Generates OpenAI function calling tool definitions from schema metadata.
