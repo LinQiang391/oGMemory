@@ -6,15 +6,35 @@ Direct evidence keeps a configurable score and result-slot reserve.
 
 from __future__ import annotations
 
-from collections.abc import Iterable, Sequence
+from collections.abc import Callable, Iterable, Sequence
 from dataclasses import dataclass, replace
 from math import ceil
-from typing import Protocol
+from typing import Protocol, TypeVar
 
 from core.models import RequestContext, SeedHit, TypedQuery
 from retrieval.identity import canonical_uri
 from retrieval.owner_scope import expand_owner_space_aliases
 from scene.config import SceneConfig
+
+_T = TypeVar("_T")
+
+
+def select_scene_evidence(
+    ranked: Sequence[_T], limit: int, reserve: float | None,
+    is_expanded: Callable[[_T], bool],
+) -> list[_T]:
+    """Apply evidence quotas to an already ranked candidate pool."""
+    if reserve is None:
+        return list(ranked[:limit])
+    if limit <= 0:
+        return []
+    direct, expanded = [], []
+    for item in ranked:
+        (expanded if is_expanded(item) else direct).append(item)
+    reserved = min(len(direct), ceil(limit * reserve))
+    selected = direct[:reserved] + expanded[:limit - reserved]
+    selected.extend(direct[reserved:reserved + limit - len(selected)])
+    return selected
 
 
 @dataclass(frozen=True)
@@ -135,12 +155,8 @@ class SceneRanker:
             ranked.append(replace(hit, score=score, metadata=metadata))
         ranked.sort(key=lambda item: (-item.score, item.uri))
         if limit is not None:
-            if any("member" in s.routes or "lexical" in s.routes for s in matched):
-                direct = [h for h in ranked if not h.metadata.get("scene_expanded")]
-                expanded = [h for h in ranked if h.metadata.get("scene_expanded")]
-                reserved = min(len(direct), ceil(limit * self.config.direct_evidence_reserve))
-                selected = direct[:reserved] + expanded[:limit - reserved]
-                selected.extend(direct[reserved:reserved + limit - len(selected)])
-                return SceneRanking(tuple(selected), matched)
-            ranked = ranked[:limit]
+            reserve = (self.config.direct_evidence_reserve
+                       if any("member" in s.routes or "lexical" in s.routes for s in matched) else None)
+            ranked = select_scene_evidence(
+                ranked, limit, reserve, lambda hit: bool(hit.metadata.get("scene_expanded")))
         return SceneRanking(tuple(ranked), matched)
