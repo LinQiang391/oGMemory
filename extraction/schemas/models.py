@@ -1,5 +1,3 @@
-# Copyright (c) 2026 openGauss Community.
-# SPDX-License-Identifier: MulanPSL-2.0
 """Schema data models for memory type definitions."""
 
 from dataclasses import dataclass, field

@@ -1,5 +1,3 @@
-# Copyright (c) 2026 openGauss Community.
-# SPDX-License-Identifier: MulanPSL-2.0
 """Schema-driven memory type definitions for ContextEngine."""
 
 from extraction.schemas.models import FieldType, MemoryTypeSchema, SchemaField

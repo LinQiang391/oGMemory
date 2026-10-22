@@ -1,5 +1,3 @@
-# Copyright (c) 2026 openGauss Community.
-# SPDX-License-Identifier: MulanPSL-2.0
 """Schema registry for loading and managing memory type schemas."""
 
 from logging import getLogger

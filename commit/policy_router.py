@@ -1,5 +1,3 @@
-# Copyright (c) 2026 openGauss Community.
-# SPDX-License-Identifier: MulanPSL-2.0
 """Policy router for selecting the appropriate merge policy.
 
 Routes CandidateMemory to the correct MergePolicy based on schema properties
