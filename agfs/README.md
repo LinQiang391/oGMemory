@@ -267,4 +267,4 @@ All API endpoints are prefixed with `/api/v1/`.
 
 ## License
 
-Apache License 2.0
+[Apache License 2.0](LICENSE)

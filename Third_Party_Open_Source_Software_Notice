@@ -9,6 +9,12 @@ upstream repository license files. The GNU license text comes from the SPDX Lice
 
 Copyright Notice and License Texts
 
+Software: AGFS server and Go SDK
+Scope: agfs/ (including agfs/sdk/)
+License: Apache-2.0
+Source: https://github.com/c4pt0r/agfs
+License text: agfs/LICENSE
+
 Software: psycopg2-binary 2.9.11
 Scope: Core
 License: LGPL-3.0-or-later with OpenSSL linking exception

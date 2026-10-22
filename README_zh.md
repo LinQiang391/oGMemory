@@ -807,4 +807,4 @@ ContextFS / SQL 存储 + 向量索引
 
 ## 许可证
 
-[Apache License 2.0](LICENSE) | 致谢 [OpenViking](https://github.com/volcengine/OpenViking) AGFS 文件存储层
+[Mulan PSL v2](LICENSE) | 致谢 [OpenViking](https://github.com/volcengine/OpenViking) AGFS 文件存储层
