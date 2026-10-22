@@ -46,6 +46,12 @@ Defaults follow the successful `bedroom_03` full-video setup:
 - Raw audio enabled; judge enabled. Debug logging is off to avoid large
   base64 audio payloads.
 
+The default extractor samples at 1 fps and stops after 16 frames. For a
+30-second clip this means frames at approximately 0–15 seconds, **not** uniform
+sampling across the whole clip. `--seconds 0` processes every clip of the full
+video and the audio covers complete clips, but it does not imply complete
+visual coverage. Keep this limitation explicit when interpreting results.
+
 Supported environment overrides:
 
 | Variable | Default / purpose |
@@ -82,8 +88,13 @@ before launching. Without `ASR_BASE_URL`, the full pipeline retains its
 the target machine.
 
 A fresh output directory does not isolate the SQL graph. Reusing the same
-account/database can update shared evidence; use a dedicated test database or
-account when isolation is needed. Additional runner flags can be appended, e.g.
+account/database can update shared evidence. For an independent rerun of the
+**same video**, use a dedicated test database and point both graph and vector
+configuration at it: the current clip loader's legacy IDs are derived from
+`video_id/clip_id`, and the SQL primary key is global, not account-scoped.
+Changing only the account can therefore cause a duplicate-key error rather than
+creating an isolated copy. Do not clear or rewrite the original graph to work
+around this. Additional runner flags can be appended, e.g.
 `--account-id <experiment-account>`.
 
 ## Outputs and interpretation
