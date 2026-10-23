@@ -227,6 +227,23 @@ agent_memory:
 # omitting fields here falls back to the service defaults. Used by
 # m3.config.load_m3_runtime_config (m3/qa.py, m3/run_video_pipeline.py).
 m3:
+  # Opt-in bounded QA context. Output reservation comes from qa_llm.max_tokens.
+  # Default counter: UTF-8 bytes + framing. Optional local tokenizer needs m3-budget.
+  # See docs/m3_bounded_context.md for source-preserving excerpt semantics.
+  qa_context:
+    enabled: false
+    context_window: 32768
+    max_input_tokens: 24000
+    safety_tokens: 2048
+    max_top_k: 16
+    max_candidates: 32
+    max_result_nodes: 24
+    max_search_calls: 8
+    max_selected_nodes: 32
+    max_passages_per_node: 32
+    # tokenizer_path: /path/to/pinned/local/tokenizer.json
+    # tokenizer_multiplier: 1.15
+
   # Multimodal per-clip episodic memory generation.
   episodic_llm:
     provider: "${LLM_PROVIDER}"

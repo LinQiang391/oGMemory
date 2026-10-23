@@ -514,6 +514,7 @@ def run_react_qa(args: argparse.Namespace, graph=None, embedder=None, llm=None) 
             config_path=args.config,
         )
 
+    from m3.context_budget import load_context_budget
     adapter = OGMemoryControlAdapter(
         llm=llm,
         graph=graph,
@@ -528,6 +529,7 @@ def run_react_qa(args: argparse.Namespace, graph=None, embedder=None, llm=None) 
         transcript_fusion=getattr(args, "transcript_fusion", "rrf"),
         context_k=getattr(args, "context_k", 0),
         include_neighbors=getattr(args, "include_neighbors", 1),
+        context_budget=load_context_budget(args.config),
     )
 
     output_path = Path(args.output_jsonl).resolve()
