@@ -57,7 +57,9 @@ def fake_openai_ctor(monkeypatch: pytest.MonkeyPatch, fake_client: Mock) -> Mock
 
 
 class TestOpenAILLM:
-    @pytest.mark.parametrize("mode", ["structured", "text", "tools", "messages"])
+    @pytest.mark.parametrize("mode", [
+        "structured", "text", "tools", "messages", "multimodal", "multimodal_text",
+    ])
     @pytest.mark.parametrize("failure", ["timeout", "connection", 429, 500, 503])
     def test_transient_provider_failure_retains_retry_type_and_then_completes(self, fake_client, mode, failure):
         from openai import APIConnectionError, APIStatusError, APITimeoutError
@@ -72,11 +74,17 @@ class TestOpenAILLM:
         payload = '{"value":"recovered"}'
         calls = [SimpleNamespace(function=SimpleNamespace(name="extract", arguments=payload))]
         fake_client.chat.completions.create.side_effect = [error, _chat_response(content=payload, tool_calls=calls)]
-        llm = openai_llm_module.OpenAILLM(api_key="test-key", json_mode=mode == "structured")
+        llm = openai_llm_module.OpenAILLM(
+            api_key="test-key", json_mode=mode in {"structured", "multimodal"},
+        )
         schema = {"type": "object", "required": ["value"]}
         tool = {"name": "extract", "description": "Extract", "input_schema": schema}
 
         def complete():
+            if mode.startswith("multimodal"):
+                return llm.complete_multimodal(
+                    [{"role": "user", "content": "Extract"}], schema,
+                )
             if mode in {"structured", "text"}:
                 return llm.complete_json("Extract", schema)
             if mode == "tools":
@@ -201,6 +209,23 @@ class TestOpenAILLM:
                 llm.complete_with_tools("prompt", tools, tool_choice=tool_choice)
         assert fake_client.chat.completions.create.call_count == 1
         assert llm._required_tool_choice_capability == "unknown"
+
+    @pytest.mark.parametrize("tools", [None, []])
+    def test_no_tools_request_does_not_classify_required_output_error(self, fake_client, tools):
+        error = _bad_request(
+            "1 validation error for list[function-wrap[__log_extra_fields__()]]\n"
+            "Input should be a valid array [type=list_type, input_type=dict]"
+        )
+        fake_client.chat.completions.create.side_effect = error
+        llm = openai_llm_module.OpenAILLM(api_key="test-key")
+        with pytest.raises(LLMCallError) as caught:
+            llm.complete_with_tools_messages(
+                [{"role": "user", "content": "Finish"}], tools, tool_choice="required",
+            )
+        assert caught.value.status_code == 400
+        request = fake_client.chat.completions.create.call_args.kwargs
+        assert "tools" not in request
+        assert "tool_choice" not in request
 
     @pytest.mark.parametrize("message", [
         "maximum context length exceeded",
@@ -935,11 +960,38 @@ class TestOpenAILLMCompleteMultimodal:
     @pytest.mark.parametrize("json_mode", [True, False])
     def test_truncated_multimodal_output_is_not_repaired_into_success(self, fake_client, json_mode):
         llm = openai_llm_module.OpenAILLM(api_key="test-key", json_mode=json_mode)
-        fake_client.chat.completions.create.return_value = _chat_response(
+        response = _chat_response(
             content='{"description":"unfinished', finish_reason="length",
         )
-        with pytest.raises(LLMOutputTruncatedError, match="multimodal output truncated"):
+        response.usage = SimpleNamespace(
+            prompt_tokens=100, completion_tokens=4096,
+            completion_tokens_details=SimpleNamespace(reasoning_tokens=4000),
+        )
+        fake_client.chat.completions.create.return_value = response
+        with pytest.raises(LLMOutputTruncatedError, match="multimodal output truncated") as caught:
             llm.complete_multimodal([{"role": "user", "content": "describe"}], {"type": "object"})
+        assert "completion_tokens=4096" in str(caught.value)
+        assert "reasoning_tokens=4000" in str(caught.value)
+        assert fake_client.chat.completions.create.call_count == 1
+
+    @pytest.mark.parametrize("json_mode", [True, False])
+    def test_multimodal_keeps_deadline_error_after_response(self, fake_client, monkeypatch, json_mode):
+        from core.errors import OperationDeadlineExceededError
+
+        llm = openai_llm_module.OpenAILLM(api_key="test-key", json_mode=json_mode)
+        deadline = OperationDeadlineExceededError("response arrived after deadline")
+        response = _chat_response(content='{"description":"complete"}')
+
+        def complete(**kwargs):
+            def expired():
+                raise deadline
+            monkeypatch.setattr(openai_llm_module, "check_deadline", expired)
+            return response
+
+        fake_client.chat.completions.create.side_effect = complete
+        with pytest.raises(OperationDeadlineExceededError) as caught:
+            llm.complete_multimodal([{"role": "user", "content": "describe"}], {"type": "object"})
+        assert caught.value is deadline
         assert fake_client.chat.completions.create.call_count == 1
 
     def test_complete_multimodal_text_fallback_on_bad_request(

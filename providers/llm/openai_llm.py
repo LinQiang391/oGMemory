@@ -1033,7 +1033,7 @@ class OpenAILLM(LLM):
             raise
         except BadRequestError as e:
             if (
-                api_tool_choice == "required"
+                tool_parameters.get("tool_choice") == "required"
                 and self._is_required_tool_output_parse_error(e)
             ):
                 raise ToolCallProtocolError(
