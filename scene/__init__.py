@@ -17,7 +17,10 @@ from scene.jobs import (
     SceneJobStatus,
     SceneJobStore,
     SceneLeaseLostError,
+    SceneWorker,
+    SceneWorkerOutcome,
 )
+from scene.manager import SceneMemoryManager
 from scene.models import SceneCluster, SceneContribution
 from scene.retrieval import (
     SceneEvidenceSearchSource,
@@ -27,6 +30,7 @@ from scene.retrieval import (
     SceneRanking,
     SceneSearchSource,
 )
+from scene.service import SceneService
 from scene.store import (
     SceneEvidenceRepository,
     SceneNodeSource,
@@ -38,6 +42,8 @@ from scene.store import (
 __all__ = [
     "CanonicalSceneAdapter",
     "SceneDecisionEngine",
+    "SceneMemoryManager",
+    "SceneService",
     "SceneCluster",
     "SceneContribution",
     "SceneNodeSource",
@@ -56,6 +62,8 @@ __all__ = [
     "SceneJobStatus",
     "SceneJobStore",
     "SceneLeaseLostError",
+    "SceneWorker",
+    "SceneWorkerOutcome",
     "InMemorySceneJobStore",
     "SceneHit",
     "SceneRanking",
