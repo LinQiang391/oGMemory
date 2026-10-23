@@ -26,10 +26,12 @@ def test_scene_imports_from_built_wheel(tmp_path):
             "from scene.decision_evidence import SceneEvidenceBuilder; "
             "from scene.decision_calls import CallBudget, SceneModelCaller; "
             "from scene.decision_preflight import ScenePreflight; "
+            "from scene.decision_proposal import SceneProposalStage; "
             "from scene.decision_prompts import QUALITY_PROMPT; "
             "assert SceneEvidenceBuilder().limits.max_input_nodes == 128; "
             "assert CallBudget(3).remaining == 3; "
             "assert ScenePreflight(SceneModelCaller(None)).config.max_react_rounds == 2; "
+            "assert SceneProposalStage(SceneModelCaller(None)).config.max_members_per_scene == 64; "
             "assert PreflightOutput(status='READY').status == 'READY'; "
             "assert QUALITY_PROMPT.endswith('PROPOSAL:\\n'); print(scene.__name__)",
         ],

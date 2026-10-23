@@ -57,6 +57,8 @@ EVIDENCE PACKET:
 """
 
 QUALITY_PROMPT = """Validate this scene proposal against its source evidence.
+Scene membership is defined by draft.member_uris. Use provenance_context and
+tool_evidence to trace those members to their original sources and verify support.
 Check that selected evidence supports one specific thread, each member has a
 supporting passage, and the title, description and boundary express that thread.
 Check CREATE against existing event/goal identities and UPDATE/MERGE against the
