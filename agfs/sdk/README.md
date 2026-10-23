@@ -177,4 +177,4 @@ go test -v
 
 ## License
 
-See the LICENSE file in the root of the repository.
+[Apache License 2.0](../LICENSE)

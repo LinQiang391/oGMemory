@@ -7,7 +7,7 @@ name = "context-engine"
 version = "0.1.0"
 description = "Long-term memory infrastructure for AI Agents"
 readme = "README.md"
-license = { text = "Apache-2.0" }
+license = { text = "MulanPSL-2.0" }
 requires-python = ">=3.11"
 authors = [
     { name = "ContextEngine Team" }
@@ -16,7 +16,7 @@ keywords = ["ai", "agents", "memory", "llm", "rag"]
 classifiers = [
     "Development Status :: 3 - Alpha",
     "Intended Audience :: Developers",
-    "License :: OSI Approved :: Apache Software License",
+    "License :: OSI Approved :: Mulan Permissive Software License v2 (MulanPSL-2.0)",
     "Programming Language :: Python :: 3.11",
     "Programming Language :: Python :: 3.12",
     "Topic :: Scientific/Engineering :: Artificial Intelligence",

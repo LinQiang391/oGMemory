@@ -789,4 +789,4 @@ Evaluated on [LoCoMo](https://arxiv.org/abs/2402.10790) long-context conversatio
 
 ## License
 
-[Apache License 2.0](LICENSE)
+[Mulan PSL v2](LICENSE)
