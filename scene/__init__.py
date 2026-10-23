@@ -10,6 +10,7 @@ from scene.config import (
     SceneConfigProvider,
     SceneConfigSnapshot,
 )
+from scene.decision import SceneDecisionEngine
 from scene.jobs import (
     InMemorySceneJobStore,
     SceneJob,
@@ -36,6 +37,7 @@ from scene.store import (
 
 __all__ = [
     "CanonicalSceneAdapter",
+    "SceneDecisionEngine",
     "SceneCluster",
     "SceneContribution",
     "SceneNodeSource",
