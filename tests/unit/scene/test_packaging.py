@@ -27,6 +27,7 @@ def test_scene_imports_from_built_wheel(tmp_path):
             "from scene.decision_calls import CallBudget, SceneModelCaller; "
             "from scene.decision_preflight import ScenePreflight; "
             "from scene.decision_proposal import SceneProposalStage; "
+            "from scene.decision_application import SceneDecisionApplier; "
             "from scene.decision_prompts import QUALITY_PROMPT; "
             "assert SceneEvidenceBuilder().limits.max_input_nodes == 128; "
             "assert CallBudget(3).remaining == 3; "
