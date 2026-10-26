@@ -1,13 +1,21 @@
 THIRD PARTY OPEN SOURCE SOFTWARE NOTICE
 
-This notice identifies the third-party open source packages declared as runtime
-dependencies of oGMemory in pyproject.toml, including the two optional backends.
-Versions below are the resolved versions in uv.lock on this branch. Copyright
-and license rights remain with the respective owners. The license texts below
-are reproduced from package distributions; pyagfs and chromadb use their
-upstream repository license files. The GNU license text comes from the SPDX License List.
+This notice covers oGMemory's direct runtime dependencies, optional dependencies,
+and embedded third-party components. Python package versions below are the
+resolved versions in uv.lock on this branch. Copyright and license rights remain
+with the respective owners. Package license texts are reproduced from the
+corresponding distributions; pyagfs and chromadb use their upstream repository
+license files. AGFS has its own license in agfs/LICENSE. The GNU license text
+comes from the SPDX License List. This is not a complete transitive-dependency
+inventory.
 
 Copyright Notice and License Texts
+
+Software: AGFS server and Go SDK
+Scope: agfs/ (including agfs/sdk/)
+License: Apache-2.0
+Source: https://github.com/c4pt0r/agfs
+License text: agfs/LICENSE
 
 Software: psycopg2-binary 2.9.11
 Scope: Core
@@ -100,11 +108,11 @@ License: Apache-2.0
 Source: https://pypi.org/project/nltk/3.9.4/
 License text: Apache License, Version 2.0 (common text below)
 
-Software: mcp 1.28.1
+Software: mcp 2.0.0
 Scope: Core
 License: MIT
-Source: https://pypi.org/project/mcp/1.28.1/
-License text: mcp 1.28.1 section below
+Source: https://pypi.org/project/mcp/2.0.0/
+License text: mcp 2.0.0 section below
 
 Software: chromadb 1.5.7
 Scope: Optional (chroma)
@@ -118,6 +126,24 @@ Scope: Optional (sentence-transformers)
 License: Apache-2.0
 Source: https://pypi.org/project/sentence-transformers/5.4.0/
 License text: Apache License, Version 2.0 (common text below)
+
+Software: pydantic 2.12.5
+Scope: Core
+License: MIT
+Source: https://pypi.org/project/pydantic/2.12.5/
+License text: pydantic 2.12.5 section below
+
+Software: jsonschema 4.26.0
+Scope: Core
+License: MIT
+Source: https://pypi.org/project/jsonschema/4.26.0/
+License text: jsonschema 4.26.0 section below
+
+Software: deepagents 0.7.23
+Scope: Optional (deepagents)
+License: MIT
+Source: https://pypi.org/project/deepagents/0.7.23/
+License text: deepagents 0.7.23 section below
 
 LICENSE TEXTS
 
@@ -601,8 +627,78 @@ LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
 OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 SOFTWARE.
 
-mcp 1.28.1
-----------
+pydantic 2.12.5
+---------------
+The MIT License (MIT)
+
+Copyright (c) 2017 to present Pydantic Services Inc. and individual contributors.
+
+Permission is hereby granted, free of charge, to any person obtaining a copy
+of this software and associated documentation files (the "Software"), to deal
+in the Software without restriction, including without limitation the rights
+to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+copies of the Software, and to permit persons to whom the Software is
+furnished to do so, subject to the following conditions:
+
+The above copyright notice and this permission notice shall be included in all
+copies or substantial portions of the Software.
+
+THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+SOFTWARE.
+
+jsonschema 4.26.0
+-----------------
+Copyright (c) 2012 Julian Berman
+
+Permission is hereby granted, free of charge, to any person obtaining a copy
+of this software and associated documentation files (the "Software"), to deal
+in the Software without restriction, including without limitation the rights
+to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+copies of the Software, and to permit persons to whom the Software is
+furnished to do so, subject to the following conditions:
+
+The above copyright notice and this permission notice shall be included in
+all copies or substantial portions of the Software.
+
+THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN
+THE SOFTWARE.
+
+deepagents 0.7.23
+-----------------
+MIT License
+
+Copyright (c) LangChain, Inc.
+
+Permission is hereby granted, free of charge, to any person obtaining a copy
+of this software and associated documentation files (the "Software"), to deal
+in the Software without restriction, including without limitation the rights
+to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+copies of the Software, and to permit persons to whom the Software is
+furnished to do so, subject to the following conditions:
+
+The above copyright notice and this permission notice shall be included in all
+copies or substantial portions of the Software.
+
+THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+SOFTWARE.
+
+mcp 2.0.0
+---------
 MIT License
 
 Copyright (c) 2024 Anthropic, PBC

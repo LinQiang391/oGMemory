@@ -766,4 +766,4 @@ See [SWE-bench Lite testing guide and scripts](benchmarks/swebench/README.md) fo
 
 ## License
 
-[Apache License 2.0](LICENSE)
+[Mulan PSL v2](LICENSE)
