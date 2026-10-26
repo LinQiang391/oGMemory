@@ -699,10 +699,10 @@ def test_vector_db_env_vars_renamed_with_legacy_alias(monkeypatch):
 
     # The new name wins over the legacy alias.
     monkeypatch.setenv("VECTOR_DB_CONNECTION_STRING", "host=new dbname=vec")
-    monkeypatch.setenv("VECTOR_DB_TABLE_NAME", "m3_vectors")
+    monkeypatch.setenv("VECTOR_DB_TABLE_NAME", "text_vectors")
     cfg = OgMemConfig.load("unused.yaml")
     assert cfg.opengauss_connection_string == "host=new dbname=vec"
-    assert cfg.opengauss_table_name == "m3_vectors"
+    assert cfg.opengauss_table_name == "text_vectors"
     # Untouched legacy value still applies for fields without a new-name
     # counterpart set.
     assert cfg.opengauss_dimension == 768

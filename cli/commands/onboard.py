@@ -13,7 +13,7 @@ from cli.lib.prompt import confirm, input_masked, input_validated, select
 # Provider defaults
 PROVIDER_DEFAULTS = {
     "openai": {"base_url": "https://api.openai.com/v1", "model": "gpt-4o-mini", "embedding_model": "text-embedding-ada-002", "embedding_dim": 1536},
-    "volcengine": {"base_url": "https://ark.cn-beijing.volces.com/api/v3", "model": "doubao-seed-2-0-code-preview-260215", "embedding_model": "doubao-embedding-vision-250615", "embedding_dim": 1024},
+    "volcengine": {"base_url": "https://ark.cn-beijing.volces.com/api/v3", "model": "doubao-seed-2-0-code-preview-260215"},
     "dashscope": {"base_url": "https://dashscope.aliyuncs.com/compatible-mode/v1", "model": "qwen-plus", "embedding_model": "text-embedding-v3", "embedding_dim": 1024},
     "zhipu": {"base_url": "https://open.bigmodel.cn/api/paas/v4", "model": "glm-4-flash", "embedding_model": "embedding-3", "embedding_dim": 2048},
     "mock": {"base_url": "", "model": "mock", "embedding_model": "mock", "embedding_dim": 1024},
@@ -47,8 +47,8 @@ def _step2_llm(args) -> dict:
     else:
         providers = list(PROVIDER_DEFAULTS.keys())
         if getattr(args, "mode", None) == "docker":
-            from cli.lib.deploy_helpers import QUICKSTART_EMBEDDING_PROVIDERS
-            providers = [provider for provider in providers if provider in QUICKSTART_EMBEDDING_PROVIDERS]
+            from cli.lib.deploy_helpers import QUICKSTART_LLM_PROVIDERS
+            providers = [provider for provider in providers if provider in QUICKSTART_LLM_PROVIDERS]
         previous = getattr(args, "provider", None)
         if previous and previous not in providers:
             providers.append(previous)
@@ -70,15 +70,17 @@ def _step2_llm(args) -> dict:
 
 def _embedding_adapter(provider: str) -> str:
     adapter = {"zhipu": "openai", "dashscope": "openai"}.get(provider, provider)
-    if adapter not in {"openai", "openai-cached", "volcengine", "st", "mock"}:
+    if adapter not in {"openai", "openai-cached", "st", "mock"}:
         raise ValueError("Unsupported embedding provider; use openai for an OpenAI-compatible API")
     return adapter
 
 
 def _step3_embedding(args, llm_config: dict) -> dict:
     _print_header(4, "Embedding Configuration")
+    llm_supports_embedding = "embedding_model" in PROVIDER_DEFAULTS.get(llm_config["provider"], {})
+    default_provider = llm_config["provider"] if llm_supports_embedding else "openai"
     if args.non_interactive:
-        provider = args.embedding_provider or llm_config["provider"]
+        provider = args.embedding_provider or default_provider
         model = args.embedding_model or PROVIDER_DEFAULTS.get(provider, {}).get("embedding_model", "")
         defaults = PROVIDER_DEFAULTS.get(provider, {})
         dim = getattr(args, "embedding_dimension", None) or defaults.get("embedding_dim", 1024)
@@ -91,7 +93,7 @@ def _step3_embedding(args, llm_config: dict) -> dict:
         )
     else:
         same_default = all(getattr(args, "embedding_" + key, None) in (None, llm_config.get(key)) for key in ("provider", "base_url", "api_key"))
-        same = confirm("Use same provider for embedding?", default=same_default)
+        same = llm_supports_embedding and confirm("Use same provider for embedding?", default=same_default)
         if same:
             provider = llm_config["provider"]
         elif getattr(args, "mode", None) == "docker":
@@ -99,7 +101,7 @@ def _step3_embedding(args, llm_config: dict) -> dict:
             providers = list(QUICKSTART_EMBEDDING_PROVIDERS)
             provider = providers[select("Embedding provider:", providers)]
         else:
-            provider = input_validated("Embedding provider", getattr(args, "embedding_provider", None) or llm_config["provider"])
+            provider = input_validated("Embedding provider", getattr(args, "embedding_provider", None) or default_provider)
         defaults = PROVIDER_DEFAULTS.get(provider, {})
         keep = provider == getattr(args, "embedding_provider", None)
         model = input_validated("Embedding model", (getattr(args, "embedding_model", None) if keep else None) or defaults.get("embedding_model", ""))

@@ -549,61 +549,6 @@ def test_index_cached_batch_attributes_each_input(ledger):
     )
 
 
-@pytest.mark.parametrize("kind", ["multimodal", "volcengine"])
-@pytest.mark.parametrize(
-    "usage,expected,missing",
-    [
-        ({}, 0, 1),
-        ({"total_tokens": None}, 0, 1),
-        ({"total_tokens": 0}, 0, 0),
-        ({"prompt_tokens": 7}, 7, 0),
-        ({"total_tokens": None, "prompt_tokens": 7}, 7, 0),
-    ],
-)
-def test_embedding_usage_fields_and_per_input_owners(
-    ledger, monkeypatch, kind, usage, expected, missing
-):
-    import httpx
-
-    from providers.embedder.openai_embedder import OpenAIEmbedder
-    from providers.embedder.volcengine_embedder import VolcengineEmbedder
-    from providers.token_tracker import TokenTracker, distributed_usage_scope
-
-    _, store, account = ledger
-    if kind == "multimodal":
-        provider = OpenAIEmbedder(
-            api_key="test", base_url="http://test/v1", model="test", dimension=2, multimodal=True
-        )
-        client = httpx.Client(
-            transport=httpx.MockTransport(
-                lambda req: httpx.Response(
-                    200, json={"usage": usage, "data": {"embedding": [1.0, 2.0]}}
-                )
-            )
-        )
-        monkeypatch.setattr(httpx, "Client", lambda **kwargs: client)
-    else:
-        provider = object.__new__(VolcengineEmbedder)
-        provider._model_name = "test"
-        provider._dimension = 2
-        provider.token_tracker = TokenTracker("test")
-        provider._client = SimpleNamespace(
-            multimodal_embeddings=SimpleNamespace(
-                create=lambda **kw: SimpleNamespace(
-                    usage=usage, data=SimpleNamespace(embedding=[1.0, 2.0])
-                )
-            )
-        )
-    provider.token_tracker.set_usage_store(store)
-    inputs = [((tenant, "user:alice"), 1) for tenant in (account, account + "-other")]
-    with distributed_usage_scope(dict(inputs), inputs=inputs):
-        assert provider.embed_texts(["a", "b"]) == [[1.0, 2.0], [1.0, 2.0]]
-    for tenant in (account, account + "-other"):
-        totals = store.metrics(1, tenant)["cumulative"]
-        assert totals["embedding"] == {"calls": 1, "total_tokens": expected}
-        assert totals["missing_usage_calls"] == missing
-
-
 def test_database_handshake_deadline_releases_connection_capacity(ledger):
     from fs.sql_adapter.pool import SharedConnectionPool
 

@@ -50,7 +50,6 @@ embedding:
   model: "text-embedding-v4"
   base_url: "${LLM_BASE_URL}"
   api_key: "${LLM_API_KEY}"
-  multimodal: false                 # 仅火山引擎需设为 true
   # api_key_command:
   #   command: ["/usr/local/bin/op", "read", "op://team/ogmemory/embedding-api-key"]
   # st_model: "BAAI/bge-large-en-v1.5"

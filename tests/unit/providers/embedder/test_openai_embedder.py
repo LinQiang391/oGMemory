@@ -280,55 +280,6 @@ class TestOpenAIEmbedder:
 
         assert embedder._get_model_dimension("unknown") == openai_embedder_module.ADA_002_DIM
 
-    def test_multimodal_deadline_budget_is_shared_across_subrequests(self, monkeypatch):
-        class Clock:
-            now = 0.0
-
-            def monotonic(self):
-                return self.now
-
-        class Response:
-            def raise_for_status(self):
-                return None
-
-            def json(self):
-                return {"data": {"embedding": [0.1, 0.2]}}
-
-        class HttpClient:
-            request_timeouts = []
-
-            def __init__(self, *, timeout):
-                assert timeout == 120.0
-
-            def __enter__(self):
-                return self
-
-            def __exit__(self, *args):
-                return False
-
-            def post(self, url, *, json, headers, timeout):
-                del url, json, headers
-                self.request_timeouts.append(timeout)
-                clock.now += 4.0
-                return Response()
-
-        import httpx
-
-        clock = Clock()
-        embedder = openai_embedder_module.OpenAIEmbedder(
-            api_key="test-key",
-            multimodal=True,
-            dimension=2,
-        )
-        monkeypatch.setattr(openai_embedder_module.time, "monotonic", clock.monotonic)
-        monkeypatch.setattr(httpx, "Client", HttpClient)
-
-        result = embedder.embed_texts_with_timeout(["one", "two"], timeout_seconds=10.0)
-
-        assert result == [[0.1, 0.2], [0.1, 0.2]]
-        assert HttpClient.request_timeouts == [10.0, 6.0]
-
-
 class TestCachedOpenAIEmbedder:
     def test_inherited_deadline_capability_dispatches_through_cached_override(
         self,

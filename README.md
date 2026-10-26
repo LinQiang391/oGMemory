@@ -421,8 +421,8 @@ ogmem onboard --non-interactive --mode docker --provider openai --api-key "$LLM_
 
 This non-interactive command starts containers after preflight. To generate configuration
 and start later, run `ogmem onboard --mode docker` and decline immediate startup.
-Docker supports OpenAI, Volcengine, DashScope and Zhipu; DashScope/Zhipu embeddings
-use the OpenAI-compatible adapter with the supplied endpoint and credentials.
+Docker LLMs support OpenAI, Volcengine, DashScope and Zhipu. Text embeddings
+use the OpenAI-compatible adapter with their configured endpoint and credentials.
 Mock providers are available in local mode only.
 Zhipu's default `embedding-3` configuration uses its native 2048 dimensions.
 The configured embedding dimension must match the service's returned vectors;

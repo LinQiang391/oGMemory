@@ -13,11 +13,9 @@ from cli.lib.local_runtime import private_write
 
 logger = logging.getLogger(__name__)
 
-# These services use the quickstart's OpenAI-compatible chat API. Embedding
-# needs a separate adapter name because Volcengine uses a different protocol.
+QUICKSTART_LLM_PROVIDERS = ("openai", "volcengine", "dashscope", "zhipu")
 QUICKSTART_EMBEDDING_PROVIDERS = {
     "openai": "openai",
-    "volcengine": "volcengine",
     "dashscope": "openai",
     "zhipu": "openai",
 }
@@ -38,11 +36,14 @@ def generate_quickstart_env(
 
     llm_provider = llm_config.get("provider", "openai")
     embedding_provider = embedding_config.get("provider", "openai")
-    for kind, provider in (("LLM", llm_provider), ("Embedding", embedding_provider)):
-        if provider not in QUICKSTART_EMBEDDING_PROVIDERS:
+    for kind, provider, supported in (
+        ("LLM", llm_provider, QUICKSTART_LLM_PROVIDERS),
+        ("Embedding", embedding_provider, QUICKSTART_EMBEDDING_PROVIDERS),
+    ):
+        if provider not in supported:
             raise ValueError(
                 f"Docker quickstart does not support {kind} provider {provider!r}; "
-                "choose openai, volcengine, dashscope, or zhipu. "
+                f"choose {', '.join(supported)}. "
                 "Use local mode for mock providers."
             )
 

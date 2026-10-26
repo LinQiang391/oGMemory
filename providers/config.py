@@ -6,7 +6,6 @@ Now delegates to ``OgMemConfig`` for unified YAML + env loading.
 
 from __future__ import annotations
 
-import os
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Any, Literal
 
@@ -18,7 +17,7 @@ if TYPE_CHECKING:
     from providers.unified_config import OgMemConfig, SecretCommandSpec
 
 
-ProviderType = Literal["mock", "openai", "openai-cached", "st", "volcengine"]
+ProviderType = Literal["mock", "openai", "openai-cached", "st"]
 # Open string type allows names supplied through the vector provider registry.
 VectorDbType = str
 
@@ -75,9 +74,6 @@ class ProviderConfig:
     # Embedding output dimension. In the current design this must stay aligned
     # with the vector-index schema dimension configured for persistence.
     embedding_dimension: int = 1024
-
-    # Embedding multimodal flag
-    embedding_multimodal: bool = False
 
     # Maximum characters sent for each OpenAI-compatible embedding input.
     embedding_max_input_chars: int = 30_000
@@ -138,7 +134,6 @@ class ProviderConfig:
             openai_embedding_base_url=cfg.openai_embedding_base_url,
             openai_embedding_api_key=cfg.openai_embedding_api_key,
             openai_embedding_api_key_command=cfg.openai_embedding_api_key_command,
-            embedding_multimodal=cfg.embedding_multimodal,
             embedding_max_input_chars=cfg.embedding_max_input_chars,
             embedding_batch_size=cfg.embedding_batch_size,
             embedding_dimension=cfg.opengauss_dimension,
@@ -184,20 +179,6 @@ class ProviderConfig:
             from providers.embedder.st_embedder import SentenceTransformerEmbedder
             return SentenceTransformerEmbedder(model=self.st_model)
 
-        if ep == "volcengine":
-            from providers.embedder.volcengine_embedder import VolcengineEmbedder
-            api_key = self.effective_embedding_api_key() or os.environ.get("VOLC_API_KEY", "")
-            base_url = (self.openai_embedding_base_url
-                        or os.environ.get("VOLC_BASE_URL", "https://ark.cn-beijing.volces.com/api/coding/v3"))
-            model = os.environ.get("VOLC_EMBEDDING_MODEL",
-                                   self.openai_embedding_model or "doubao-embedding-vision-250615")
-            return VolcengineEmbedder(
-                api_key=api_key,
-                model=model,
-                base_url=base_url,
-                dimension=self.opengauss_dimension or 1024,
-            )
-
         if ep in ("openai", "openai-cached"):
             emb_url = self.openai_embedding_base_url or self.openai_base_url
             emb_key = self.effective_embedding_api_key()
@@ -209,7 +190,6 @@ class ProviderConfig:
                     model=self.openai_embedding_model,
                     dimension=self.opengauss_dimension,
                     cache_max_size=self.cache_max_size,
-                    multimodal=self.embedding_multimodal,
                     max_input_chars=self.embedding_max_input_chars,
                     batch_size=self.embedding_batch_size,
                 )
@@ -218,7 +198,6 @@ class ProviderConfig:
                 base_url=emb_url,
                 model=self.openai_embedding_model,
                 dimension=self.opengauss_dimension,
-                multimodal=self.embedding_multimodal,
                 max_input_chars=self.embedding_max_input_chars,
                 batch_size=self.embedding_batch_size,
             )
@@ -305,7 +284,6 @@ class ProviderConfig:
             openai_embedding_base_url=self.openai_embedding_base_url,
             openai_embedding_api_key=self.openai_embedding_api_key,
             openai_embedding_api_key_command=self.openai_embedding_api_key_command,
-            embedding_multimodal=self.embedding_multimodal,
             embedding_max_input_chars=self.embedding_max_input_chars,
             embedding_batch_size=self.embedding_batch_size,
             vector_db_type=self.vector_db_type,

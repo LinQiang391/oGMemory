@@ -236,7 +236,6 @@ embedding:
   model: null
   base_url: null
   api_key: null
-  multimodal: false
 
 vector_db:
   type: chroma

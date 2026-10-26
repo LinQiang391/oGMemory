@@ -40,7 +40,6 @@ embedding:
   api_key: null                  # [all] defaults to llm.api_key
   # api_key_command:
   #   command: ["/usr/local/bin/op", "read", "op://team/ogmemory/embedding-api-key"]
-  multimodal: false              # [all] true for VolcEngine /doubao embeddings
   # st_model: "BAAI/bge-m3"     # [local] Sentence Transformer local model (overrides API embedding)
 
 # ---- Vector Database [all] ----

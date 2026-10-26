@@ -73,13 +73,13 @@ def test_printed_deferred_command_matches_immediate_execution(tmp_path, monkeypa
 
 
 @pytest.mark.skipif(not HAS_BASH, reason="POSIX shell required")
-@pytest.mark.parametrize("provider,adapter", [
-    ("openai", "openai"), ("volcengine", "volcengine"),
-    ("dashscope", "openai"), ("zhipu", "openai"),
+@pytest.mark.parametrize("llm_provider,embedding_provider,adapter", [
+    ("openai", "openai", "openai"), ("volcengine", "openai", "openai"),
+    ("dashscope", "dashscope", "openai"), ("zhipu", "zhipu", "openai"),
 ])
-def test_supported_providers_pass_actual_quickstart_validation(tmp_path, provider, adapter):
+def test_supported_providers_pass_actual_quickstart_validation(tmp_path, llm_provider, embedding_provider, adapter):
     envfile = deploy_helpers.generate_quickstart_env(
-        model_config(provider), model_config(provider), output_path=tmp_path / "model.env",
+        model_config(llm_provider), model_config(embedding_provider), output_path=tmp_path / "model.env",
     )
     values = subprocess.check_output([
         "bash", "-c", 'source "$1"; printf "%s\\n" "$EMBEDDING_PROVIDER" '

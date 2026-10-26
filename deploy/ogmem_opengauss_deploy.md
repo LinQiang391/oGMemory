@@ -102,7 +102,6 @@ embedding:
   api_key: "<YOUR_EMBEDDING_API_KEY>"
   base_url: "<YOUR_EMBEDDING_BASE_URL>"
   model: "<YOUR_EMBEDDING_MODEL>"
-  multimodal: false
 
 vector_db:
   type: opengauss

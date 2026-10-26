@@ -89,7 +89,6 @@ def test_create_embedder_uses_cached_openai_factory(monkeypatch: pytest.MonkeyPa
         model="text-embedding-3-small",
         dimension=1024,  # Default opengauss_dimension
         cache_max_size=123,
-        multimodal=False,  # Default embedding_multimodal
         max_input_chars=8_000,
         batch_size=8,
     )
@@ -121,7 +120,6 @@ def test_create_embedder_uses_non_cached_openai_factory_when_cache_disabled(
         base_url=None,
         model="Qwen/Qwen3-Embedding-0.6B",
         dimension=1024,
-        multimodal=False,
         max_input_chars=8_000,
         batch_size=8,
     )

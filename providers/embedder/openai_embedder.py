@@ -76,7 +76,6 @@ class OpenAIEmbedder(Embedder):
         base_url: str | None = None,
         model: str = "text-embedding-ada-002",
         dimension: int | None = None,
-        multimodal: bool = False,
         max_input_chars: int = DEFAULT_MAX_INPUT_CHARS,
         batch_size: int = 2048,
     ):
@@ -87,7 +86,6 @@ class OpenAIEmbedder(Embedder):
             base_url: Custom base URL for compatible APIs.
             model: Embedding model name.
             dimension: Expected dimension (for validation). If None, inferred from model.
-            multimodal: Use the ``/embeddings/multimodal`` endpoint.
             max_input_chars: Maximum characters sent for each embedding input.
             batch_size: Maximum texts per request to the compatible endpoint.
         """
@@ -122,7 +120,6 @@ class OpenAIEmbedder(Embedder):
         self._base_url = base_url
         self._model = model
         self._dimension = dimension or self._get_model_dimension(model)
-        self._multimodal = multimodal
         self._max_input_chars = max_input_chars
         self._batch_size = batch_size
 
@@ -204,33 +201,27 @@ class OpenAIEmbedder(Embedder):
                 truncated.append(t)
 
         try:
-            if self._multimodal:
-                embeddings = self._embed_multimodal(
-                    truncated,
-                    timeout_seconds=None if deadline is None else deadline - time.monotonic(),
-                )
-            else:
-                embeddings = []
-                for start in range(0, len(truncated), self._batch_size):
-                    batch = truncated[start:start + self._batch_size]
-                    with embedding_input_scope(range(start, start + len(batch))):
-                        client = self._embedding_client(
-                            timeout_seconds=None if deadline is None else deadline - time.monotonic())
-                        try:
-                            response = client.embeddings.create(input=batch, model=self._model)
-                        except Exception:
-                            self.token_tracker.record_failure('embedding', deadline=deadline)
-                            raise
-                        usage = getattr(response, "usage", None)
-                        total_tokens = embedding_usage_tokens(usage)
-                        self.token_tracker.record_embed(total_tokens or 0,
-                            usage_known=total_tokens is not None, deadline=deadline)
-                        vectors = [item.embedding for item in response.data]
-                        if len(vectors) != len(batch):
-                            raise ValueError(
-                                f"Embedding count mismatch: expected {len(batch)}, got {len(vectors)}"
-                            )
-                        embeddings.extend(vectors)
+            embeddings = []
+            for start in range(0, len(truncated), self._batch_size):
+                batch = truncated[start:start + self._batch_size]
+                with embedding_input_scope(range(start, start + len(batch))):
+                    client = self._embedding_client(
+                        timeout_seconds=None if deadline is None else deadline - time.monotonic())
+                    try:
+                        response = client.embeddings.create(input=batch, model=self._model)
+                    except Exception:
+                        self.token_tracker.record_failure('embedding', deadline=deadline)
+                        raise
+                    usage = getattr(response, "usage", None)
+                    total_tokens = embedding_usage_tokens(usage)
+                    self.token_tracker.record_embed(total_tokens or 0,
+                        usage_known=total_tokens is not None, deadline=deadline)
+                    vectors = [item.embedding for item in response.data]
+                    if len(vectors) != len(batch):
+                        raise ValueError(
+                            f"Embedding count mismatch: expected {len(batch)}, got {len(vectors)}"
+                        )
+                    embeddings.extend(vectors)
         except UsagePersistenceError:
             raise
         except Exception as e:
@@ -257,63 +248,6 @@ class OpenAIEmbedder(Embedder):
         """Embed through a provider call bounded by the caller's remaining deadline."""
 
         return self.embed_texts(texts, timeout_seconds=timeout_seconds)
-
-    def _embed_multimodal(
-        self,
-        texts: list[str],
-        *,
-        timeout_seconds: float | None = None,
-    ) -> list[list[float]]:
-        """Call the /embeddings/multimodal endpoint for vision embedding models.
-
-        The multimodal endpoint treats `input` as parts of ONE embedding
-        (e.g. text + image), so each text must be a separate request.
-        """
-        import httpx
-
-        base = (self._base_url or "https://api.openai.com/v1").rstrip("/")
-        url = f"{base}/embeddings/multimodal"
-        headers = {
-            "Authorization": f"Bearer {self._api_key}",
-            "Content-Type": "application/json",
-        }
-        results: list[list[float]] = []
-        call_deadline = (
-            None
-            if timeout_seconds is None
-            else time.monotonic() + self._bounded_timeout_seconds(timeout_seconds)
-        )
-        with httpx.Client(timeout=120.0) as client:
-            for index, text in enumerate(texts):
-                request_timeout = 120.0
-                if call_deadline is not None:
-                    request_timeout = call_deadline - time.monotonic()
-                    if request_timeout <= 0.0:
-                        raise TimeoutError("embedding request deadline elapsed")
-                payload = {
-                    "model": self._model,
-                    "input": [{"type": "text", "text": text}],
-                    "dimensions": self._dimension,
-                }
-                try:
-                    resp = client.post(
-                        url, json=payload, headers=headers, timeout=request_timeout,
-                    )
-                    resp.raise_for_status()
-                except Exception:
-                    with embedding_input_scope([index]):
-                        self.token_tracker.record_failure('embedding', deadline=call_deadline)
-                    raise
-                data = resp.json()
-                total_tokens = embedding_usage_tokens(data.get('usage'))
-                with embedding_input_scope([index]):
-                    self.token_tracker.record_embed(total_tokens or 0,
-                        usage_known=total_tokens is not None, deadline=call_deadline)
-                embedding = data.get("data", {}).get("embedding", [])
-                if not embedding:
-                    raise ValueError(f"No embedding from multimodal endpoint: {data}")
-                results.append(embedding)
-        return results
 
     def _get_model_dimension(self, model: str) -> int:
         """Get expected dimension for a model."""

@@ -462,12 +462,11 @@ class OgMemConfig:
     llm_extra_body: dict[str, Any] = field(default_factory=dict)
 
     # -- Embedding -------------------------------------------------------------
-    embedding_provider: str | None = None  # Separate embedding provider (st/openai/volcengine/mock)
+    embedding_provider: str | None = None  # Separate embedding provider (st/openai/mock)
     openai_embedding_model: str = "text-embedding-ada-002"
     openai_embedding_base_url: str | None = None
     openai_embedding_api_key: str | None = None
     openai_embedding_api_key_command: SecretCommandSpec | None = field(default=None, repr=False)
-    embedding_multimodal: bool = False
     embedding_max_input_chars: int = 30_000
     embedding_batch_size: int = 2048
     st_model: str = "BAAI/bge-m3"
@@ -842,11 +841,6 @@ class OgMemConfig:
             openai_embedding_base_url=emb_base_url,
             openai_embedding_api_key=emb_api_key,
             openai_embedding_api_key_command=emb_api_key_command,
-            embedding_multimodal=_resolve_bool(
-                emb.get("multimodal"),
-                "OGMEM_EMBEDDING_MULTIMODAL",
-                False,
-            ),
             embedding_max_input_chars=_resolve(
                 emb.get("max_input_chars"),
                 "OGMEM_EMBEDDING_MAX_INPUT_CHARS",

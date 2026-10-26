@@ -63,12 +63,12 @@ llm:
   max_tokens: 4096
 
 embedding:
-  model: "doubao-embedding-vision-250615"
-  base_url: "https://ark.cn-beijing.volces.com/api/v3"
-  api_key: null              # 缺省回退到 llm.api_key
+  provider: openai
+  model: "text-embedding-v4"
+  base_url: "https://dashscope.aliyuncs.com/compatible-mode/v1"
+  api_key: "your-embedding-api-key"
   # api_key_command:
   #   command: ["/usr/local/bin/op", "read", "op://team/ogmemory/embedding-api-key"]
-  multimodal: true
 
 vector_db:
   type: memory                   # quickstart: memory; full persistence: opengauss / chroma
@@ -148,7 +148,6 @@ cache:
 | `embedding.base_url` | `OGMEM_EMBEDDING_BASE_URL` | 回退到 `llm.base_url` | 否 | Embedding API Base URL |
 | `embedding.api_key` | `OGMEM_EMBEDDING_API_KEY` | 回退到 `llm.api_key` | 否 | Embedding API Key |
 | `embedding.api_key_command` | `OGMEM_EMBEDDING_API_KEY_CMD` / `OGMEM_EMBEDDING_API_KEY_COMMAND` | 回退到 `llm.api_key` | 否 | 惰性执行命令并读取 stdout 作为 Embedding API Key。命令必须使用绝对路径，且可执行文件必须命中代码内置白名单 |
-| `embedding.multimodal` | `OGMEM_EMBEDDING_MULTIMODAL` | `false` | 否 | 使用 `/embeddings/multimodal` 端点。设为 `true` / `1` / `yes` 启用 |
 
 ### 向量数据库
 
@@ -247,9 +246,9 @@ docker run -d --name ogmemory --network host \
   -e OGMEM_API_KEY=your-api-key \
   -e OGMEM_BASE_URL=https://ark.cn-beijing.volces.com/api/coding/v3 \
   -e OGMEM_LLM_MODEL=doubao-seed-2-0-code-preview-260215 \
-  -e OGMEM_EMBEDDING_BASE_URL=https://ark.cn-beijing.volces.com/api/v3 \
-  -e OGMEM_EMBEDDING_MODEL=doubao-embedding-vision-250615 \
-  -e OGMEM_EMBEDDING_MULTIMODAL=true \
+  -e OGMEM_EMBEDDING_BASE_URL=https://dashscope.aliyuncs.com/compatible-mode/v1 \
+  -e OGMEM_EMBEDDING_MODEL=text-embedding-v4 \
+  -e OGMEM_EMBEDDING_API_KEY=your-embedding-api-key \
   -e VECTOR_DB_DIMENSION=1024 \
   -e VECTOR_DB_CONNECTION_STRING="host=127.0.0.1 port=8799 dbname=postgres user=sundechao password=xxx" \
   ogmemory:v0.9
