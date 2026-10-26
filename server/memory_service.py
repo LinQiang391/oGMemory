@@ -2524,7 +2524,13 @@ class MemoryService:
     def _get_shared_vector_index(self):
         """Lazy-init shared vector index (same instance for read + outbox worker)."""
         if self._vector_index is None:
-            vector_index = self._provider_cfg.create_vector_index()
+            if (self._use_sql and self._cfg.vector_db_type == "opengauss"
+                    and self._cfg.opengauss_connection_string == self._cfg.sql_connection_string):
+                vector_index = self._provider_cfg.create_vector_index(
+                    pool=self._get_shared_sql_pool(),
+                )
+            else:
+                vector_index = self._provider_cfg.create_vector_index()
             projection_index = vector_index
             lexical_index = None
             if getattr(self._cfg, "retrieval_hybrid_enabled", False):

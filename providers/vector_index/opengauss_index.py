@@ -123,24 +123,14 @@ class OpenGaussVectorIndex(PoolAdapterMixin, VectorIndex):
         dim = self._dimension
         conn = self._get_connection()
         try:
-            # ---- extension bootstrap (PostgreSQL + pgvector only) ----
-            # Best-effort: openGauss doesn't speak this statement and
-            # raises ``syntax error at or near "EXTENSION"``; we log
-            # and continue because openGauss ships vector(N) natively.
-            try:
-                with conn.cursor() as cur:
-                    cur.execute("CREATE EXTENSION IF NOT EXISTS vector")
-                conn.commit()
-            except Exception as exc:
-                conn.rollback()
-                # Use DEBUG so a real PG deployment without pgvector
-                # installed surfaces loudly at the next failure (the
-                # CREATE TABLE below will error on the ``vector``
-                # type) without spamming a successful openGauss boot.
-                logger.debug(
-                    "CREATE EXTENSION vector skipped (expected on openGauss): %s",
-                    exc,
-                )
+            if self.sql_dialect.name == "postgresql":
+                try:
+                    with conn.cursor() as cur:
+                        cur.execute("CREATE EXTENSION IF NOT EXISTS vector")
+                    conn.commit()
+                except Exception as exc:
+                    conn.rollback()
+                    logger.debug("CREATE EXTENSION vector unavailable: %s", exc)
             with conn.cursor() as cur:
                 cur.execute(f"""
                     CREATE TABLE IF NOT EXISTS {tbl} (
@@ -283,8 +273,9 @@ class OpenGaussVectorIndex(PoolAdapterMixin, VectorIndex):
 
         return psycopg2.connect(self._connection_string)
 
-    def _return_connection(self, conn):
-        """Return a connection to the pool, rolling back dirty transactions."""
+    @staticmethod
+    def _reset_connection(conn):
+        """End the index transaction before the connection becomes idle."""
         if conn.closed != 0:
             return
         try:
@@ -292,6 +283,17 @@ class OpenGaussVectorIndex(PoolAdapterMixin, VectorIndex):
                 conn.rollback()
         except Exception:
             conn.close()
+
+    def _return_shared_connection(self, conn):
+        try:
+            self._reset_connection(conn)
+        finally:
+            self._shared_pool.return_connection(conn)
+
+    def _return_connection(self, conn):
+        """Return a connection to the pool, rolling back dirty transactions."""
+        self._reset_connection(conn)
+        if conn.closed != 0:
             return
         if len(self._pool) < self._pool_size:
             self._pool.append(conn)
