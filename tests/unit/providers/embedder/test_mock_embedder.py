@@ -2,7 +2,7 @@
 
 import pytest
 
-from providers.embedder.mock_embedder import MockEmbedder, ZeroEmbedder, MOCK_EMBEDDING_DIM
+from providers.embedder.mock_embedder import MOCK_EMBEDDING_DIM, MockEmbedder, ZeroEmbedder
 
 
 class TestMockEmbedder:
@@ -54,6 +54,13 @@ class TestMockEmbedder:
 
         assert len(results[0]) == MOCK_EMBEDDING_DIM
 
+    def test_deadline_aware_capability_preserves_nonblocking_mock_semantics(self):
+        embedder = MockEmbedder()
+
+        assert embedder.embed_texts_with_timeout(["hello"], timeout_seconds=1.0) == embedder.embed_texts(["hello"])
+        with pytest.raises(TimeoutError):
+            embedder.embed_texts_with_timeout(["hello"], timeout_seconds=0)
+
 
 class TestZeroEmbedder:
     """Tests for ZeroEmbedder."""
@@ -73,3 +80,10 @@ class TestZeroEmbedder:
 
         # All vectors should be identical
         assert results[0] == results[1] == results[2]
+
+    def test_deadline_aware_capability_preserves_zero_vectors(self):
+        embedder = ZeroEmbedder()
+
+        assert embedder.embed_texts_with_timeout(["hello"], timeout_seconds=1.0) == [
+            [0.0] * MOCK_EMBEDDING_DIM
+        ]

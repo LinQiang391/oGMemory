@@ -81,7 +81,7 @@ def _produce(dsn, account, owner, index, dialect="postgresql"):
                     prompt_tokens_details=SimpleNamespace(cached_tokens=2),
                 ),
                 model="test-llm",
-                choices=[SimpleNamespace(message=SimpleNamespace(content="{}"))],
+                choices=[SimpleNamespace(message=SimpleNamespace(content="{}"), finish_reason="stop")],
             )
             provider._client = SimpleNamespace(
                 chat=SimpleNamespace(completions=SimpleNamespace(create=lambda **kw: response))
@@ -362,7 +362,7 @@ def test_success_without_usage_and_failed_provider_calls(ledger):
     response = SimpleNamespace(
         usage=None,
         model="test-llm",
-        choices=[SimpleNamespace(message=SimpleNamespace(content="{}"))],
+        choices=[SimpleNamespace(message=SimpleNamespace(content="{}"), finish_reason="stop")],
     )
     client = SimpleNamespace(create=lambda **kw: response)
     provider._client = SimpleNamespace(chat=SimpleNamespace(completions=client))
@@ -491,7 +491,7 @@ def test_llm_concurrent_initialization_publishes_bound_tracker(ledger, monkeypat
                     create=lambda **kw: SimpleNamespace(
                         usage=SimpleNamespace(prompt_tokens=10, completion_tokens=3),
                         model="test",
-                        choices=[SimpleNamespace(message=SimpleNamespace(content="{}"))],
+                        choices=[SimpleNamespace(message=SimpleNamespace(content="{}"), finish_reason="stop")],
                     )
                 )
             )
@@ -701,7 +701,7 @@ def test_cache_hit_survives_eviction_during_persistence(ledger, kind):
                     create=lambda **kw: SimpleNamespace(
                         usage=SimpleNamespace(prompt_tokens=2, completion_tokens=1),
                         model="test",
-                        choices=[SimpleNamespace(message=SimpleNamespace(content='{"ok":true}'))],
+                        choices=[SimpleNamespace(message=SimpleNamespace(content='{"ok":true}'), finish_reason="stop")],
                     )
                 )
             )
@@ -734,6 +734,70 @@ def test_cache_hit_survives_eviction_during_persistence(ledger, kind):
     assert store.metrics(1, account)["cumulative"]["local_cache_hits"] == 1
 
 
+@pytest.mark.parametrize("transport", ["http", "mcp", "typed"])
+def test_candidate_code_search_persists_request_owner(ledger, monkeypatch, tmp_path, transport):
+    import server.app as app_module
+    import server.mcp_tools as mcp_tools
+    import server.memory_service as service_module
+    from core.models import RequestContext
+    from retrieval.code_retrieval import ActiveCodeSearchRequest
+    from service.code_workspace_sync import ResolvedCodeWorkspace
+
+    dsn, store, account = ledger
+    service = _service(dsn)
+    service._cfg.code_retrieval_enabled = True
+    service._cfg.code_retrieval_mode = "candidate_local"
+    source = tmp_path / "target.py"
+    source.write_text("def parse_target(value):\n    return value\n", encoding="utf-8")
+    workspace = ResolvedCodeWorkspace(
+        root_id="root-1", root_slug="repo", root_fingerprint="f" * 64,
+        physical_root=tmp_path, max_files=300, language_hints={},
+    )
+    monkeypatch.setattr(service, "get_control_plane_store", lambda: None)
+    monkeypatch.setattr(
+        service_module, "CodeWorkspaceRegistryResolver",
+        lambda *args, **kwargs: SimpleNamespace(resolve=lambda **kw: workspace),
+    )
+    monkeypatch.setattr("retrieval.bm25_index._ensure_nltk", lambda: None)
+    monkeypatch.setattr("retrieval.bm25_index._tokenize", lambda text: text.lower().split())
+    provider = service._get_candidate_code_embedder()
+    inputs = []
+
+    def create(**kwargs):
+        inputs.append(kwargs["input"])
+        return SimpleNamespace(
+            usage=SimpleNamespace(total_tokens=7),
+            data=[SimpleNamespace(embedding=[1.0, 2.0]) for _ in kwargs["input"]],
+        )
+
+    client = SimpleNamespace(embeddings=SimpleNamespace(create=create))
+    client.with_options = lambda **kwargs: client
+    provider._client = client
+    monkeypatch.setattr(app_module, "_service", service)
+    for tenant, agent in [(account, ""), (account + "-other", "helper")]:
+        ctx = RequestContext(tenant, "alice", agent, "test", uuid4().hex)
+        monkeypatch.setattr(app_module, "_build_authenticated_context", lambda params: ctx)
+        monkeypatch.setattr(mcp_tools, "build_mcp_context", lambda *args, **kwargs: ctx)
+        before = len(inputs)
+        if transport == "http":
+            response = app_module.app.test_client().post(
+                "/api/v1/resources/code/search", json={"query": "parse_target"},
+            )
+            assert response.status_code == 200
+            assert response.json["evidence"]
+        elif transport == "mcp":
+            assert "parse_target" in mcp_tools.search_code(service, query="parse_target")
+        else:
+            assert service.search_active(ActiveCodeSearchRequest("parse_target"), ctx).evidence
+        calls = len(inputs) - before
+        assert calls == 2
+        owner = ctx.agent_space_name() if agent else ctx.user_space_name()
+        totals = store.metrics(1, tenant, (owner,))["cumulative"]["embedding"]
+        assert totals == {"calls": calls, "total_tokens": calls * 7}
+    assert store.metrics(1, account)["cumulative"]["embedding"] == {
+        "calls": 2, "total_tokens": 14,
+    }
+    service._get_shared_sql_pool().close_all()
 
 
 def test_database_dns_obeys_deadline(tmp_path):

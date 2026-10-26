@@ -64,6 +64,74 @@ service:
   # http_ip_allowlist_trust_proxy: false              # [all]
   # http_trusted_proxies: ["127.0.0.1"]               # [all]
 
+# ---- Code Memory Features [all, opt-in] ----
+features:
+  code_resources_enabled: false
+  code_resources_max_files: 5000
+  # Empty fails closed: local workspace registration is permitted only below
+  # canonical directories configured here. Do not use / as an allowed root.
+  code_workspace_allowed_roots: []
+  # Workspace sync is separate from direct code-resource operations and remains
+  # disabled by default. It requires code_resources_enabled: true.
+  code_sync_enabled: false
+  code_sync_default_trigger_mode: hybrid  # hybrid / manual / external_event
+  code_sync_default_wait_mode: accepted  # accepted / filesystem_complete / index_visible
+  code_sync_reconcile_interval_seconds: 300
+  code_sync_watch_interval_seconds: 5
+  code_sync_run_timeout_seconds: 60
+  code_sync_failure_backoff_seconds: 30
+  code_sync_max_pending_roots: 100
+  code_sync_debounce_seconds: 2
+  code_retrieval_enabled: false
+  # Process-static mode; restart the service after changing it.
+  # full keeps the imported/persistent code index path. candidate_local uses
+  # only one registered root and request-local candidate vectors.
+  # Prefer the nested `code_retrieval.mode` below. The legacy flat
+  # `code_retrieval_mode` form is also accepted, but do not set both.
+  code_retrieval_semantic_enabled: true
+  code_retrieval_bm25_enabled: true
+  code_retrieval_symbolic_enabled: true
+  code_retrieval_graph_enabled: true
+  code_retrieval:
+    mode: full  # full / candidate_local
+    fusion_mode: weighted_rrf  # weighted_rrf / weighted_sum / sum
+    semantic_weight: 0.33
+    bm25_weight: 0.17
+    symbolic_weight: 0.17
+    graph_weight: 0.33
+    candidate_limit: 50
+    result_limit: 5
+    snippet_chars: 1200
+    batch_chars: 8000
+    graph_neighbor_limit: 24
+    route_deadline_ms: 500
+    candidate_discovery_pool_limit: 300
+    candidate_file_limit: 80
+    candidate_snippet_limit: 500
+    candidate_semantic_limit: 16
+    candidate_embedding_chars: 4096
+    candidate_embedding_batch_texts: 8
+    candidate_embedding_batch_tokens: 8000
+    candidate_read_bytes: 67108864
+    candidate_discovery_deadline_ms: 15000
+    candidate_embedding_deadline_ms: 330000
+    candidate_request_deadline_ms: 360000
+  tool_output_filter:
+    enabled: false
+    read_enabled: true
+    bash_enabled: true
+    adaptive_enabled: true
+    read_min_chars: 8000
+    read_max_lines: 60
+    bash_min_chars: 8000
+    bash_min_lines: 100
+    test_max_lines: 120
+    diff_max_lines: 100
+    error_max_lines: 100
+    generic_max_lines: 80
+    output_max_chars: 50000
+    recovery_max_chars: 50000
+
 # ---- MCP Server [all] ----
 mcp:
   enabled: true
@@ -75,6 +143,7 @@ mcp:
   enable_delete_tools: false
   enable_runtime_tools: false
   enable_diagnostic_tools: false
+  enable_code_edit_tools: false
   max_request_bytes: 1048576
   max_sse_connections: 64
   max_response_chars: 50000
@@ -143,6 +212,42 @@ memory:
   # topic_detection_enabled: false
   # compression_quality_enabled: false
   # compression_quality_persist_metadata: false
+
+# ---- Large Tool-result Externalization [all, opt-in] ----
+tool_result_externalization:
+  enabled: false
+  # When the host exposes a trusted post-tool/pre-model middleware, replace a
+  # qualifying result before its first model request. Disable to retain the
+  # legacy afterTurn-only lifecycle without disabling Artifact/recall support.
+  first_view_enabled: true
+  # Current lifecycle contract: one complete user message is one semantic Turn.
+  # The option remains explicit so future verified lifecycles can extend it.
+  semantic_turn_mode: user_message  # currently the only supported value
+  single_result_chars: 20000
+  synopsis_max_chars: 2000
+  # synopsis, key_facts, selected_evidence, retained_records and coverage share
+  # synopsis_max_chars, except unique critical records may exceed it.
+  # The Turn budget applies that combined summary across all stubs in one Turn.
+  stub_summary_turn_chars: 12000
+  write_timeout_ms: 3000
+  retry_attempts: 2
+  search_chunk_bytes: 16384
+  search_overlap_bytes: 1024
+  search_top_k: 5
+  search_max_artifacts: 20
+  search_deadline_ms: 2000
+  read_default_bytes: 32768
+  artifact_temp_grace_seconds: 600
+  http_max_response_chars: 100000
+
+# ---- Tool-result Cache Delay [opt-in] ----
+tool_result_optimization:
+  cache_delay:
+    enabled: false
+    delayed_result_chars: 2000
+    idle_ttl_seconds: 300
+    # Observability/cost-planning input only; it is not a correctness gate.
+    cache_hit_price_ratio: 0.1
 
 # ---- Agent Skill Sedimentation [AGFS or SQL, opt-in] ----
 # AGFS sedimentation currently supports one oGMemory service process.
@@ -218,3 +323,24 @@ agent_memory:
 cache:
   enabled: true                  # [all]
   max_size: 1000                 # [all]
+
+# ---- M3 long-video benchmark [all] ----
+# Configuration for the M3 episodic-memory pipeline. ``embedding``
+# overrides the top-level block for M3 retrieval; ``vector_index``
+# configures the dedicated OpenGaussVectorIndex that backs
+# ``GraphService.search_by_embedding`` so QA can push the
+# ``ClipScope`` filter down to SQL instead of scanning JSONB.
+# The vector-index connection string is inherited from the
+# top-level ``vector_db.connection_string`` — no separate
+# ``m3.vector_index.connection_string`` key exists.
+m3:
+  embedding:
+    provider: openai              # [all]
+    model: "BAAI/bge-large-zh-v1.5"  # [all]
+    base_url: null                # [all]
+    api_key: null                 # [all]
+    dimension: 1024               # [all]
+  vector_index:
+    backend: opengauss            # [all] openGauss is still the recommended production target; ``pgvector`` is the convenience alias for PostgreSQL+pgvector deployments that want to share one DB
+    table_name: m3_episodic_vectors  # [all] partition by run if you share a DB
+    pool_size: 5                  # [all]

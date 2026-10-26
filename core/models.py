@@ -7,15 +7,15 @@ Retrieval-chain models (SeedHit → SearchMemoryResult) added for the
 search_memory pipeline; they follow the same conventions.
 """
 
-from dataclasses import dataclass, field
-from datetime import datetime, timezone
-from enum import Enum
-from typing import Any
 import hashlib
 import uuid
+from dataclasses import dataclass, field
+from datetime import UTC, datetime
+from enum import Enum
+from typing import Any
 
 
-class Role(str, Enum):
+class Role(str, Enum):  # noqa: UP042 - serialized values must remain legacy-compatible
     """Minimal RBAC roles for multi-tenant control plane."""
     ROOT = "ROOT"
     ADMIN = "ADMIN"
@@ -207,7 +207,8 @@ class WritePlan:
 class IndexRecord:
     """A record in the vector index.
 
-    Each ContextNode expands to 3 IndexRecords (L0/L1/L2).
+    Index emitters may create L0, L1, and L2 records as applicable.
+    Leaf ContextNodes use L0 plus optional L2; directory summaries own L1.
     The id is stable: sha256(uri + ":" + str(level))[:16].
 
     CRITICAL: filters MUST contain account_id + owner_space.
@@ -248,7 +249,7 @@ class OutboxEvent:
 
     def __post_init__(self):
         if not self.created_at:
-            self.created_at = datetime.now(timezone.utc).isoformat()
+            self.created_at = datetime.now(UTC).isoformat()
 
 
 @dataclass
@@ -268,6 +269,7 @@ class TypedQuery:
     account_id: str = ""  # Injected by service layer
     owner_space: str | list[str] | None = None  # Further limit to user or agent scope
     intent: str | None = None  # RetrievalIntent value, for Layer 3 intent-aware retrieval
+    resource_type: str | None = None  # RESOURCE subtype pre-filter (for example, "code")
     memory_directories: list[str] | None = None  # URI type directories applied before candidate limits
 
 
@@ -275,7 +277,7 @@ class TypedQuery:
 # Retrieval pipeline models
 # ---------------------------------------------------------------------------
 
-class RetrieverMode(str, Enum):
+class RetrieverMode(str, Enum):  # noqa: UP042 - public enum compatibility
     """Controls depth of scoring: QUICK skips reranker, THINKING uses it."""
     THINKING = "thinking"
     QUICK = "quick"

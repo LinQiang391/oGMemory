@@ -4,6 +4,7 @@ Runs 4 stages sequentially — errors are propagated, not silently degraded:
   Stage 1  QueryPlanner        — classify query into TypedQuery[]
   Stage 2  SeedRetriever       — mixed-level search, or direct L2 search
   Stage 3  HierarchicalSearcher — expand to L2 leaves, or select direct L2 hits
+  Optional SceneRetrievalStage — supplement and rank scoped memory evidence
   Stage 4  ResultRanker     — keep only L2, sort, top-k -> RetrievedBlock[]
 
 Returns a pure structured SearchMemoryResult.
@@ -24,16 +25,17 @@ from core.models import (
     SearchMemoryResult,
     SeedResult,
     TypedQuery,
-    SeedHit,
 )
+from retrieval.candidate_pool import candidate_top_k
+from retrieval.hierarchical_searcher import HierarchicalSearcher
 from retrieval.hotness import blend_hotness
 from retrieval.identity import memory_identity
-from retrieval.result_ranker import ResultRanker, _vec_to_leaf
-from retrieval.hierarchical_searcher import HierarchicalSearcher
-from retrieval.candidate_pool import candidate_top_k
 from retrieval.query_planner import QueryPlanner
+from retrieval.result_ranker import ResultRanker, _vec_to_leaf
+from retrieval.scene_stage import SceneRetrievalStage
 from retrieval.seed_retriever import SeedRetriever
 from retrieval.trace import RetrievalTrace, TraceTimer
+from scene.retrieval import SceneRanker, SceneSearchSource, select_scene_evidence
 
 logger = logging.getLogger(__name__)
 
@@ -48,6 +50,8 @@ class RetrievalPipeline:
         config: RetrievalConfig | None = None,
         context_reader=None,
         access_tracker=None,
+        scene_ranker: SceneRanker | None = None,
+        scene_source: SceneSearchSource | None = None,
     ) -> None:
         self.planner = planner
         self.seed_retriever = seed_retriever
@@ -56,6 +60,10 @@ class RetrievalPipeline:
         self.cfg = config or RetrievalConfig()
         self._context_reader = context_reader
         self._access_tracker = access_tracker
+        self._scene_stage = (
+            SceneRetrievalStage(scene_source, scene_ranker)
+            if scene_source is not None and scene_ranker is not None else None
+        )
 
     def run(
         self,
@@ -70,6 +78,8 @@ class RetrievalPipeline:
         score_threshold: float | None = None,
         mode: str = RetrieverMode.QUICK,
         fill_content_for_top_k: int = 0,
+        context_type: str | None = None,
+        resource_type: str | None = None,
         memory_directories: list[str] | None = None,
     ) -> SearchMemoryResult:
         t0 = time.monotonic()
@@ -80,6 +90,8 @@ class RetrievalPipeline:
             query, ctx, trace,
             top_k=top_k, categories=categories,
             hints=hints, session_archive=session_archive,
+            context_type=context_type,
+            resource_type=resource_type,
         )
 
         # Stage 2
@@ -97,18 +109,32 @@ class RetrievalPipeline:
 
         # Stage 3
         all_leaf_hits: list[LeafHit] = []
+        query_results = []
+        scene_stage = self._scene_stage.bind(ctx, typed_queries, trace) if self._scene_stage else None
         for tq, sr in zip(typed_queries, all_seed_results):
+            reserve = None
             leaves = self._run_expand(
                 tq, sr, ctx, trace,
                 limit=candidate_top_k(self.cfg, tq.top_k, fallback_top_k=tq.top_k), mode=mode,
                 score_threshold=score_threshold,
             )
+            if scene_stage is not None:
+                is_visible = getattr(self._context_reader, "is_visible", None)
+                if callable(is_visible):
+                    leaves = [hit for hit in leaves if is_visible(hit.uri, ctx)]
+                candidates = scene_stage.apply(leaves, tq, sr.query_vector, ctx, trace)
+                leaves, reserve = candidates.hits, candidates.direct_evidence_reserve
+            query_results.append((tq, leaves, sr if self.cfg.expand_hierarchy else None, reserve))
             all_leaf_hits.extend(leaves)
 
         # Stage 4
         # Direct mode must not reintroduce candidates rejected by its threshold.
         merged_seed = self._merge_seeds(all_seed_results) if self.cfg.expand_hierarchy else None
-        blocks = self._run_assembly(typed_queries, all_leaf_hits, merged_seed, trace, ctx, fill_content_for_top_k=fill_content_for_top_k)
+        blocks = self._run_assembly(
+            typed_queries, all_leaf_hits, merged_seed, trace, ctx,
+            fill_content_for_top_k=fill_content_for_top_k,
+            query_results=query_results if self._scene_stage is not None else None,
+        )
 
         trace.total_ms = (time.monotonic() - t0) * 1000
 
@@ -128,7 +154,17 @@ class RetrievalPipeline:
     # -- Stage runners with degradation ------------------------------------
 
     def _run_planner(
-        self, query, ctx, trace, *, top_k, categories, hints, session_archive
+        self,
+        query,
+        ctx,
+        trace,
+        *,
+        top_k,
+        categories,
+        hints,
+        session_archive,
+        context_type,
+        resource_type,
     ) -> list[TypedQuery]:
         with TraceTimer("planner") as st:
             st.input_count = 1
@@ -136,7 +172,11 @@ class RetrievalPipeline:
                 queries = self.planner.plan(
                     query, ctx,
                     session_archive=session_archive,
-                    hints=hints, categories=categories, top_k=top_k,
+                    hints=hints,
+                    categories=categories,
+                    top_k=top_k,
+                    context_type=context_type,
+                    resource_type=resource_type,
                 )
             except RetrievalError:
                 raise
@@ -198,7 +238,10 @@ class RetrievalPipeline:
 
         return self._fallback_l2_from_seed(sr)
 
-    def _run_assembly(self, typed_queries, leaf_hits, merged_seed, trace, ctx=None, fill_content_for_top_k=0) -> list[RetrievedBlock]:
+    def _run_assembly(
+        self, typed_queries, leaf_hits, merged_seed, trace, ctx=None,
+        fill_content_for_top_k=0, query_results=None,
+    ) -> list[RetrievedBlock]:
         with TraceTimer("assembly") as st:
             st.input_count = len(leaf_hits)
             all_blocks = []
@@ -206,12 +249,17 @@ class RetrievalPipeline:
 
             # Run assembly for each typed query (e.g., memory/skill/resource)
             # and deduplicate results by URI
-            for tq in (typed_queries or [TypedQuery(text="", context_type="")]):
+            inputs = query_results if query_results is not None else [
+                (tq, leaf_hits, merged_seed, None)
+                for tq in (typed_queries or [TypedQuery(text="", context_type="", categories=[])])
+            ]
+            for tq, query_hits, query_seed, reserve in inputs:
                 try:
                     blocks = self.assembly.assemble(
-                        tq, leaf_hits, merged_seed, ctx=ctx,
+                        tq, query_hits, query_seed, ctx=ctx,
                         fill_content_for_top_k=fill_content_for_top_k,
                         context_reader=self._context_reader,
+                        **({"direct_evidence_reserve": reserve} if reserve is not None else {}),
                     )
                 except Exception as exc:
                     logger.error("[assembly] assemble failed: %s", exc, exc_info=True)
@@ -236,7 +284,13 @@ class RetrievalPipeline:
                     ),
                     reverse=True,
                 )
-                all_blocks = all_blocks[:final_limit]
+                reserve = next((reserve for _, _, _, reserve in inputs if reserve is not None), None)
+                selected = select_scene_evidence(
+                    all_blocks, final_limit, reserve,
+                    lambda block: bool(block.metadata.get("scene_expanded")),
+                )
+                selected_ids = {id(block) for block in selected}
+                all_blocks = [block for block in all_blocks if id(block) in selected_ids]
 
             st.output_count = len(all_blocks)
         trace.add_stage(st)

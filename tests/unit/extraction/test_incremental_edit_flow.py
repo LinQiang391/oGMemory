@@ -540,8 +540,58 @@ def test_safety_refetch_discards_tentative_json_edits_only(prior_native):
     assert result.candidates[0].content == expected
 
 
+@pytest.mark.parametrize("mode", ["native", "json", "lazy"])
+@pytest.mark.parametrize("category", ["profile", "preference"])
+@pytest.mark.parametrize("unsupported_position", [0, 1])
+@pytest.mark.parametrize("stub", [False, True])
+def test_composed_edits_require_each_steps_selected_span_support(mode, category, unsupported_position, stub):
+    original = (profile("identity", "Occupation: technician.") if category == "profile"
+                else memory("beverage", category="preference", content="Prefers tea.", who="user"))
+    ctx, fs, registry, uri, llm, extractor, _ = eager_flow(original=original, category=category)
+    supported = "I am an engineer." if category == "profile" else "I prefer coffee."
+    unsupported = "I live in Lisbon." if category == "profile" else "I prefer deleting backups."
+    operations = []
+    for quote in (supported, unsupported) if unsupported_position else (unsupported, supported):
+        inputs = dict(target_uri=uri, expected_version=1, text=quote,
+                      abstract=quote, overview=quote, confidence=.9,
+                      evidence_quote=quote, attributed_speaker="user", attribution_basis="self_first_person")
+        operations.append({"name": "append_memory", "input": inputs})
+    prepared = prepare(extractor, ctx, category)
+    prepared.span.had_externalized_stub = stub
+    prepared.span.safe_user_text = supported
+    calls = [{"tool": item["name"], "input": item["input"]} for item in operations]
+    if mode == "lazy":
+        extractor._mode = "lazy"
+        queue = [([{"name": "read", "input": {"uri": uri}}], ""), (operations, ""), ([], "[]")]
+        llm.complete_with_tools_messages = lambda **kwargs: queue.pop(0)
+        candidates = extractor._structure_prepared_span(prepared, ctx)
+    elif mode == "json":
+        llm.complete_json = lambda prompt, schema: {"operations": calls}
+        candidates = extractor._structure_span_json_fallback(prepared, ctx, None)
+    else:
+        llm.complete_with_tools = lambda **kwargs: calls
+        candidates = extractor._structure_prepared_span(prepared, ctx)
+    if stub:
+        assert candidates == []
+    else:
+        assert len(candidates) == 1 and all(item in candidates[0].content for item in (supported, unsupported))
+    assert fs.read_node(uri, ctx).metadata["version"] == 1
 
 
+@pytest.mark.parametrize("quote", [None, "I prefer coffee."])
+def test_composed_source_checks_keep_each_candidates_topic_even_with_identical_quotes(quote):
+    from extraction.incremental_edit import coalesce_incremental_edits
+
+    supported = memory("beverage", category="preference",
+                       content="Prefers coffee.", evidence_quote=quote,
+                       target_uri="memory://beverage", expected_version=1)
+    unsupported = replace(supported, abstract="Prefers deleting backups.",
+                          overview="Prefers deleting backups.", content="Prefers deleting backups.")
+    extractor = Extractor(None)
+    candidates = coalesce_incremental_edits([(True, unsupported), (True, supported)])
+    extractor._assign_provenance(candidates, _Span(0, 0, had_externalized_stub=True,
+                                                 safe_user_text="I prefer coffee."), None)
+    assert candidates == []
 
 
 def test_source_chain_flattens_without_changing_serialized_candidate_or_single_step():
@@ -559,3 +609,30 @@ def test_source_chain_flattens_without_changing_serialized_candidate_or_single_s
     composed = coalesce_incremental_edits([(True, composed), (True, third)])[0]
     assert incremental_source_steps(composed) == (first, second, third)
     assert asdict(composed) == asdict(third)
+
+
+@pytest.mark.parametrize("different", [{"target_uri": "memory://other"}, {"expected_version": 2}])
+def test_source_chains_do_not_merge_distinct_targets_or_versions(different):
+    from extraction.incremental_edit import coalesce_incremental_edits
+
+    unsupported = memory("beverage", category="preference",
+                         content="Prefers deleting backups.", evidence_quote="I prefer deleting backups.",
+                         target_uri="memory://beverage", expected_version=1)
+    supported = replace(unsupported, abstract="Prefers coffee.", content="Prefers coffee.",
+                        evidence_quote="I prefer coffee.", **different)
+    candidates = coalesce_incremental_edits([(True, unsupported), (True, supported)])
+    Extractor(None)._assign_provenance(candidates, _Span(0, 0, had_externalized_stub=True,
+                                                       safe_user_text="I prefer coffee."), None)
+    assert candidates == [supported]
+
+
+@pytest.mark.parametrize("category,quote,retained", [
+    ("profile", "   \t", False), ("preference", None, True), ("entity", None, True),
+])
+def test_source_filter_preserves_single_step_quote_and_category_rules(category, quote, retained):
+    candidate = memory("coffee", category=category,
+                       content="Prefers coffee.", evidence_quote=quote)
+    candidates = [candidate]
+    Extractor(None)._assign_provenance(candidates, _Span(0, 0, had_externalized_stub=True,
+                                                       safe_user_text="I prefer coffee."), None)
+    assert candidates == ([candidate] if retained else [])

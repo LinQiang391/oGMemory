@@ -49,11 +49,11 @@ export HERMES_HOME="${HERMES_HOME:-$HOME/.hermes}"
 mkdir -p "$HERMES_HOME/plugins/ogmemory"
 
 curl -fL \
-  https://raw.gitcode.com/opengauss/oGMemory/raw/dev/hermes_memory_plugin/ogmemory/__init__.py \
+  https://raw.gitcode.com/opengauss/oGMemory/raw/dev/plugins/hermes/ogmemory/__init__.py \
   -o "$HERMES_HOME/plugins/ogmemory/__init__.py"
 
 curl -fL \
-  https://raw.gitcode.com/opengauss/oGMemory/raw/dev/hermes_memory_plugin/ogmemory/plugin.yaml \
+  https://raw.gitcode.com/opengauss/oGMemory/raw/dev/plugins/hermes/ogmemory/plugin.yaml \
   -o "$HERMES_HOME/plugins/ogmemory/plugin.yaml"
 ```
 

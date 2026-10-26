@@ -4,20 +4,27 @@ USER root
 
 RUN mkdir -p /opt/ogmem-openclaw-defaults/extensions
 
-COPY openclaw_context_engine_plugin/ /opt/ogmem-openclaw-defaults/extensions/og-memory-context-engine/
+COPY plugins/openclaw/ /opt/ogmem-openclaw-defaults/extensions/og-memory-context-engine/
 COPY config/openclaw/ogmem.template.json /opt/ogmem-openclaw-defaults/openclaw.template.json
 COPY docker/entrypoint-openclaw.sh /usr/local/bin/entrypoint-openclaw.sh
+COPY docker/configure-openclaw.cjs /usr/local/bin/configure-openclaw.cjs
 RUN chmod +x /usr/local/bin/entrypoint-openclaw.sh
 
+# The entrypoint creates the active config only after rendering and validation.
 RUN mkdir -p /home/node/.openclaw/extensions && \
     cp -r /opt/ogmem-openclaw-defaults/extensions/og-memory-context-engine /home/node/.openclaw/extensions/ && \
-    cp /opt/ogmem-openclaw-defaults/openclaw.template.json /home/node/.openclaw/openclaw.json && \
     chown -R node:node /home/node/.openclaw && \
     mkdir -p /tmp/ogmem_ws && chmod 777 /tmp/ogmem_ws
 
 ENV OGMEM_MODE=remote
-ENV OGMEM_API_URL=http://127.0.0.1:8090
-ENV OPENCLAW_GATEWAY_TOKEN=ogmem-default-token
+# OGMEM_API_URL is intentionally NOT set here. The plugin reads it from
+# the container env at runtime, and the compose env block in
+# deploy/docker-compose.yml sets it from .env's OGMEM_URL. Hardcoding it
+# here would shadow the compose override and pin the plugin to port 8090.
+# OPENCLAW_GATEWAY_TOKEN is also intentionally NOT set here — the compose
+# env block sets it from .env's OPENCLAW_GATEWAY_TOKEN (with fallback to
+# "ogmem-default-token"), so a hardcoded value here would be redundant
+# and could leak the default token if someone runs the image directly.
 
 ENTRYPOINT ["/usr/local/bin/entrypoint-openclaw.sh"]
 CMD ["gateway"]

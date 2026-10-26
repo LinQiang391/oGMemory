@@ -3,11 +3,11 @@
 Orchestrates the write process: extraction → planning → building → writing → outbox.
 """
 
-from collections.abc import Callable
 import hashlib
 import time
-from datetime import datetime, timezone
-from typing import Optional, cast
+from collections.abc import Callable
+from datetime import UTC, datetime
+from typing import cast
 
 from commit.archive_builder import ArchiveBuilder
 from commit.outbox_store import OutboxStore
@@ -86,6 +86,19 @@ class ContextWriter:
             raise ValueError("index publication requires an Outbox store")
         self._require_index_event = require_index_event
 
+    @staticmethod
+    def _get_real_method(
+        instance: object | None,
+        name: str,
+    ) -> Callable[..., object] | None:
+        """Return a class-defined method without accepting dynamic mock attributes."""
+        if instance is None or not callable(getattr(type(instance), name, None)):
+            return None
+        method = getattr(instance, name, None)
+        if not callable(method):
+            return None
+        return cast(Callable[..., object], method)
+
     def _operation_fingerprint(self, plan: WritePlan, ctx: RequestContext, content_hash: str = "") -> str:
         """Generate operation fingerprint for idempotency tracking.
 
@@ -102,18 +115,12 @@ class ContextWriter:
         return hashlib.sha256(payload.encode()).hexdigest()
 
     @staticmethod
-    def _get_real_method(
-        instance: object | None,
-        name: str,
-    ) -> Callable[..., object] | None:
-        """Return a class-defined method without accepting dynamic mock attributes."""
-        if instance is None or not callable(getattr(type(instance), name, None)):
-            return None
-        method = getattr(instance, name, None)
-        if not callable(method):
-            return None
-        return cast(Callable[..., object], method)
-
+    def _is_code_resource(node: object) -> bool:
+        """Return whether *node* is governed by the durable code contract."""
+        return (
+            getattr(node, "context_type", None) == "RESOURCE"
+            and getattr(node, "metadata", {}).get("resource_type") == "code"
+        )
 
     @staticmethod
     def prewrite_skip(candidate: CandidateMemory, ctx: RequestContext) -> WritePlan | None:
@@ -315,6 +322,14 @@ class ContextWriter:
                     supports_atomic_write is None
                     or bool(supports_atomic_write(node))
                 )
+                if self._is_code_resource(node) and (
+                    atomic_write is None
+                    or not atomic_write_allowed
+                    or build_write_event is None
+                ):
+                    raise RuntimeError(
+                        "code resource writes require an atomic Outbox backend"
+                    )
                 if (
                     atomic_write is not None
                     and atomic_write_allowed
@@ -503,7 +518,7 @@ class ContextWriter:
 
             # Update metadata to mark as archived
             node.metadata["status"] = "ARCHIVED"
-            node.metadata["archived_at"] = datetime.now(timezone.utc).isoformat()
+            node.metadata["archived_at"] = datetime.now(UTC).isoformat()
 
             # Write back the updated node
             self._fs.write_node(node, ctx)

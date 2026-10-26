@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from urllib.parse import quote
+
 import pytest
 
 from core.errors import NodeNotFoundError
@@ -130,6 +132,7 @@ def test_status_resource_reports_implemented_toolsets_only():
         OgMemConfig(
             mcp_enable_write_tools=True,
             mcp_enable_delete_tools=True,
+            mcp_enable_code_edit_tools=True,
             mcp_enable_runtime_tools=True,
             mcp_enable_diagnostic_tools=True,
         ),
@@ -143,6 +146,7 @@ def test_status_resource_reports_implemented_toolsets_only():
     assert payload["toolsets"]["read_only"] is True
     assert payload["toolsets"]["write"] is True
     assert payload["toolsets"]["delete"] is True
+    assert payload["toolsets"]["code_edit"] is True
     assert payload["toolsets"]["runtime"] is False
     assert payload["toolsets"]["diagnostic"] is False
 
@@ -152,6 +156,24 @@ def test_status_resource_rejects_invalid_default_toolset():
 
     with pytest.raises(ValueError, match="mcp_default_toolset"):
         render_resource(service, "ogmemory://status", _ctx())
+
+
+def test_code_toolset_status_suppresses_generic_write_and_delete_flags():
+    service = _FakeService(
+        OgMemConfig(
+            mcp_default_toolset="code",
+            mcp_enable_write_tools=True,
+            mcp_enable_delete_tools=True,
+            mcp_enable_code_edit_tools=True,
+        ),
+        [],
+    )
+
+    payload = render_resource(service, "ogmemory://status", _ctx())
+
+    assert payload["toolsets"]["write"] is False
+    assert payload["toolsets"]["delete"] is False
+    assert payload["toolsets"]["code_edit"] is True
 
 
 def test_types_resource_exposes_public_memory_types_without_internal_types():
@@ -227,9 +249,10 @@ def test_collection_resource_uses_summary_listing_without_full_node_reads():
 
     assert [row["id"] for row in payload["memories"]] == ["coding_style"]
     assert service.fs.summary_calls == [
-        ("ctx://acct-1/users/alice/memories/preferences", 1)
+        ("ctx://acct-1/users/alice/memories/preferences", 2)
     ]
     assert service.fs.read_node_calls == []
+    assert payload["truncated"] is True
 
 
 def test_skill_collection_lists_only_governed_published_skills():
@@ -524,3 +547,64 @@ def test_pattern_item_reads_scoped_legacy_agent_path_when_user_path_exists():
     assert payload["id"] == "review"
     assert payload["content"] == "legacy agent pattern content"
     assert "ctx://" not in str(payload)
+
+
+@pytest.mark.parametrize("service_type", [_FakeService, _SummaryService])
+@pytest.mark.parametrize("count", [0, 1, 50, 51])
+def test_collection_truncated_flag_matches_remaining_items(service_type, count):
+    service = service_type(OgMemConfig(mcp_collection_limit=50), [
+        _node(f"ctx://acct-1/users/alice/memories/preferences/item_{index:02d}")
+        for index in range(count)
+    ])
+    payload = render_resource(service, "ogmemory://memories/preference", _ctx())
+    assert len(payload["memories"]) == min(count, 50)
+    assert payload["truncated"] is (count > 50)
+
+
+@pytest.mark.parametrize("user_count,agent_count", [(0, 2), (1, 1), (2, 0), (1, 0)])
+def test_pattern_collection_counts_both_owners_at_limit(user_count, agent_count):
+    nodes = [
+        _node(f"ctx://acct-1/{owner}/memories/patterns/item_{index}", category="pattern")
+        for owner, count in (("users/alice", user_count), ("agents/bot", agent_count))
+        for index in range(count)
+    ]
+    payload = render_resource(_SummaryService(OgMemConfig(mcp_collection_limit=1), nodes),
+                              "ogmemory://memories/pattern", _ctx())
+    assert len(payload["memories"]) == 1
+    assert payload["truncated"] is (user_count + agent_count > 1)
+
+
+@pytest.mark.parametrize("stored_name", [
+    "Mixed" + quote("历史", safe="").lower(),
+    "Mixed%E5%8e%86%e5%8F%B2",
+])
+@pytest.mark.parametrize("owner,public_prefix", [
+    ("users/alice", "ogmemory://memories/pattern/"),
+    ("agents/bot", "ogmemory://memories/pattern/agent/"),
+    ("agents/bot", "ogmemory://memories/pattern/"),
+])
+def test_item_resource_resolves_historical_escape_case(stored_name, owner, public_prefix):
+    service = _FakeService(OgMemConfig(), [
+        _node(f"ctx://acct-1/{owner}/memories/patterns/{stored_name}", category="pattern")
+    ])
+    payload = render_resource(service, public_prefix + quote("Mixed历史", safe=""), _ctx())
+    assert payload["content"] == "content"
+    assert payload["id"] == "Mixed历史"
+
+
+def test_historical_fallback_requires_unique_name_within_owner():
+    service = _FakeService(OgMemConfig(), [
+        _node(f"ctx://acct-1/users/alice/memories/preferences/{name}")
+        for name in ("Mixed%E5%8e%86%e5%8F%B2", "Mixed%e5%8E%86%E5%8f%b2")
+    ])
+    with pytest.raises(ValueError, match="Ambiguous"):
+        render_resource(service, "ogmemory://memories/preference/" + quote("Mixed历史", safe=""), _ctx())
+
+
+@pytest.mark.parametrize("owner_path", ["acct-1/users/bob", "acct-2/users/alice"])
+def test_historical_fallback_stays_in_current_owner(owner_path):
+    service = _FakeService(OgMemConfig(), [
+        _node(f"ctx://{owner_path}/memories/preferences/Mixed%E5%8e%86%e5%8F%B2")
+    ])
+    with pytest.raises(Exception, match="not_found_or_not_visible"):
+        render_resource(service, "ogmemory://memories/preference/" + quote("Mixed历史", safe=""), _ctx())

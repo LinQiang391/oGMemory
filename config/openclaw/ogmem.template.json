@@ -53,16 +53,31 @@
     "entries": {
       "og-memory-context-engine": {
         "enabled": true,
+        "hooks": {
+          "allowConversationAccess": true
+        },
         "config": {
           "mode": "remote",
           "memoryApiBaseUrl": "__OGMEM_URL__",
           "authApiKey": "__OG_AUTH_API_KEY__",
-          "authAccountId": "__OG_AUTH_ACCOUNT_ID__"
+          "authAccountId": "__OG_AUTH_ACCOUNT_ID__",
+          "toolResultExternalizationEnabled": false,
+          "toolResultFirstViewExternalizationEnabled": true,
+          "toolResultFirstViewMinChars": 20000,
+          "semanticTurnMode": "user_message"
         }
       },
       "memory-core": {
         "enabled": false
       }
+    },
+    "allow": [
+      "og-memory-context-engine"
+    ]
+  },
+  "discovery": {
+    "mdns": {
+      "mode": "off"
     }
   }
 }

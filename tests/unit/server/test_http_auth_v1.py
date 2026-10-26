@@ -3,19 +3,21 @@
 from __future__ import annotations
 
 import importlib.util
+from unittest.mock import Mock
 
 import pytest
-
-_HAS_FLASK = importlib.util.find_spec("flask") is not None
-pytestmark = pytest.mark.skipif(not _HAS_FLASK, reason="flask is not installed")
 
 from providers.unified_config import OgMemConfig
 from server.api_keys import APIKeyManager
 from server.audit import AuditService
 from server.auth import AuthService
 from server.control_plane_store import ControlPlaneStore
+from server.mcp_security import UNTRUSTED_DATA_NOTICE  # noqa: E402
 from server.memory_service import MemoryService
 from server.tenant_admin import TenantAdminService
+
+_HAS_FLASK = importlib.util.find_spec("flask") is not None
+pytestmark = pytest.mark.skipif(not _HAS_FLASK, reason="flask is not installed")
 
 if _HAS_FLASK:
     import server.app as app_module
@@ -73,6 +75,304 @@ def test_data_route_requires_api_key_when_role_control_enabled(monkeypatch, tmp_
     assert resp.status_code == 401
 
 
+@pytest.mark.parametrize("status", ["processing", "completed", "failed"])
+def test_operator_task_poll_auth_and_account_boundary(monkeypatch, tmp_path, status):
+    from extraction.operators.task_store import InMemoryTaskStore
+    from service.operator_service import OperatorService
+
+    service, owner_key = _make_service(tmp_path)
+    service.get_key_manager().create_account("acct-2", "eve")
+    other_key = service.get_key_manager().register_user("acct-2", "mallory", "user")
+    tasks = InMemoryTaskStore()
+    rec = tasks.submit(
+        raw_node_id="private-node", operator_service="test", account_id="acct-1",
+    )
+    rec.status = status
+    rec.result = {"secret": "private result"}
+    rec.error = "private error"
+    monkeypatch.setattr(app_module, "_service", service)
+    monkeypatch.setattr(
+        app_module, "_operator_service", OperatorService(Mock(), task_store=tasks),
+    )
+    client = app_module.app.test_client()
+    url = f"/api/v1/operators/tasks/{rec.task_id}"
+
+    for headers in ({}, {"X-API-Key": "invalid-key"}):
+        assert client.get(url, headers=headers).status_code == 401
+        assert client.get("/api/v1/operators/tasks/missing", headers=headers).status_code == 401
+
+    # Neither knowing the task ID nor supplying the owner's account parameter
+    # may override the account bound to the authenticated key.
+    for suffix in ("", "?account_id=acct-1"):
+        denied = client.get(url + suffix, headers={"X-API-Key": other_key})
+        assert denied.status_code == 404
+        assert denied.get_json() == {"error": "task not found"}
+
+    allowed = client.get(url, headers={"X-API-Key": owner_key})
+    assert allowed.status_code == 200
+    assert allowed.get_json()["result"] == rec.result
+    assert allowed.get_json()["account_id"] == "acct-1"
+    assert client.get(
+        "/api/v1/operators/tasks/missing", headers={"X-API-Key": owner_key},
+    ).status_code == 404
+
+
+@pytest.mark.parametrize("headers", [{}, {"X-API-Key": "invalid-key"}])
+def test_code_memory_only_compose_requires_valid_api_key(monkeypatch, tmp_path, headers):
+    service, _ = _make_service(tmp_path)
+    service.compose = Mock(side_effect=AssertionError("unauthenticated request delegated"))
+    monkeypatch.setattr(app_module, "_service", service)
+
+    response = app_module.app.test_client().post(
+        "/api/v1/compose",
+        json={"messages": [], "code_memory_only": True},
+        headers=headers,
+    )
+
+    assert response.status_code == 401
+    service.compose.assert_not_called()
+
+
+@pytest.mark.parametrize(
+    ("route", "method_name", "payload"),
+    [
+        (
+            "/api/v1/resources/code/sync/registrations",
+            "register_code_workspace",
+            {"path": "/private/repository", "name": "repo"},
+        ),
+        (
+            "/api/v1/resources/code/sync",
+            "sync_code_workspace",
+            {"root_id": "root-1"},
+        ),
+        (
+            "/api/v1/resources/code/upsert",
+            "upsert_code_resource",
+            {"path": "src/service.py", "root_slug": "repo"},
+        ),
+        (
+            "/api/v1/resources/code/search",
+            "search_code_resources",
+            {"query": "service", "scope": {"root_slugs": ["repo"]}},
+        ),
+        (
+            "/api/v1/resources/code/snippet",
+            "read_focused_code_snippet",
+            {"uri": "ctx://acct-1/resources/code-node", "max_chars": 32},
+        ),
+    ],
+)
+def test_code_memory_routes_delegate_with_authenticated_context(
+    monkeypatch,
+    tmp_path,
+    route,
+    method_name,
+    payload,
+):
+    """Unit-only Flask adapter coverage; canonical services are recording doubles."""
+
+    service, member_key = _make_service(tmp_path)
+    captured = []
+
+    def delegate(params):
+        captured.append(dict(params))
+        return {"ok": True, "root_id": "root-1", "locator": "repo/src/service.py:1-2"}
+
+    monkeypatch.setattr(service, method_name, delegate)
+    monkeypatch.setattr(app_module, "_service", service)
+    body = {**payload, "accountId": "foreign-request-value", "userId": "mallory"}
+
+    response = app_module.app.test_client().post(
+        route,
+        json=body,
+        headers={"X-API-Key": member_key},
+    )
+
+    assert response.status_code == 200
+    assert captured[0]["_ctx"].account_id == "acct-1"
+    assert captured[0]["_ctx"].user_id == "bob"
+    assert "/private/repository" not in response.get_data(as_text=True)
+
+
+@pytest.mark.parametrize(
+    ("route", "method_name"),
+    [
+        ("/api/v1/resources/code/sync/registrations", "register_code_workspace"),
+        ("/api/v1/resources/code/sync", "sync_code_workspace"),
+        ("/api/v1/resources/code/upsert", "upsert_code_resource"),
+        ("/api/v1/resources/code/search", "search_code_resources"),
+        ("/api/v1/resources/code/snippet", "read_focused_code_snippet"),
+    ],
+)
+@pytest.mark.parametrize("body", [b"[]", b"null", b"{", b""])
+def test_code_memory_routes_reject_missing_invalid_or_non_object_json_before_delegation(
+    monkeypatch,
+    tmp_path,
+    route,
+    method_name,
+    body,
+):
+    service, member_key = _make_service(tmp_path)
+    monkeypatch.setattr(
+        service,
+        method_name,
+        lambda params: (_ for _ in ()).throw(AssertionError(f"unexpected delegation: {params}")),
+    )
+    monkeypatch.setattr(app_module, "_service", service)
+
+    response = app_module.app.test_client().post(
+        route,
+        data=body,
+        content_type="application/json",
+        headers={"X-API-Key": member_key},
+    )
+
+    assert response.status_code == 400
+    assert response.get_json()["error"] == "request body must be a JSON object"
+
+
+@pytest.mark.parametrize(
+    "method",
+    [
+        "register_code_workspace",
+        "sync_code_workspace",
+        "refresh_code_resource",
+        "upsert_code_resource",
+        "search_code_resources",
+        "read_focused_code_snippet",
+        "edit_code_file",
+    ],
+)
+def test_generic_call_does_not_expose_code_memory_canonical_facades(monkeypatch, method):
+    monkeypatch.setattr(
+        app_module,
+        "_get_service",
+        lambda: (_ for _ in ()).throw(AssertionError("generic call initialized the service")),
+    )
+
+    response = app_module.app.test_client().post(f"/api/v1/call/{method}", json={})
+
+    assert response.status_code == 404
+    assert response.get_json() == {"error": f"unknown method: {method}"}
+
+
+@pytest.mark.parametrize(
+    ("route", "payload"),
+    [
+        ("/api/v1/resources/code/sync/registrations", {"path": "/private/repository"}),
+        ("/api/v1/resources/code/sync", {"root_id": "root-1"}),
+        ("/api/v1/resources/code/refresh", {"root_slug": "repo", "path": "src/service.py"}),
+        ("/api/v1/resources/code/upsert", {"root_slug": "repo", "path": "src/service.py"}),
+    ],
+)
+def test_workspace_mutation_routes_reject_member_before_delegation(
+    monkeypatch,
+    tmp_path,
+    route,
+    payload,
+):
+    service, member_key = _make_service(tmp_path)
+    monkeypatch.setattr(app_module, "_service", service)
+
+    response = app_module.app.test_client().post(
+        route,
+        json=payload,
+        headers={"X-API-Key": member_key},
+    )
+
+    assert response.status_code == 403
+
+
+def test_workspace_refresh_fails_closed_when_role_control_is_disabled(monkeypatch):
+    service = MemoryService(
+        config=OgMemConfig(
+            provider="mock",
+            vector_db_type="memory",
+            code_resources_enabled=True,
+        )
+    )
+    monkeypatch.setattr(app_module, "_service", service)
+
+    response = app_module.app.test_client().post(
+        "/api/v1/resources/code/refresh",
+        json={"root_slug": "repo", "path": "src/service.py"},
+    )
+
+    assert response.status_code == 503
+
+
+def test_code_memory_search_route_requires_authentication(monkeypatch, tmp_path):
+    service, _ = _make_service(tmp_path)
+    monkeypatch.setattr(
+        service,
+        "search_code_resources",
+        lambda params: (_ for _ in ()).throw(AssertionError("unauthenticated request delegated")),
+    )
+    monkeypatch.setattr(app_module, "_service", service)
+
+    response = app_module.app.test_client().post(
+        "/api/v1/resources/code/search",
+        json={"query": "service"},
+    )
+
+    assert response.status_code == 401
+
+
+def test_public_code_resource_delete_route_is_not_registered(monkeypatch, tmp_path):
+    service, _ = _make_service(tmp_path)
+    monkeypatch.setattr(app_module, "_service", service)
+
+    response = app_module.app.test_client().delete(
+        "/api/v1/resources/code-node",
+        json={},
+    )
+
+    assert response.status_code == 404
+
+
+@pytest.mark.parametrize(
+    ("route", "method_name", "error", "status"),
+    [
+        (
+            "/api/v1/resources/code/search",
+            "search_code_resources",
+            ValueError("invalid code search"),
+            400,
+        ),
+        (
+            "/api/v1/resources/code/snippet",
+            "read_focused_code_snippet",
+            FileNotFoundError("missing code snippet"),
+            404,
+        ),
+    ],
+)
+def test_code_memory_routes_use_existing_error_mapping(
+    monkeypatch,
+    tmp_path,
+    route,
+    method_name,
+    error,
+    status,
+):
+    service, member_key = _make_service(tmp_path)
+    monkeypatch.setattr(
+        service,
+        method_name,
+        lambda params: (_ for _ in ()).throw(error),
+    )
+    monkeypatch.setattr(app_module, "_service", service)
+
+    response = app_module.app.test_client().post(
+        route,
+        json={"query": "service", "uri": "ctx://acct-1/resources/code-node"},
+        headers={"X-API-Key": member_key},
+    )
+
+    assert response.status_code == status
+
+
 def test_session_working_set_route_requires_api_key_when_role_control_enabled(monkeypatch, tmp_path):
     service, _ = _make_service(tmp_path)
     monkeypatch.setattr(app_module, "_service", service)
@@ -114,6 +414,28 @@ def test_data_route_uses_trusted_identity_over_request_fields(monkeypatch, tmp_p
     assert payload["user"] == "bob"
 
 
+@pytest.mark.parametrize("code_memory_only", [None, "true", 1, {}])
+def test_compose_route_rejects_non_boolean_code_memory_only(
+    monkeypatch,
+    tmp_path,
+    code_memory_only,
+):
+    service, member_key = _make_service(tmp_path)
+    # _make_service uses a recording Compose stub for auth tests; restore the
+    # actual boundary implementation to verify Flask maps its validation error.
+    service.compose = MemoryService.compose.__get__(service, MemoryService)
+    monkeypatch.setattr(app_module, "_service", service)
+
+    response = app_module.app.test_client().post(
+        "/api/v1/compose",
+        json={"messages": [], "code_memory_only": code_memory_only},
+        headers={"X-API-Key": member_key},
+    )
+
+    assert response.status_code == 400
+    assert "code_memory_only" in response.get_json()["error"]
+
+
 def test_data_route_rejects_explicit_unowned_agent(monkeypatch, tmp_path):
     service, member_key = _make_service(tmp_path)
     monkeypatch.setattr(app_module, "_service", service)
@@ -129,6 +451,61 @@ def test_data_route_rejects_explicit_unowned_agent(monkeypatch, tmp_path):
     )
 
     assert resp.status_code == 403
+
+
+def test_tool_output_filter_route_reaches_memory_service_with_authenticated_context(
+    monkeypatch, tmp_path
+):
+    service, _ = _make_service(tmp_path)
+    captured = {}
+
+    def filter_bash(params):
+        captured.update(params)
+        return {"ok": True, "skipped": True, "reason": "below_min_chars"}
+
+    service.filter_bash = filter_bash
+    monkeypatch.setattr(app_module, "_service", service)
+    client = app_module.app.test_client()
+
+    response = client.post(
+        "/api/v1/filter_bash",
+        json={"agentId": "agent-1", "command": "pytest -q", "output": "short"},
+        headers={"X-API-Key": "root-key"},
+    )
+
+    assert response.status_code == 200
+    assert response.get_json()["reason"] == "below_min_chars"
+    assert captured["_ctx"].account_id == "acct-default"
+    assert captured["_ctx"].agent_id == "agent-1"
+
+
+def test_tool_output_recovery_marks_original_as_untrusted(monkeypatch, tmp_path):
+    service, _ = _make_service(tmp_path)
+    captured = {}
+
+    def recover_original(params):
+        captured.update(params)
+        return {
+            "ok": True,
+            "memory_uri": params["memory_uri"],
+            "original": "external command output",
+        }
+
+    service.read_tool_output_original = recover_original
+    monkeypatch.setattr(app_module, "_service", service)
+    client = app_module.app.test_client()
+    uri = "ctx://acct-default/agents/agent-1/memories/tool_outputs/item"
+
+    response = client.post(
+        "/api/v1/tool_output_original",
+        json={"agentId": "agent-1", "memory_uri": uri},
+        headers={"X-API-Key": "root-key"},
+    )
+
+    assert response.status_code == 200
+    assert response.get_json()["untrusted_data_notice"] == UNTRUSTED_DATA_NOTICE
+    assert captured["_ctx"].account_id == "acct-default"
+    assert captured["_ctx"].agent_id == "agent-1"
 
 
 def test_trace_route_persists_canonical_non_boundary_event_without_finalizing(

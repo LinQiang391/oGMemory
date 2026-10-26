@@ -12,13 +12,16 @@ Happy path: event → process → delete
 Failure path: retry with exponential backoff → DLQ after MAX_RETRY
 """
 
+import hashlib
 import inspect
+import json
 import logging
 import re
 import uuid
 from contextlib import ExitStack, nullcontext
-from dataclasses import dataclass, replace
+from dataclasses import asdict, dataclass, replace
 from datetime import UTC, datetime, timedelta
+from typing import Protocol, cast
 
 from core.errors import NodeNotFoundError
 from core.interfaces import LLM, ContextFS, Embedder, VectorIndex
@@ -31,16 +34,24 @@ from providers.token_tracker import (
     request_usage_scope,
     usage_scope,
 )
+from retrieval.bm25_index import Bm25Index, build_code_bm25_document
 
 logger = logging.getLogger(__name__)
 
 _MEMORY_OWNER_PATTERN = re.compile(
     r"^ctx://(?P<account>[^/]+)/(?P<owner_type>users|agents)/(?P<owner_id>[^/]+)/"
 )
+_RESOURCE_PATTERN = re.compile(r"^ctx://(?P<account>[^/]+)/resources(?:/|$)")
 
 DEFAULT_MAX_RETRY: int = 5
 DEFAULT_BASE_DELAY_MS: int = 1000
 DEFAULT_MAX_DELAY_MS: int = 60000
+
+
+class _DurableDeletePayloadFS(Protocol):
+    def is_tombstoned(self, uri: str, ctx: RequestContext) -> bool: ...
+
+    def delete_node_payload(self, uri: str, ctx: RequestContext) -> None: ...
 
 
 @dataclass
@@ -84,7 +95,9 @@ class OutboxWorker:
         fs: ContextFS | None = None,
         llm: LLM | None = None,
         directory_summary_enabled: bool = True,
+        bm25_index: Bm25Index | None = None,
         agent_memory_handler=None,
+        memory_projection_handler=None,
     ) -> None:
         """Initialize the OutboxWorker.
 
@@ -95,6 +108,7 @@ class OutboxWorker:
             fs: ContextFS for reading directory children (required for UPSERT_DIRECTORY)
             llm: LLM for generating directory summaries (required for UPSERT_DIRECTORY)
             directory_summary_enabled: If False, skip UPSERT_DIRECTORY events
+            bm25_index: Optional shared lexical index for code IndexRecords
         """
         self._vector_index = vector_index
         self._embedder = embedder
@@ -102,12 +116,24 @@ class OutboxWorker:
         self._fs = fs
         self._llm = llm
         self._directory_summary_enabled = directory_summary_enabled
+        self._bm25_index = bm25_index
         self._agent_memory_handler = agent_memory_handler
+        self._memory_projection_handler = memory_projection_handler
 
-    @staticmethod
-    def _has_real_method(instance, name: str) -> bool:
-        """Return whether the instance class defines a callable method."""
-        return instance is not None and callable(getattr(type(instance), name, None))
+    def _upsert_code_bm25(self, records: list[IndexRecord]) -> None:
+        if self._bm25_index is None:
+            return
+        documents = [
+            document
+            for record in records
+            if (document := build_code_bm25_document(record)) is not None
+        ]
+        if documents:
+            self._bm25_index.bulk_upsert(documents)
+
+    def _delete_bm25(self, record_ids: list[str]) -> None:
+        if self._bm25_index is not None:
+            self._bm25_index.delete(record_ids)
 
     def process_event(
         self,
@@ -125,7 +151,10 @@ class OutboxWorker:
         Returns:
             WorkerResult with success status
         """
-        if event.retry_count >= self._config.max_retry:
+        if (
+            event.retry_count >= self._config.max_retry
+            and not self._is_durable_delete_event(event)
+        ):
             return self._handle_max_retry_exceeded(event)
 
         try:
@@ -161,7 +190,7 @@ class OutboxWorker:
                 with scope:
                     return self._process_upsert_directory(event, resolved_ctx)
             elif event_type == "DELETE_CONTEXT":
-                return self._process_delete_context(event)
+                return self._process_delete_context(event, ctx)
             elif event_type == "ARCHIVE_CONTEXT":
                 return self._process_archive_context(event)
             else:
@@ -212,6 +241,8 @@ class OutboxWorker:
             obsolete = [key for key in event.payload.get("ids_to_delete", []) if key not in current_ids]
             if obsolete:
                 self._vector_index.delete(obsolete)
+                self._delete_bm25(obsolete)
+        records = self._current_projection_records(event, records)
         if not records:
             logger.warning("Event %s has no records to index", event.event_id)
             return WorkerResult(
@@ -226,6 +257,7 @@ class OutboxWorker:
             embeddings = self._embedder.embed_texts(texts)
         augmented_records = self._augment_with_embeddings(records, embeddings)
         self._vector_index.upsert(augmented_records)
+        self._upsert_code_bm25(records)
 
         logger.info(
             "Successfully processed UPSERT_CONTEXT %s, "
@@ -238,6 +270,62 @@ class OutboxWorker:
             success=True,
             records_upserted=len(records),
         )
+
+    @staticmethod
+    def _projection_record_fingerprint(records: list[IndexRecord]) -> str:
+        values = [(item.id, item.uri, item.level, item.text, item.filters, item.metadata)
+                  for item in records]
+        return hashlib.sha256(json.dumps(values, sort_keys=True, default=str).encode()).hexdigest()
+
+    def _is_memory_projection_event(self, event: OutboxEvent) -> bool:
+        return bool(self._memory_projection_handler is not None
+                    and _MEMORY_OWNER_PATTERN.match(event.uri)
+                    and "/memories/" in event.uri
+                    and event.event_type in {"UPSERT_CONTEXT", "ARCHIVE_CONTEXT", "DELETE_CONTEXT"})
+
+    def _current_projection_records(self, event: OutboxEvent, records: list[IndexRecord]) -> list[IndexRecord]:
+        if not self._is_memory_projection_event(event):
+            return records
+        if self._fs is None:
+            raise RuntimeError("memory projection requires canonical node storage")
+        from index.index_record_builder import build_index_records
+
+        try:
+            node = self._fs.read_node(event.uri, self._build_request_context(event))
+        except NodeNotFoundError:
+            return []
+        if node.context_type != "MEMORY" or node.metadata.get("node_type") == "directory":
+            return records
+        current = build_index_records(node)
+        event.payload["records"] = [asdict(record) for record in current]
+        event.payload["_memory_projection_version"] = node.metadata.get("version")
+        event.payload["_memory_projection_fingerprint"] = self._projection_record_fingerprint(current)
+        return current
+
+    def _notify_memory_projection(self, event: OutboxEvent, result: WorkerResult) -> None:
+        if not self._is_memory_projection_event(event):
+            return
+        if event.event_type == "UPSERT_CONTEXT" and result.records_upserted == 0:
+            return
+        if self._fs is None:
+            raise RuntimeError("memory projection requires canonical node storage")
+        ctx = self._build_request_context(event)
+        try:
+            node = self._fs.read_node(event.uri, ctx)
+        except NodeNotFoundError:
+            node = None
+        if event.event_type == "UPSERT_CONTEXT":
+            if node is None or node.context_type != "MEMORY" or node.metadata.get("node_type") == "directory":
+                return
+            from index.index_record_builder import build_index_records
+
+            fingerprint = self._projection_record_fingerprint(build_index_records(node))
+            if (fingerprint != event.payload.get("_memory_projection_fingerprint")
+                    or node.metadata.get("version") != event.payload.get("_memory_projection_version")):
+                raise RuntimeError("canonical memory changed during indexing")
+        elif node is not None:
+            return
+        self._memory_projection_handler(event, ctx)
 
     def _process_upsert_directory(
         self,
@@ -327,7 +415,33 @@ class OutboxWorker:
             records_upserted=result.stats.completed_dirs,
         )
 
-    def _process_delete_context(self, event: OutboxEvent) -> WorkerResult:
+    @staticmethod
+    def _has_real_method(instance, name: str) -> bool:
+        """Return whether ``name`` is defined by the instance's real class."""
+
+        return instance is not None and callable(getattr(type(instance), name, None))
+
+    def _cleanup_tombstoned_payload(
+        self,
+        event: OutboxEvent,
+        ctx: RequestContext | None,
+    ) -> None:
+        """Finish an AGFS durable delete before the event can be acknowledged."""
+
+        if ctx is None or self._fs is None or not all(
+            self._has_real_method(self._fs, method)
+            for method in ("is_tombstoned", "delete_node_payload")
+        ):
+            return
+        fs = cast(_DurableDeletePayloadFS, self._fs)
+        if fs.is_tombstoned(event.uri, ctx):
+            fs.delete_node_payload(event.uri, ctx)
+
+    def _process_delete_context(
+        self,
+        event: OutboxEvent,
+        ctx: RequestContext | None,
+    ) -> WorkerResult:
         """Process DELETE_CONTEXT event.
 
         If the payload contains ``ids_to_delete`` (emitted by move_node),
@@ -336,6 +450,7 @@ class OutboxWorker:
 
         Args:
             event: OutboxEvent with deleted URI
+            ctx: RequestContext for tombstoned AGFS payload cleanup
 
         Returns:
             WorkerResult with success status
@@ -352,6 +467,8 @@ class OutboxWorker:
             ]
 
         self._vector_index.delete(ids_to_delete)
+        self._delete_bm25(ids_to_delete)
+        self._cleanup_tombstoned_payload(event, ctx)
 
         logger.info(
             "Successfully processed DELETE_CONTEXT %s, "
@@ -389,6 +506,7 @@ class OutboxWorker:
             ]
 
         self._vector_index.delete(ids_to_delete)
+        self._delete_bm25(ids_to_delete)
 
         logger.info(
             "Successfully processed ARCHIVE_CONTEXT %s, "
@@ -411,7 +529,8 @@ class OutboxWorker:
         Returns:
             Timedelta for delay before next retry
         """
-        delay_ms = self._config.base_delay_ms * (2 ** retry_count)
+        exponent = min(max(retry_count, 0), 30)
+        delay_ms = self._config.base_delay_ms * (2 ** exponent)
         delay_ms = min(delay_ms, self._config.max_delay_ms)
         return timedelta(milliseconds=delay_ms)
 
@@ -427,9 +546,20 @@ class OutboxWorker:
         """
         if result.success:
             return False
+        if self._is_durable_delete_event(event):
+            return True
         if event.retry_count >= self._config.max_retry:
             return False
         return True
+
+    @staticmethod
+    def _is_durable_delete_event(event: OutboxEvent) -> bool:
+        """Return whether DELETE must remain live until payload cleanup succeeds."""
+
+        return bool(
+            event.event_type == "DELETE_CONTEXT"
+            and event.payload.get("durable_delete") is True
+        )
 
     def _extract_records(self, event: OutboxEvent) -> list[IndexRecord]:
         """Extract IndexRecords from event payload.
@@ -583,6 +713,7 @@ class OutboxWorker:
             stats: Statistics dict to update
         """
         if result.success:
+            self._notify_memory_projection(event, result)
             outbox_store.mark_done(event, node_uri)
             stats["succeeded"] += 1
             return
@@ -617,7 +748,16 @@ class OutboxWorker:
         """Build a minimal RequestContext for event processing when possible."""
         match = _MEMORY_OWNER_PATTERN.match(event.uri)
         if not match:
-            return None
+            resource_match = _RESOURCE_PATTERN.match(event.uri)
+            if not resource_match:
+                return None
+            return RequestContext(
+                account_id=resource_match.group("account"),
+                user_id="outbox-worker",
+                agent_id="outbox-worker",
+                session_id=f"outbox:{event.event_id}",
+                trace_id=f"outbox:{event.event_id}",
+            )
 
         account_id = match.group("account")
         owner_type = match.group("owner_type")
@@ -687,11 +827,31 @@ class OutboxWorker:
             return outbox_store.processing_lock(node_uri)
         return nullcontext()
 
+    @staticmethod
+    def _is_upsert_event(event: OutboxEvent) -> bool:
+        return event.event_type in {"UPSERT_CONTEXT", "UPSERT_DIRECTORY"}
+
+    @staticmethod
+    def _event_is_current(outbox_store, event: OutboxEvent, node_uri: str) -> bool:
+        """Call one- or two-argument liveness implementations safely."""
+
+        method = getattr(outbox_store, "is_event_current")
+        try:
+            signature = inspect.signature(method)
+        except (TypeError, ValueError):
+            # Some extension-backed callables do not expose a signature.
+            return bool(method(event.event_id))
+        try:
+            signature.bind(event.event_id, node_uri)
+        except TypeError:
+            return bool(method(event.event_id))
+        return bool(method(event.event_id, node_uri))
+
     def _rollback_stale_upsert(
         self,
         event: OutboxEvent,
         outbox_store,
-        ctx: RequestContext,
+        ctx: RequestContext | None,
     ) -> None:
         """Delete vector records and directory nodes for a tombstoned event.
 
@@ -712,6 +872,7 @@ class OutboxWorker:
 
         if ids:
             self._vector_index.delete(ids)
+            self._delete_bm25(ids)
             logger.info(
                 "Rolled back %d stale records for tombstoned event %s",
                 len(ids), event.event_id,
@@ -720,6 +881,12 @@ class OutboxWorker:
         # Delete stale directory summary nodes written during processing.
         written_dir_uris = event.payload.get("written_dir_uris", [])
         if written_dir_uris and self._fs:
+            if ctx is None:
+                logger.error(
+                    "Cannot roll back stale directory nodes without request context: %s",
+                    event.event_id,
+                )
+                return
             failed_uris: list[str] = []
             for dir_uri in written_dir_uris:
                 try:
@@ -822,7 +989,10 @@ class OutboxWorker:
         # claim_batch and here, skip processing to avoid writing stale
         # vectors at the old URI.  DB errors propagate so we don't
         # accidentally skip legitimate events.
-        if self._supports_liveness_check(outbox_store):
+        if (
+            self._is_upsert_event(event)
+            and self._supports_liveness_check(outbox_store)
+        ):
             try:
                 current = self._event_is_current(outbox_store, event, node_uri)
             except Exception:
@@ -851,7 +1021,11 @@ class OutboxWorker:
             # returned True but *before* the upsert finished.
             # On DB error, treat the event as failed so it retries
             # rather than silently acking potentially stale vectors.
-            if result.success and self._supports_liveness_check(outbox_store):
+            if (
+                result.success
+                and self._is_upsert_event(event)
+                and self._supports_liveness_check(outbox_store)
+            ):
                 try:
                     current = self._event_is_current(outbox_store, event, node_uri)
                 except Exception:
@@ -925,6 +1099,7 @@ class OutboxWorker:
                 augmented = self._augment_with_embeddings(records, embeddings)
                 try:
                     self._vector_index.upsert(augmented)
+                    self._upsert_code_bm25(records)
                     result = WorkerResult(
                         event_id=event.event_id,
                         success=True,
@@ -1009,7 +1184,7 @@ class OutboxWorker:
 
         # Collect all pending events across accounts, grouped by type.
         # UPSERT_CONTEXT events are batch-embedded for efficiency.
-        all_pending: list[tuple[str, object]] = []  # (node_uri, event)
+        all_pending: list[tuple[str, OutboxEvent]] = []
         for account_id in account_ids:
             try:
                 pending = outbox_store.list_pending(account_id)
@@ -1019,8 +1194,8 @@ class OutboxWorker:
             all_pending.extend(pending)
 
         # Phase 1: Batch-embed all UPSERT_CONTEXT events
-        upsert_batch: list[tuple[object, str, list[IndexRecord]]] = []  # (event, node_uri, records)
-        other_events: list[tuple[object, str]] = []  # (event, node_uri)
+        upsert_batch: list[tuple[OutboxEvent, str, list[IndexRecord]]] = []
+        other_events: list[tuple[OutboxEvent, str]] = []
 
         for node_uri, event in all_pending:
             if event.event_type in excluded_types:
@@ -1034,9 +1209,47 @@ class OutboxWorker:
                 stats["skipped"] += 1
                 continue
 
+            if (
+                self._is_upsert_event(event)
+                and self._supports_liveness_check(outbox_store)
+            ):
+                try:
+                    current = self._event_is_current(outbox_store, event, node_uri)
+                except Exception as exc:
+                    logger.warning(
+                        "Pre-upsert liveness check failed for %s",
+                        event.event_id,
+                        exc_info=True,
+                    )
+                    failure_result = WorkerResult(
+                        event_id=event.event_id,
+                        success=False,
+                        error_message=str(exc),
+                    )
+                    stats["processed"] += 1
+                    self._handle_processing_result(
+                        event,
+                        node_uri,
+                        outbox_store,
+                        failure_result,
+                        stats,
+                    )
+                    continue
+                if not current:
+                    try:
+                        outbox_store.release(event, node_uri)
+                    except Exception:
+                        logger.debug(
+                            "Stale event lock was already removed for %s",
+                            event.event_id,
+                            exc_info=True,
+                        )
+                    stats["skipped"] += 1
+                    continue
+
             if event.event_type == "UPSERT_CONTEXT" and event.payload.get("agent_memory_version") != 1:
                 try:
-                    records = self._extract_records(event)
+                    records = self._current_projection_records(event, self._extract_records(event))
                     if records:
                         upsert_batch.append((event, node_uri, records))
                     else:
@@ -1061,6 +1274,23 @@ class OutboxWorker:
             try:
                 ctx = self._build_request_context(event)
                 result = self.process_event(event, ctx)
+                if (
+                    result.success
+                    and self._is_upsert_event(event)
+                    and self._supports_liveness_check(outbox_store)
+                ):
+                    current = self._event_is_current(outbox_store, event, node_uri)
+                    if not current:
+                        self._rollback_stale_upsert(
+                            event,
+                            outbox_store,
+                            ctx,
+                        )
+                        result = WorkerResult(
+                            event_id=event.event_id,
+                            success=True,
+                            records_upserted=0,
+                        )
                 self._handle_processing_result(event, node_uri, outbox_store, result, stats)
             except Exception as e:
                 logger.error("Exception processing event %s: %s", event.event_id, e, exc_info=True)
@@ -1068,22 +1298,6 @@ class OutboxWorker:
                 self._handle_processing_result(event, node_uri, outbox_store, failure_result, stats)
 
         return stats
-
-    @staticmethod
-    def _event_is_current(outbox_store, event: OutboxEvent, node_uri: str) -> bool:
-        """Call one- or two-argument liveness implementations safely."""
-
-        method = getattr(outbox_store, "is_event_current")
-        try:
-            signature = inspect.signature(method)
-        except (TypeError, ValueError):
-            # Some extension-backed callables do not expose a signature.
-            return bool(method(event.event_id))
-        try:
-            signature.bind(event.event_id, node_uri)
-        except TypeError:
-            return bool(method(event.event_id))
-        return bool(method(event.event_id, node_uri))
 
 
 def create_upsert_event(

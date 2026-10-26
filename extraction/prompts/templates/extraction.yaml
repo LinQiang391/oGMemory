@@ -40,6 +40,19 @@ system_prompt: |
   - NEVER infer, guess, or fabricate facts not explicitly stated
   - Copy proper nouns, field names, version numbers VERBATIM
 
+  **REFERENCE RESOLUTION — MEMORIES MUST STAND ALONE:**
+  - In any language, resolve references such as "this system", "the current project" and "it" to the exact
+    named subject established in the conversation. Preserve that name in abstract, overview and content.
+  - Prior session context and assistant replies may ONLY help identify an already established referent;
+    they cannot establish a new user preference, requirement or factual claim. The user's statement
+    must still support the extracted fact. Keep evidence_quote verbatim, including its original pronouns.
+  - Distinguish the system being designed from reference products, databases, clients and the memory
+    service itself. A browser URL, workspace path or a name appearing nearby is not enough to bind a subject.
+  - If several subjects are plausible or no name is established, preserve the uncertainty explicitly;
+    never guess a project name or turn a project-specific requirement into a global user preference.
+  - For a project-specific preference, name the project in every summary/body and use its established
+    name as scope_ref so the same topic in another project is not merged. General preferences use empty scope_ref.
+
   **HIGH RECALL STRATEGY:**
   - Preserve supported information in the appropriate category, without duplicating it across categories
   - Category eligibility precedes recall; lower confidence cannot authorize excluded chatter
@@ -264,14 +277,14 @@ examples: |
 
   ## profile vs entity — Report about another person
   Conversation:
-    user: "朋友跟我说他是一名建筑师"
+    user: "My friend told me he is an architect."
 
   ✅ CORRECT — extract_entity for the friend:
     routing_key: "friend"
     abstract: "User's friend is an architect"
     overview: "- The user's friend is an architect."
     content: "# User's friend\n\n## Career\n- The user's friend is an architect."
-    who: "朋友"
+    who: "friend"
     confidence: 0.7
 
   ❌ WRONG — extract_profile (friend is an architect, not the user)

@@ -17,6 +17,7 @@
             <p>工作区</p>
             <button class="sidebar-link" type="button" data-view="dashboard"><span>⌁</span>控制台</button>
             <button class="sidebar-link active" type="button" data-view="memory" aria-current="page"><span>▤</span>记忆</button>
+            <button class="sidebar-link" type="button" data-view="scenes" aria-label="场景记忆"><span>◈</span>场景记忆</button>
             <button class="sidebar-link" type="button" data-view="retrieval"><span>⌕</span>检索</button>
             <button class="sidebar-link" type="button" data-view="skill"><span>✧</span>Agent Skill</button>
           </section>
@@ -145,6 +146,34 @@
         </article>
       </section>
       </section>
+      <section id="scenes-view" class="scenes-view" hidden>
+        <header class="scenes-heading">
+          <div><h1>场景记忆</h1><p>查看场景的时间脉络与关联记忆。</p></div>
+          <button id="scenes-refresh" class="secondary-button" type="button">↻ 刷新</button>
+        </header>
+        <div class="scenes-toolbar">
+          <label for="scenes-scope">记忆范围<select id="scenes-scope" aria-label="场景记忆范围"><option value="">加载中</option></select></label>
+          <span id="scenes-count" role="status"></span>
+        </div>
+        <div class="scenes-workspace">
+          <section aria-label="场景列表">
+            <div id="scenes-list" class="scenes-list" aria-live="polite"></div>
+            <footer id="scenes-pagination" class="tasks-pagination" hidden>
+              <span id="scenes-page-summary"></span>
+              <div><button id="scenes-previous" type="button">上一页</button><button id="scenes-next" type="button">下一页</button></div>
+            </footer>
+          </section>
+          <article id="scene-detail" class="scene-detail" hidden>
+            <header><span id="scene-detail-origin" class="section-label"></span><h2 id="scene-detail-title"></h2></header>
+            <div id="scene-detail-meta" class="scene-meta"></div>
+            <p id="scene-detail-description" class="scene-description"></p>
+            <section class="scene-members-section">
+              <h3>关联记忆 <span id="scene-detail-member-count"></span></h3>
+              <div id="scene-detail-members" class="scene-members"></div>
+            </section>
+          </article>
+        </div>
+      </section>
       <section id="retrieval-view" class="retrieval-view" hidden>
         <form id="retrieval-form" class="retrieval-form">
           <span aria-hidden="true">⌕</span>
@@ -198,14 +227,16 @@
       </div>
     </div>
 
-    <dialog id="settings-dialog" class="settings-dialog">
+    <dialog id="settings-dialog" class="settings-dialog" aria-labelledby="settings-title" aria-describedby="settings-description">
       <form id="settings-form">
         <div class="dialog-head">
-          <div><span class="section-label">连接</span><h2>查看范围</h2></div>
+          <div><h2 id="settings-title">连接 oGMemory</h2></div>
           <button id="settings-close" class="close-button" type="button" aria-label="关闭">×</button>
         </div>
-        <label>API Key<input id="api-key-input" type="password" placeholder="启用权限控制时填写" autocomplete="off"></label>
-        <button id="save-settings" class="primary-button" type="submit">保存并刷新</button>
+        <p id="settings-description" class="settings-description">请输入管理员为你分配的 oGMemory API Key。连接后将显示你有权限查看的内容。</p>
+        <label>API Key<input id="api-key-input" type="password" placeholder="请输入你的 API Key" autocomplete="off" aria-describedby="settings-help"></label>
+        <button id="save-settings" class="primary-button" type="submit">连接</button>
+        <p id="settings-help" class="settings-help">没有 API Key？请联系管理员获取。</p>
       </form>
     </dialog>
 

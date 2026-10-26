@@ -23,7 +23,7 @@ Marketplace：
 源码开发：
 
 ```bash
-claude --plugin-dir ./claude-plugin --debug
+claude --plugin-dir ./plugins/claude-code --debug
 ```
 
 ## 3. 配置
@@ -95,7 +95,7 @@ Read/Bash 输出过滤、手动 `/og-add-history` / `/og-compose` 和 MCP 工具
 | `PreCompact` | 两个脚本 | Trace `pre_compact` + 同步 `/after_turn` | 5s + 600s |
 | `SessionEnd` | `call_add_session_message.py` | Trace `session_end` | 5s |
 
-Hook 定义：[`../../claude-plugin/hooks/hooks.json`](../../claude-plugin/hooks/hooks.json)。
+Hook 定义：[`../../plugins/claude-code/hooks/hooks.json`](../../plugins/claude-code/hooks/hooks.json)。
 
 ## 5. Prompt 前自动召回
 

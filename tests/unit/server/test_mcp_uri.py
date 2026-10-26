@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from urllib.parse import quote
+
 import pytest
 
 from core.models import RequestContext
@@ -164,3 +166,43 @@ def test_legacy_agent_pattern_uri_maps_to_scoped_public_uri():
 def test_public_uri_validation_rejects_unsafe_inputs(uri):
     with pytest.raises(ValueError):
         parse_ogmemory_uri(uri)
+
+
+@pytest.mark.parametrize("uri", [
+    "http://example.test/memory",
+    "https://example.test/memory",
+    "ogmemory://memories/preference/target?view=content",
+    "ogmemory://memories/preference/target#content",
+    "ogmemory://memories/preference/target?",
+    "ogmemory://memories/preference/target#",
+    "\nogmemory://memories/preference/target",
+    "ogmemory://memories/preference/tar\tget",
+    "ogmemory://memories/preference/target%00",
+    "ogmemory://memories/preference//target",
+    "ogmemory://memories/preference/target/",
+    "ogmemory://memories/preference/",
+    "ogmemory://status/",
+    "ogmemory://memories/preference/coffee shop",
+    "ogmemory://memories/preference/bad%GG",
+    "ogmemory://memories/preference/bad%FF",
+])
+def test_public_uri_rejects_text_that_changes_during_parsing(uri):
+    with pytest.raises(ValueError):
+        parse_ogmemory_uri(uri)
+
+
+def test_encoded_reserved_characters_remain_part_of_memory_name():
+    assert external_to_internal_uri(
+        "ogmemory://memories/preference/Symbols%3FHash%23%E6%A0%87%E8%AE%B0", _ctx()
+    ) == "ctx://acct-1/users/alice/memories/preferences/Symbols?Hash#标记"
+
+
+def test_historical_percent_escape_fallback_preserves_ascii_case():
+    encoded = quote("Mixed历史", safe="")
+    assert external_to_internal_uri_candidates(
+        "ogmemory://memories/preference/" + encoded, _ctx()
+    ) == [
+        "ctx://acct-1/users/alice/memories/preferences/Mixed历史",
+        "ctx://acct-1/users/alice/memories/preferences/" + encoded,
+        "ctx://acct-1/users/alice/memories/preferences/Mixed" + quote("历史", safe="").lower(),
+    ]

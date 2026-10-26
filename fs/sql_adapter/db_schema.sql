@@ -91,6 +91,8 @@ CREATE TABLE IF NOT EXISTS session_archives (
     archive_id    VARCHAR(64)  NOT NULL,
     session_id    VARCHAR(128) NOT NULL,
     account_id    VARCHAR(128) NOT NULL,
+    owner_user_id VARCHAR(128) NOT NULL DEFAULT '',
+    owner_agent_id VARCHAR(128) NOT NULL DEFAULT '',
     abstract      TEXT         NOT NULL DEFAULT '',
     overview      TEXT         NOT NULL DEFAULT '',
     messages      JSONB        NOT NULL DEFAULT '[]',
@@ -177,6 +179,31 @@ DO $$ BEGIN
 EXCEPTION WHEN duplicate_object THEN NULL;
 END $$;
 
+-- Complete logical tool outputs externalized from ordinary memory messages.
+CREATE TABLE IF NOT EXISTS tool_result_artifacts (
+    account_id       VARCHAR(128) NOT NULL,
+    session_id       VARCHAR(128) NOT NULL,
+    owner_user_id    VARCHAR(128) NOT NULL,
+    owner_agent_id   VARCHAR(128) NOT NULL,
+    artifact_id      VARCHAR(96)  NOT NULL,
+    output_text      TEXT         NOT NULL,
+    metadata         JSONB        NOT NULL,
+    content_sha256   VARCHAR(64)  NOT NULL,
+    created_at       TIMESTAMPTZ  NOT NULL DEFAULT NOW(),
+    PRIMARY KEY (account_id, session_id, owner_user_id, owner_agent_id, artifact_id)
+);
+CREATE INDEX IF NOT EXISTS idx_tool_result_artifacts_list
+    ON tool_result_artifacts
+       (account_id, session_id, owner_user_id, owner_agent_id, artifact_id DESC);
+ALTER TABLE tool_result_artifacts ENABLE ROW LEVEL SECURITY;
+ALTER TABLE tool_result_artifacts FORCE ROW LEVEL SECURITY;
+DO $$ BEGIN
+    CREATE POLICY tenant_isolation ON tool_result_artifacts
+        USING (account_id = current_setting('app.account_id', true))
+        WITH CHECK (account_id = current_setting('app.account_id', true));
+EXCEPTION WHEN duplicate_object THEN NULL;
+END $$;
+
 -- dream_recalls
 ALTER TABLE dream_recalls ENABLE ROW LEVEL SECURITY;
 ALTER TABLE dream_recalls FORCE ROW LEVEL SECURITY;
@@ -230,6 +257,23 @@ CREATE TABLE IF NOT EXISTS cp_audit_logs (
     details     JSONB        NOT NULL DEFAULT '{}'
 );
 CREATE INDEX IF NOT EXISTS idx_cp_audit_account ON cp_audit_logs (account_id);
+
+-- Protected workspace-sync registry. Canonical local paths stay in the JSON
+-- state owned by the server control plane and never enter ContextFS/index
+-- metadata. SQL row locks make lease and dirty-state transitions atomic across
+-- application workers.
+CREATE TABLE IF NOT EXISTS code_workspace_sync_roots (
+    account_id       VARCHAR(128) NOT NULL,
+    root_id          VARCHAR(128) NOT NULL,
+    state            JSONB        NOT NULL DEFAULT '{}',
+    lease_owner      VARCHAR(128),
+    lease_expires_at TIMESTAMPTZ,
+    created_at       TIMESTAMPTZ  NOT NULL DEFAULT NOW(),
+    updated_at       TIMESTAMPTZ  NOT NULL DEFAULT NOW(),
+    PRIMARY KEY (account_id, root_id)
+);
+CREATE INDEX IF NOT EXISTS idx_workspace_sync_due
+    ON code_workspace_sync_roots (account_id, lease_expires_at, updated_at);
 
 -- ============================================================
 -- Agent lifecycle traces

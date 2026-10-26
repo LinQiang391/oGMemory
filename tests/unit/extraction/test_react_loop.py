@@ -173,6 +173,19 @@ class TestLoopControl:
         result = _make_loop(llm=llm).run("conv", _ctx(), prefetch)
         assert "ctx://acme/p" in result.read_uris
 
+    def test_prefetch_tracking_is_reset_between_runs(self):
+        llm = _make_llm()
+        for _ in range(3):
+            llm._queue.append(([], _extract_json()))
+        loop = _make_loop(llm=llm)
+        for uri in ("ctx://acme/first", "ctx://acme/second"):
+            prefetch = PrefetchResult(
+                messages=["ctx"], read_uris={uri}, listed_uris=set(),
+            )
+            result = loop.run("conv", _ctx(), prefetch)
+            assert result.read_uris == {uri}
+        assert loop.run("no prefetch", _ctx()).read_uris == set()
+
     def test_unread_existing_file_refetch_uris_are_deduplicated(self):
         """Multiple candidates targeting the same existing URI are refetched once."""
         fs = _make_fs(exists=True)
@@ -442,5 +455,5 @@ class TestErrorHandling:
         """An API failure must not be reported as a successful empty extraction."""
         llm = _make_llm()
         llm.complete_with_tools_messages = Mock(side_effect=RuntimeError("API down"))
-        with pytest.raises(ExtractionIncompleteError, match="no_valid_output"):
+        with pytest.raises(ExtractionIncompleteError, match="llm_error"):
             _make_loop(llm=llm).run("conv", _ctx())

@@ -131,6 +131,7 @@ def test_prepare_compaction_advances_watermark_when_only_assistant_messages(serv
     mgr = service.get_session_manager()
     mgr.add_message("sess-compact", "assistant", "only assistant", ctx)
     buf = mgr.get_or_create("sess-compact")
+    existing_summary = buf.extraction_summary
 
     write_api = Mock()
     service._write_api = write_api
@@ -140,7 +141,7 @@ def test_prepare_compaction_advances_watermark_when_only_assistant_messages(serv
     assert result["messages"] == []
     write_api.commit_session.assert_not_called()
     assert buf.extraction_watermark == 1
-    assert buf.extraction_summary == ""
+    assert buf.extraction_summary == existing_summary
 
 
 def test_after_turn_deduplicates_completed_client_request(service: MemoryService, ctx: RequestContext):
@@ -570,7 +571,8 @@ def test_after_turn_wait_true_runs_extraction_and_outbox_drain_synchronously(
     service._async_drain.assert_not_called()
 
 
-def test_after_turn_background_write_failure_rewinds_watermark_and_skips_archive_commit(service: MemoryService, ctx: RequestContext, monkeypatch):
+@pytest.mark.parametrize("extractor_error", [False, True])
+def test_after_turn_background_write_failure_rewinds_watermark_and_skips_archive_commit(service: MemoryService, ctx: RequestContext, monkeypatch, extractor_error):
     service._cfg.after_turn_threshold = 1
     service._write_api = Mock()
     service._chunk_and_extract = Mock(return_value={
@@ -581,6 +583,17 @@ def test_after_turn_background_write_failure_rewinds_watermark_and_skips_archive
         "writes_failed": 1,
         "plans": [],
     })
+    if extractor_error:
+        # Exercise the real candidate pipeline boundary, not just a write-result
+        # failure: model/parser exceptions must reach the watermark rewind path.
+        from commit.candidate_pipeline import CandidatePipeline
+
+        extractor = Mock()
+        extractor.extract.side_effect = ValueError("No valid JSON found in LLM output")
+        pipeline = CandidatePipeline([extractor])
+        service._chunk_and_extract.side_effect = lambda **kwargs: pipeline.extract(
+            kwargs["messages"], kwargs["ctx"],
+        )
     service._async_drain = Mock()
     mgr = service.get_session_manager()
     mgr._write_archive = Mock(return_value={
@@ -1242,7 +1255,7 @@ class TestAfterTurnDedup:
 
 def test_openclaw_plugin_manifest_exposes_compaction_config_schema():
     repo_root = Path(__file__).resolve().parents[3]
-    manifest_path = repo_root / "openclaw_context_engine_plugin" / "openclaw.plugin.json"
+    manifest_path = repo_root / "plugins/openclaw" / "openclaw.plugin.json"
     manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
     props = manifest["configSchema"]["properties"]
 
@@ -1252,3 +1265,15 @@ def test_openclaw_plugin_manifest_exposes_compaction_config_schema():
     assert props["summaryMaxChars"]["default"] == 4000
     assert props["shortTermIndexMode"]["enum"] == ["sync", "async", "off"]
     assert props["shortTermIndexMode"]["default"] == "sync"
+
+
+@pytest.mark.parametrize("counts", [
+    {"pending": 0, "processing": 0, "total": 0, "failed": 1},
+    {"total": 0, "supported": False},
+    {"total": 0, "error": "database unavailable"},
+])
+def test_indexing_barrier_fails_closed(service, ctx, counts):
+    service._count_outbox_unfinished = Mock(return_value=counts)
+    result = service._wait_for_outbox_idle(ctx, timeout_seconds=0)
+    assert result["idle"] is False
+    assert result["outbox"] == counts

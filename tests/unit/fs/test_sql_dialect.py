@@ -67,7 +67,7 @@ def test_opengauss_schema_preserves_tenant_write_isolation():
     assert "current_setting('app.account_id', true)" not in schema_sql
     assert "WITH CHECK (account_id" not in schema_sql
     assert "CHECK (account_id = current_setting('app.account_id')) NOT VALID" in schema_sql
-    assert schema_sql.count("_tenant_write_guard") == 10
+    assert schema_sql.count("_tenant_write_guard") == 11
     assert conn.autocommit is False
     schema_module._schema_ensured.clear()
 
@@ -96,11 +96,19 @@ def test_dialect_factory_rejects_unknown_implementation():
         resolve_sql_dialect("mysql")
 
 
+def test_workspace_root_sql_is_owned_by_postgresql_dialect():
+    cursor = _Cursor()
+
+    PostgreSQLDialect().ensure_workspace_root(cursor, "acct", "root")
+
+    assert "ON CONFLICT" in cursor.statements[0][0]
+
+
 def test_opengauss_uses_merge_and_polling():
     cursor = _Cursor()
     dialect = OpenGaussDialect()
 
-    dialect.ensure_extraction_work_account(cursor, "acct")
+    dialect.ensure_workspace_root(cursor, "acct", "root")
     dialect.notify_outbox(cursor, "ogmem_outbox", "{}")
 
     assert "MERGE INTO" in cursor.statements[0][0]

@@ -1,7 +1,8 @@
-"""IndexRecordBuilder: Expand ContextNode into three-level IndexRecords.
+"""IndexRecordBuilder: Expand ContextNode into L0 and optional L2 records.
 
-Each ContextNode expands to 3 IndexRecords (L0/L1/L2) for layered retrieval.
-Directory summaries (via DirectoryEventHandler) keep L0/L1 for hierarchical retrieval.
+Indexable ContextNodes produce an L0 abstract record and, when content is
+present, an L2 content record. This builder does not emit L1 records;
+DirectoryEventHandler emits L0/L1 records for directory summaries.
 CRITICAL: All IndexRecords MUST contain account_id + owner_space in filters.
 This is the LAST layer of tenant isolation at the vector level.
 
@@ -12,7 +13,7 @@ import re
 from typing import Final
 
 from core.models import ContextNode, IndexRecord
-
+from core.resource_identity import code_index_metadata
 
 # URI pattern to extract account_id: ctx://{account}/...
 _URI_ACCOUNT_PATTERN: Final[re.Pattern[str]] = re.compile(
@@ -65,22 +66,26 @@ def agent_memory_index_ids(node: ContextNode) -> list[str]:
 
 
 def build_index_records(node: ContextNode) -> list[IndexRecord]:
-    """Expand ContextNode into 3 IndexRecords (L0/L1/L2).
+    """Expand ContextNode into an L0 record and optional L2 record.
 
-    Each IndexRecord corresponds to a content layer:
-    - Level 0: abstract (L0) - first-pass recall
-    - Level 1: overview (L1) - agent decision layer
-    - Level 2: content (L2) - deep reading layer
+    For nodes with indexing enabled:
+    - Level 0: abstract (L0) - always emitted for first-pass recall
+    - Level 2: content (L2) - emitted when content is present for deep reading
 
-    Typed Agent nodes emit L0, L1 and complete L2 units.
+    Typed Agent nodes emit L0, L1 and complete L2 units. DirectoryEventHandler
+    owns L1 overview records for directory summaries. Nodes with
+    ``metadata["indexing_disabled"] is True`` produce no records.
 
     CRITICAL: All records include account_id + owner_space in filters
     to prevent cross-tenant leakage at the vector index level.
     """
+    if node.metadata.get("indexing_disabled") is True:
+        return []
+
     # Extract account_id from URI for tenant isolation
     account_id = _extract_account_id(node.uri)
 
-    # Build base filters that ALL levels must include
+    # Build base filters shared by every emitted record
     base_filters: dict[str, str | int | float | bool] = {
         "account_id": account_id,
         "owner_space": node.owner_space,
@@ -88,8 +93,13 @@ def build_index_records(node: ContextNode) -> list[IndexRecord]:
         "context_type": node.context_type,
     }
 
-    # Build metadata for each level
-    base_metadata: dict[str, str | bool] = {
+    code_metadata = code_index_metadata(node.metadata)
+    resource_type = code_metadata.get("resource_type")
+    if isinstance(resource_type, str):
+        base_filters["resource_type"] = resource_type
+
+    # Build metadata shared by emitted L0/L2 records
+    base_metadata: dict[str, str | int | float | bool] = {
         "abstract": node.abstract,
         "category": node.category,
         "context_type": node.context_type,
@@ -97,6 +107,7 @@ def build_index_records(node: ContextNode) -> list[IndexRecord]:
         "has_overview": bool(node.overview),
         "has_content": bool(node.content),
     }
+    base_metadata.update(code_metadata)
 
     if node.metadata.get("agent_memory_version") == 1:
         from extraction.agent_memory import memory_units, node_memory_fields, render_agent_memory
@@ -170,7 +181,7 @@ def build_index_records(node: ContextNode) -> list[IndexRecord]:
             metadata={"level": "content", **l2_metadata},
         ))
 
-    # Validate all records have required filters
+    # Validate every emitted record has the required filters
     _validate_filters(records)
 
     return records

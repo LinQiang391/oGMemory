@@ -11,18 +11,18 @@ from __future__ import annotations
 
 import heapq
 import logging
-from datetime import datetime, timezone
+from datetime import datetime
 from typing import Any
 
 from core.interfaces import VectorIndex
 from core.models import (
     LeafHit,
-    RetrievalConfig,
     RequestContext,
+    RetrievalConfig,
     RetrieverMode,
+    SeedHit,
     SeedResult,
     TypedQuery,
-    SeedHit,
 )
 from retrieval.hotness import hotness_score
 from retrieval.identity import memory_identity
@@ -92,6 +92,8 @@ class HierarchicalSearcher:
         base_filters: dict[str, Any] = {"account_id": ctx.account_id}
         if typed_query.context_type:
             base_filters["context_type"] = typed_query.context_type
+        if typed_query.resource_type:
+            base_filters["resource_type"] = typed_query.resource_type
         if typed_query.memory_directories is not None:
             base_filters["memory_directory"] = typed_query.memory_directories
         owner_space = allowed_owner_space_filter(

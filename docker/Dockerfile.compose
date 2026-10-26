@@ -45,6 +45,7 @@ COPY cli/        /opt/ogmem/cli/
 COPY scripts/    /opt/ogmem/scripts/
 COPY skills/     /opt/ogmem/skills/
 COPY perf/       /opt/ogmem/perf/
+COPY features/   /opt/ogmem/features/
 COPY scene/      /opt/ogmem/scene/
 
 # Copy AGFS binary and config

@@ -116,7 +116,7 @@ def test_agfs_acknowledgement_cleanup_recovers(agfs_server_info, monkeypatch, re
                 assert acquired is False
         else:
             assert restarted.try_acquire(event, event.uri, "recovery") is False
-        assert restarted.list_pending(ctx.account_id) == []
+        assert restarted.count_unfinished(ctx.account_id) == {"pending": 0, "processing": 0, "total": 0}
         names = {entry["name"].rsplit("/", 1)[-1] for entry in client.ls(prefix.rsplit("/", 1)[0])}
         assert names == set()
         assert client.read(outbox._uri_to_agfs_path(event.uri) + ".agent_memory_done") == marker
@@ -137,4 +137,4 @@ def test_agfs_worker_cleans_acknowledged_retry(agfs_server_info):
     worker = OutboxWorker(_indexed_units()[3], SameEmbedding(), fs=fs,
                          agent_memory_handler=lambda job: pytest.fail("completed job was executed again"))
     assert worker.run_once(restarted, [ctx.account_id])["failed"] == 0
-    assert restarted.list_pending(ctx.account_id) == []
+    assert restarted.count_unfinished(ctx.account_id)["total"] == 0

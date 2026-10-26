@@ -523,6 +523,9 @@ def test_dispose_dispatch_persists_fixed_source_before_the_worker_runs(ctx, monk
 def test_dispose_real_background_failure_reports_pending_then_can_retry(ctx):
     fs = MemoryFS()
     service, writer, manager = lifecycle_service(fs, ctx, entries=[candidate(), candidate("entity")])
+    service._count_outbox_unfinished = Mock(return_value={
+        "pending": 0, "processing": 0, "failed": 0, "total": 0, "supported": True,
+    })
     seed(manager, ctx)
     reject_entity_once(writer)
     assert service.dispose({"sessionId": ctx.session_id, "_ctx": ctx})["flushed"] is False

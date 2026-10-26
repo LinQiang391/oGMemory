@@ -1,0 +1,57 @@
+# Reference configuration for the Operator registry.
+#
+# Copy this file to ``config/operators.yaml`` and edit. Any operator
+# listed here is registered into the default OperatorRegistry when
+# the server starts (or when ``load_from_config()`` is called).
+#
+# To disable the built-in operators, simply don't list them here —
+# they only get registered by ``register_all_defaults()``, which you
+# can also skip in code.
+#
+# Class paths are dotted import paths. ``kwargs`` are forwarded to the
+# operator's constructor. Anything resolvable at import time is fair
+# game (e.g. HTTPBackend pointing at a remote CV service).
+
+operators:
+  # ----- Prompt analyzer (text-only, no CV backend needed) -----
+  - class_path: extraction.operators.PromptExtractor
+    kwargs: {}
+
+  # ----- Image captioning with a stub backend (replace with real one) -----
+  - class_path: extraction.operators.builtin.image_caption.ImageCaptionExtractor
+    kwargs: {}
+
+  # ----- Object detection with the Mock backend (replace with HTTP for prod) -----
+  - class_path: extraction.operators.builtin.object_detection.ObjectDetectionExtractor
+    kwargs:
+      confidence_threshold: 0.5
+      max_objects: 50
+
+  # ----- Face detection via a remote CV service -----
+  # Uncomment and configure base_url to enable. Backend selection is
+  # done via the HTTPBackend; the operator just calls detect_faces().
+  #
+  # - class_path: extraction.operators.builtin.face_detection.FaceDetectionExtractor
+  #   kwargs:
+  #     backend:
+  #       __class_path__: extraction.operators.backends.http_backend.HTTPBackend
+  #       base_url: https://cv.internal.example.com
+  #       auth_token: ${CV_API_TOKEN}
+  #     min_confidence: 0.6
+
+  # ----- Pose detection with OpenCV HOG (no model files needed) -----
+  # Requires opencv-python + numpy to be installed.
+  - class_path: extraction.operators.builtin.pose_detection.PoseDetectionExtractor
+    kwargs:
+      min_confidence: 0.5
+
+  # ----- OCR with the Mock backend -----
+  - class_path: extraction.operators.builtin.ocr_extractor.OCRExtractor
+    kwargs:
+      min_confidence: 0.4
+
+  # ----- Document structure (text-only) -----
+  - class_path: extraction.operators.builtin.document_extractor.DocumentExtractor
+    kwargs:
+      min_section_length: 20
+      max_sections: 50

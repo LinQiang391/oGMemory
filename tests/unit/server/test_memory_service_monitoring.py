@@ -11,6 +11,7 @@ def test_monitoring_overview_maps_runtime_health_and_account_queue() -> None:
         storage_backend="sql",
         retrieval_hybrid_enabled=True,
         vector_db_type="opengauss",
+        code_retrieval_enabled=True,
     )
     service._provider_cfg = SimpleNamespace(
         embedding_provider="openai",
@@ -63,6 +64,7 @@ def test_monitoring_overview_marks_unreachable_agfs_storage_as_error() -> None:
         storage_backend="agfs",
         retrieval_hybrid_enabled=False,
         vector_db_type="chroma",
+        code_retrieval_enabled=False,
     )
     service._provider_cfg = SimpleNamespace(
         embedding_provider="mock",

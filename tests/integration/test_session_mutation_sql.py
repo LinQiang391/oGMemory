@@ -763,6 +763,45 @@ def test_idle_observer_sees_another_worker_complete_recovery(database, ctx):
     assert idle_lifecycle(observer, ctx)["idle"]
 
 
+@pytest.mark.parametrize("restart", [False, True])
+def test_governed_request_retry_completes_pending_extraction(database, ctx, tmp_path, restart):
+    from features.tool_result_externalization.store_local import LocalToolResultArtifactStore
+    from providers.unified_config import OgMemConfig
+    from server.memory_service import MemoryService
+    from tests.unit.server.test_memory_service_tool_results import _user_message_turn
+
+    _, make = database
+    attempts = []
+
+    def extract(**kwargs):
+        attempts.append(True)
+        if len(attempts) == 1:
+            raise OSError("temporary model outage")
+        return [replace(candidate(), provenance_ids=[f"prov:1:archive:{kwargs['archive_id']}:msg-one"])]
+
+    def make_service():
+        base, writer, manager, _, _ = service_pair(make, ctx, extract=extract)
+        service = MemoryService(OgMemConfig(tool_result_externalization_enabled=True,
+            tool_result_semantic_turn_mode="user_message", tool_result_single_chars=10,
+            session_state_bridge_enabled=False, after_turn_threshold=1),
+            tool_result_store=LocalToolResultArtifactStore(tmp_path))
+        service._write_api, service._session_mgr = writer, manager
+        service._generate_and_write_summary = Mock()
+        service.drain_outbox_sync = Mock(return_value={})
+        return service, manager
+
+    service, manager = make_service()
+    request = {**params(ctx), "messages": _user_message_turn("Receiver repair details. " * 20),
+               "semanticTurnMode": "user_message"}
+    assert service.after_turn(request)["ok"] is False
+    assert manager.get_or_create(ctx.session_id, ctx).pending_extraction_ids()
+    if restart:
+        service, manager = make_service()
+    assert service.after_turn(request)["ok"]
+    assert manager.get_or_create(ctx.session_id, ctx).pending_extraction_ids() == set()
+    assert len(attempts) == 2
+    assert service.after_turn(request)["status"] == "duplicate"
+
 
 def test_idle_wait_observes_local_worker_before_refresh(database, ctx):
     _, make = database

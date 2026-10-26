@@ -391,3 +391,48 @@ def test_retry_update_preserves_concurrent_foreground_checkpoint(ctx, foreground
         assert durable[EXTENSION_KEY]["batch"]["slots"] == expected
     else:
         assert durable.get(EXTENSION_KEY) == expected
+
+
+@pytest.mark.parametrize("restart", [False, True])
+def test_background_retry_preserves_governed_turn_source(ctx, tmp_path, restart):
+    from features.tool_result_externalization.store_local import LocalToolResultArtifactStore
+    from providers.unified_config import OgMemConfig
+    from server.memory_service import MemoryService
+    from tests.unit.server.test_memory_service_tool_results import _user_message_turn
+
+    fs = MemoryFS()
+    def start_service():
+        _, writer, _ = setup_service(fs, ctx)
+        service = MemoryService(OgMemConfig(tool_result_externalization_enabled=True,
+            tool_result_semantic_turn_mode="user_message", after_turn_threshold=1,
+            session_state_bridge_enabled=False), tool_result_store=LocalToolResultArtifactStore(tmp_path))
+        service._write_api = writer
+        service._generate_and_write_summary = Mock()
+        service.drain_outbox_sync = Mock(return_value={})
+        service._async_drain = Mock()
+        service._extraction_retry.wake = Mock()
+        manager = service.get_session_manager()
+        manager.commit_snapshot = Mock(return_value={"ok": True, "status": "completed", "archived": True})
+        return service, writer, manager
+
+    service, writer, manager = start_service()
+    writer._pipeline.extract.side_effect = ToolCallProtocolError("invalid generated output")
+    request = {**params(ctx), "retryInBackground": True, "prePromptMessageCount": 1,
+               "messages": [{"role": "user", "content": "Earlier context"}] + _user_message_turn("Receiver repaired.")}
+    result = service.after_turn(request)
+    identity = result["recovery_task"]["id"]
+    ledger_key = service._tool_result_turn_ledger.STATE_KEY
+    ledger = deepcopy(manager.get_or_create(ctx.session_id).runtime_extensions[ledger_key])
+    if restart:
+        service, writer, manager = start_service()
+        status = service.wait_until_idle({"sessionId": ctx.session_id, "_ctx": ctx})
+        assert status["recovery_task"]["id"] == identity
+    writer._pipeline.extract.side_effect = None
+    writer._pipeline.extract.return_value = [candidate()]
+    ready(manager, ctx)
+
+    assert service._extraction_retry.run_once(ctx, identity) is None
+
+    assert len(nodes(fs, "event")) == 1
+    assert manager.get_or_create(ctx.session_id).request_completed("original")
+    assert manager.get_or_create(ctx.session_id).runtime_extensions[ledger_key] == ledger

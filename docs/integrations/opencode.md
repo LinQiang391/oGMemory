@@ -30,9 +30,9 @@ Unix：
 
 ```bash
 mkdir -p ~/.config/opencode/plugins/ogmemory
-cp opencode-plugin/wrappers/ogmemory.js ~/.config/opencode/plugins/ogmemory.js
-cp opencode-plugin/index.mjs opencode-plugin/package.json ~/.config/opencode/plugins/ogmemory/
-cp -r opencode-plugin/lib ~/.config/opencode/plugins/ogmemory/
+cp plugins/opencode/wrappers/ogmemory.js ~/.config/opencode/plugins/ogmemory.js
+cp plugins/opencode/index.mjs plugins/opencode/package.json ~/.config/opencode/plugins/ogmemory/
+cp -r plugins/opencode/lib ~/.config/opencode/plugins/ogmemory/
 ```
 
 目录：
@@ -46,7 +46,7 @@ cp -r opencode-plugin/lib ~/.config/opencode/plugins/ogmemory/
     └── lib/
 ```
 
-Windows 安装见 [`../../opencode-plugin/INSTALL-ZH.md`](../../opencode-plugin/INSTALL-ZH.md)。
+Windows 安装见 [`../../plugins/opencode/INSTALL-ZH.md`](../../plugins/opencode/INSTALL-ZH.md)。
 
 ## 4. 配置文件
 
@@ -273,7 +273,7 @@ Trace：
 插件测试：
 
 ```bash
-cd opencode-plugin
+cd plugins/opencode
 npm run check
 npm test
 npm pack --dry-run

@@ -155,19 +155,19 @@ cache:
 | YAML 路径 | 环境变量 | 默认值 | 必填 | 说明 |
 |-----------|---------|-------|------|------|
 | `vector_db.type` | `VECTOR_DB_TYPE` | `opengauss` (Dockerfile) / `chroma` (代码) | 否 | `memory` 内存 / `chroma` 本地持久化 / `opengauss` 数据库向量索引 |
-| `vector_db.connection_string` | `OPENGAUSS_CONNECTION_STRING` | 无 | type=opengauss 时**必填** | 连接串格式：`host=... port=... dbname=... user=... password=...` |
-| `vector_db.dimension` | `OPENGAUSS_DIMENSION` | `1024` | 否 | 向量维度，须与 Embedding 模型一致 |
-| `vector_db.table_name` | `OPENGAUSS_TABLE_NAME` | `vector_index` | 否 | 向量存储表名 |
-| `vector_db.pool_size` | `OPENGAUSS_POOL_SIZE` | `5` | 否 | 数据库连接池大小 |
+| `vector_db.connection_string` | `VECTOR_DB_CONNECTION_STRING`（旧名 `OPENGAUSS_CONNECTION_STRING` 仍生效） | 无 | type=opengauss 时**必填** | 连接串格式：`host=... port=... dbname=... user=... password=...` |
+| `vector_db.dimension` | `VECTOR_DB_DIMENSION`（旧名 `OPENGAUSS_DIMENSION`） | `1024` | 否 | 向量维度，须与 Embedding 模型一致 |
+| `vector_db.table_name` | `VECTOR_DB_TABLE_NAME`（旧名 `OPENGAUSS_TABLE_NAME`） | `vector_index` | 否 | 向量存储表名 |
+| `vector_db.pool_size` | `VECTOR_DB_POOL_SIZE`（旧名 `OPENGAUSS_POOL_SIZE`） | `5` | 否 | 数据库连接池大小 |
 
 ### 主存储后端
 
 | YAML 路径 | 环境变量 | 默认值 | 必填 | 说明 |
 |-----------|---------|-------|------|------|
-| `storage.backend` | `STORAGE_BACKEND` | `agfs` | 否 | `agfs` 目录存储 / `sql` 数据库直连存储 |
+| `storage.backend` | `STORAGE_BACKEND` | `sql` | 否 | 固定为 `sql`（PostgreSQL 直连存储） |
 | `storage.dialect` | `SQL_DIALECT` | `postgresql` | 否 | SQL 方言：`postgresql` / `opengauss`；openGauss 数据库必须使用 `DBCOMPATIBILITY='PG'` |
-| `storage.connection_string` | `SQL_CONNECTION_STRING` | 无 | backend=sql 时**必填** | libpq DSN，例如 `host=127.0.0.1 port=5432 dbname=ogmemory user=postgres password=postgres` |
-| `storage.pool_size` | `SQL_POOL_SIZE` | `5` | 否 | SQL storage 连接池大小 |
+| `storage.connection_string` | `STORAGE_DB_CONNECTION_STRING`（旧名 `SQL_CONNECTION_STRING` 仍生效） | 无 | **必填** | PostgreSQL libpq DSN，例如 `host=127.0.0.1 port=5432 dbname=ogmemory user=postgres password=postgres` |
+| `storage.pool_size` | `STORAGE_DB_POOL_SIZE`（旧名 `SQL_POOL_SIZE`） | `5` | 否 | SQL storage 连接池大小 |
 
 ### 服务配置
 
@@ -250,8 +250,8 @@ docker run -d --name ogmemory --network host \
   -e OGMEM_EMBEDDING_BASE_URL=https://ark.cn-beijing.volces.com/api/v3 \
   -e OGMEM_EMBEDDING_MODEL=doubao-embedding-vision-250615 \
   -e OGMEM_EMBEDDING_MULTIMODAL=true \
-  -e OPENGAUSS_DIMENSION=1024 \
-  -e OPENGAUSS_CONNECTION_STRING="host=127.0.0.1 port=8799 dbname=postgres user=sundechao password=xxx" \
+  -e VECTOR_DB_DIMENSION=1024 \
+  -e VECTOR_DB_CONNECTION_STRING="host=127.0.0.1 port=8799 dbname=postgres user=sundechao password=xxx" \
   ogmemory:v0.9
 ```
 
@@ -269,7 +269,7 @@ cp config/ogmem.reference.yaml config/ogmem.yaml
 
 说明：
 - 这个模式只要求本机 PostgreSQL 可连通。
-- `./scripts/start_sql.sh` 会优先读取仓库根目录 `./ogmem.yaml`，不必额外导出环境变量。
+- `./scripts/start_sql.sh` 会优先读取 `config/ogmem.yaml`，不必额外导出环境变量。
 - PostgreSQL 参数写在 `storage.connection_string`。
 - `vector_db.type: memory` 避免额外依赖 Chroma 或 openGauss vector 扩展。
 - `llm.provider: mock` 避免依赖外部 LLM API。

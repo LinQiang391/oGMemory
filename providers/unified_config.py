@@ -128,8 +128,46 @@ def _apply_model_config_overrides(raw: dict) -> dict:
 def _resolve(yaml_val: Any, env_name: str, default: Any, cast: type = str) -> Any:
     """Pick the first non-None source: YAML > env var > default, then cast."""
     if yaml_val is not None:
+        if cast in {int, float} and isinstance(yaml_val, bool):
+            if cast is int:
+                raise ValueError(f"{env_name} must be an integer")
+            raise ValueError(f"{env_name} must be a number")
         return cast(yaml_val)
     env = os.environ.get(env_name)
+    if env is not None:
+        return cast(env)
+    return default
+
+
+def _resolve_env_any(*env_names: str) -> str | None:
+    """Return the first set env var among ``env_names`` (None if all unset).
+
+    Used where an env var was renamed and the old name must keep working
+    as a legacy alias — e.g. ``VECTOR_DB_CONNECTION_STRING`` (the current
+    name, database-agnostic) with ``OPENGAUSS_CONNECTION_STRING`` as the
+    pre-rename fallback. The *new* name wins when both are set.
+    """
+    for name in env_names:
+        env = os.environ.get(name)
+        if env is not None:
+            return env
+    return None
+
+
+def _resolve_with_alias(
+    yaml_val: Any,
+    env_name: str,
+    legacy_env_name: str,
+    cast: type = str,
+    default: Any = None,
+) -> Any:
+    """Like :func:`_resolve` but with a renamed env var's legacy alias.
+
+    Priority: YAML > ``env_name`` > ``legacy_env_name`` > ``default``.
+    """
+    if yaml_val is not None:
+        return cast(yaml_val)
+    env = _resolve_env_any(env_name, legacy_env_name)
     if env is not None:
         return cast(env)
     return default
@@ -178,6 +216,20 @@ def _resolve_optional_bool(yaml_val: Any, env_name: str) -> bool | None:
     if lowered in ("0", "false", "no"):
         return False
     raise ValueError(f"{env_name} must be a boolean")
+
+
+def _resolve_filter_int(yaml_val: Any, env_name: str, default: int) -> int:
+    """Resolve a filter integer without silently truncating YAML numbers."""
+
+    value = yaml_val if yaml_val is not None else os.environ.get(env_name)
+    if value is None:
+        return default
+    if isinstance(value, bool) or isinstance(value, float):
+        raise ValueError(f"{env_name} must be an integer")
+    try:
+        return int(value)
+    except (TypeError, ValueError) as exc:
+        raise ValueError(f"{env_name} must be an integer") from exc
 
 
 def _resolve_list(yaml_val: Any, env_name: str, default: list[str] | None = None) -> list[str]:
@@ -229,6 +281,14 @@ def _first_non_none(*values: Any) -> str | None:
     for value in values:
         if value is not None:
             return str(value) if value is not None else None
+    return None
+
+
+def _first_value(*values: Any) -> Any:
+    """Return the first non-None config value without coercing its type."""
+    for value in values:
+        if value is not None:
+            return value
     return None
 
 
@@ -417,6 +477,7 @@ class OgMemConfig:
     openai_llm_model: str = "gpt-4o-mini"
     llm_temperature: float = 0.7
     llm_max_tokens: int = 4096
+    llm_request_timeout_seconds: float = 120.0
     llm_json_mode: bool = False
     llm_reasoning_effort: str | None = None
     llm_is_reasoning_model: bool | None = None
@@ -429,6 +490,8 @@ class OgMemConfig:
     openai_embedding_api_key: str | None = None
     openai_embedding_api_key_command: SecretCommandSpec | None = field(default=None, repr=False)
     embedding_multimodal: bool = False
+    embedding_max_input_chars: int = 30_000
+    embedding_batch_size: int = 2048
     st_model: str = "BAAI/bge-m3"
 
     # -- Vector DB -------------------------------------------------------------
@@ -448,6 +511,71 @@ class OgMemConfig:
     http_ip_allowlist_trust_proxy: bool = False
     http_trusted_proxies: list[str] = field(default_factory=list)
 
+    # -- Code memory feature flags -------------------------------------------
+    code_resources_enabled: bool = False
+    code_resources_max_files: int = 5000
+    # Server-local workspace registrations must remain under one of these
+    # server-configured roots.  An empty list deliberately grants no
+    # filesystem authority; the workspace service rejects registrations until
+    # an operator configures an allowed directory.
+    code_workspace_allowed_roots: list[str] = field(default_factory=list)
+    code_sync_enabled: bool = False
+    code_sync_default_trigger_mode: str = "hybrid"
+    code_sync_default_wait_mode: str = "accepted"
+    code_sync_reconcile_interval_seconds: int = 300
+    code_sync_watch_interval_seconds: int = 5
+    code_sync_run_timeout_seconds: int = 60
+    code_sync_failure_backoff_seconds: int = 30
+    code_sync_max_pending_roots: int = 100
+    code_sync_debounce_seconds: int = 2
+    code_retrieval_enabled: bool = False
+    # Retrieval mode is process-static: changing it requires a normal service
+    # restart, just like the other unified provider settings.  Request DTOs
+    # deliberately do not carry this field.
+    code_retrieval_mode: str = "full"
+    code_retrieval_semantic_enabled: bool = True
+    code_retrieval_bm25_enabled: bool = True
+    code_retrieval_symbolic_enabled: bool = True
+    code_retrieval_graph_enabled: bool = True
+    code_retrieval_fusion_mode: str = "weighted_rrf"
+    code_retrieval_semantic_weight: float = 0.33
+    code_retrieval_bm25_weight: float = 0.17
+    code_retrieval_symbolic_weight: float = 0.17
+    code_retrieval_graph_weight: float = 0.33
+    code_retrieval_candidate_limit: int = 50
+    code_retrieval_result_limit: int = 5
+    code_retrieval_snippet_chars: int = 1200
+    code_retrieval_batch_chars: int = 8000
+    code_retrieval_graph_neighbor_limit: int = 24
+    code_retrieval_route_deadline_ms: int = 500
+    # Candidate-local bounds.  These are intentionally distinct from the
+    # persisted full-index active-search budgets above: they bound filesystem
+    # discovery and request-local embedding only.
+    code_retrieval_candidate_discovery_pool_limit: int = 300
+    code_retrieval_candidate_file_limit: int = 80
+    code_retrieval_candidate_snippet_limit: int = 500
+    code_retrieval_candidate_semantic_limit: int = 16
+    code_retrieval_candidate_embedding_chars: int = 4096
+    code_retrieval_candidate_embedding_batch_texts: int = 8
+    code_retrieval_candidate_embedding_batch_tokens: int = 8000
+    code_retrieval_candidate_read_bytes: int = 64 * 1024 * 1024
+    code_retrieval_candidate_discovery_deadline_ms: int = 15_000
+    code_retrieval_candidate_embedding_deadline_ms: int = 330_000
+    code_retrieval_candidate_request_deadline_ms: int = 360_000
+    tool_output_filter_enabled: bool = False
+    tool_output_filter_read_enabled: bool = True
+    tool_output_filter_bash_enabled: bool = True
+    tool_output_filter_adaptive_enabled: bool = True
+    tool_output_filter_read_min_chars: int = 8000
+    tool_output_filter_read_max_lines: int = 60
+    tool_output_filter_bash_min_chars: int = 8000
+    tool_output_filter_bash_min_lines: int = 100
+    tool_output_filter_test_max_lines: int = 120
+    tool_output_filter_diff_max_lines: int = 100
+    tool_output_filter_error_max_lines: int = 100
+    tool_output_filter_generic_max_lines: int = 80
+    tool_output_filter_output_max_chars: int = 50000
+    tool_output_recovery_max_chars: int = 50000
     # -- MCP ------------------------------------------------------------------
     mcp_enabled: bool = True
     mcp_host: str = "127.0.0.1"
@@ -458,6 +586,7 @@ class OgMemConfig:
     mcp_enable_delete_tools: bool = False
     mcp_enable_runtime_tools: bool = False
     mcp_enable_diagnostic_tools: bool = False
+    mcp_enable_code_edit_tools: bool = False
     mcp_max_request_bytes: int = 1048576
     mcp_max_sse_connections: int = 64
     mcp_max_response_chars: int = 50000
@@ -472,6 +601,10 @@ class OgMemConfig:
     sql_pool_size: int = 5
     trace_max_turn_events: int = 128
     agent_memory_enabled: bool = False
+
+    # -- Scene memory ---------------------------------------------------------
+    scene_enabled: bool = False
+    scene_options: dict[str, Any] = field(default_factory=dict)
 
     # -- Agent skill sedimentation --------------------------------------------
     skill_sedimentation_enabled: bool = False
@@ -535,6 +668,30 @@ class OgMemConfig:
     compression_quality_enabled: bool = False
     compression_quality_persist_metadata: bool = False
 
+    # -- Large tool-result externalization (opt-in) ---------------------------
+    tool_result_externalization_enabled: bool = False
+    tool_result_first_view_enabled: bool = True
+    tool_result_semantic_turn_mode: str = "user_message"
+    tool_result_single_chars: int = 20_000
+    tool_result_synopsis_max_chars: int = 2_000
+    tool_result_stub_summary_turn_chars: int = 12_000
+    tool_result_write_timeout_ms: int = 3_000
+    tool_result_retry_attempts: int = 2
+    tool_result_search_chunk_bytes: int = 16_384
+    tool_result_search_overlap_bytes: int = 1_024
+    tool_result_search_top_k: int = 5
+    tool_result_search_max_artifacts: int = 20
+    tool_result_search_deadline_ms: int = 2_000
+    tool_result_read_default_bytes: int = 32_768
+    tool_result_artifact_temp_grace_seconds: int = 600
+    tool_result_http_max_response_chars: int = 100_000
+
+    # -- Tool-result cache optimization (independent, opt-in) -----------------
+    tool_result_cache_delay_enabled: bool = False
+    tool_result_cache_delay_chars: int = 2_000
+    tool_result_cache_delay_idle_ttl_seconds: int = 300
+    tool_result_cache_hit_price_ratio: float = 0.1
+
     # -- Retrieval ------------------------------------------------------------
     retrieval_max_top_k: int = 50
     retrieval_default_top_k: int = 10
@@ -595,6 +752,215 @@ class OgMemConfig:
         self.sql_dialect = normalize_sql_dialect(self.sql_dialect)
         if not 2 <= self.trace_max_turn_events <= 1024:
             raise ValueError("trace_max_turn_events must be between 2 and 1024")
+        filter_integer_settings = (
+            "tool_output_filter_read_min_chars",
+            "tool_output_filter_read_max_lines",
+            "tool_output_filter_bash_min_chars",
+            "tool_output_filter_bash_min_lines",
+            "tool_output_filter_test_max_lines",
+            "tool_output_filter_diff_max_lines",
+            "tool_output_filter_error_max_lines",
+            "tool_output_filter_generic_max_lines",
+            "tool_output_filter_output_max_chars",
+            "tool_output_recovery_max_chars",
+        )
+        for name in filter_integer_settings:
+            value = getattr(self, name)
+            if isinstance(value, bool) or not isinstance(value, int):
+                raise ValueError(f"{name} must be a positive integer")
+            if value < 1:
+                raise ValueError(f"{name} must be positive")
+        for name in (
+            "tool_output_filter_read_min_chars",
+            "tool_output_filter_bash_min_chars",
+            "tool_output_filter_output_max_chars",
+        ):
+            if getattr(self, name) > 10_000_000:
+                raise ValueError(f"{name} must not exceed 10000000")
+        if self.tool_output_filter_output_max_chars < 256:
+            raise ValueError("tool_output_filter_output_max_chars must be at least 256")
+        for name in (
+            "tool_output_filter_read_max_lines",
+            "tool_output_filter_bash_min_lines",
+            "tool_output_filter_test_max_lines",
+            "tool_output_filter_diff_max_lines",
+            "tool_output_filter_error_max_lines",
+            "tool_output_filter_generic_max_lines",
+        ):
+            if getattr(self, name) > 10_000:
+                raise ValueError(f"{name} must not exceed 10000")
+        if self.tool_output_recovery_max_chars > 1_000_000:
+            raise ValueError("tool_output_recovery_max_chars must not exceed 1000000")
+        if self.tool_output_filter_output_max_chars < max(
+            self.tool_output_filter_read_min_chars,
+            self.tool_output_filter_bash_min_chars,
+        ):
+            raise ValueError(
+                "tool_output_filter_output_max_chars must be at least the read and bash min chars"
+            )
+        from scene.config import SceneConfig
+        SceneConfig().merged(self.scene_options)
+        embedding_max_input_chars = self.embedding_max_input_chars
+        if (
+            isinstance(self.embedding_batch_size, bool)
+            or not isinstance(self.embedding_batch_size, int)
+            or not 1 <= self.embedding_batch_size <= 2048
+        ):
+            raise ValueError("embedding_batch_size must be an integer between 1 and 2048")
+        if isinstance(embedding_max_input_chars, bool) or not isinstance(
+            embedding_max_input_chars, int
+        ):
+            raise ValueError("embedding_max_input_chars must be a positive integer")
+        if embedding_max_input_chars < 1:
+            raise ValueError("embedding_max_input_chars must be positive")
+        integer_settings = (
+            "code_resources_max_files",
+            "code_sync_reconcile_interval_seconds",
+            "code_sync_watch_interval_seconds",
+            "code_sync_run_timeout_seconds",
+            "code_sync_failure_backoff_seconds",
+            "code_sync_max_pending_roots",
+            "code_sync_debounce_seconds",
+        )
+        for name in integer_settings:
+            value = getattr(self, name)
+            if isinstance(value, bool) or not isinstance(value, int):
+                raise ValueError(f"{name} must be a positive integer")
+        if self.code_resources_max_files < 1:
+            raise ValueError("code_resources_max_files must be positive")
+        if self.code_resources_max_files > 100000:
+            raise ValueError("code_resources_max_files must not exceed 100000")
+        if not isinstance(self.code_workspace_allowed_roots, list) or any(
+            not isinstance(value, str) or not value.strip()
+            for value in self.code_workspace_allowed_roots
+        ):
+            raise ValueError("code_workspace_allowed_roots must be a list of non-empty strings")
+        if self.code_sync_default_trigger_mode not in {"hybrid", "manual", "external_event"}:
+            raise ValueError("code_sync_default_trigger_mode is invalid")
+        if self.code_sync_default_wait_mode not in {
+            "accepted",
+            "filesystem_complete",
+            "index_visible",
+        }:
+            raise ValueError("code_sync_default_wait_mode is invalid")
+        for name in integer_settings[1:]:
+            if getattr(self, name) < 1:
+                raise ValueError(f"{name} must be positive")
+        if self.code_sync_max_pending_roots > 10000:
+            raise ValueError("code_sync_max_pending_roots must not exceed 10000")
+        if self.code_sync_enabled and not self.code_resources_enabled:
+            raise ValueError("code sync requires code_resources_enabled")
+        if self.code_retrieval_mode not in {"full", "candidate_local"}:
+            raise ValueError("code_retrieval_mode is invalid")
+        if self.code_retrieval_fusion_mode not in {"weighted_rrf", "weighted_sum", "sum"}:
+            raise ValueError("code_retrieval_fusion_mode is invalid")
+        route_weights = {
+            "code_retrieval_semantic_weight": self.code_retrieval_semantic_weight,
+            "code_retrieval_bm25_weight": self.code_retrieval_bm25_weight,
+            "code_retrieval_symbolic_weight": self.code_retrieval_symbolic_weight,
+            "code_retrieval_graph_weight": self.code_retrieval_graph_weight,
+        }
+        for name, value in route_weights.items():
+            if isinstance(value, bool) or not isinstance(value, (int, float)) or not math.isfinite(float(value)):
+                raise ValueError(f"{name} must be finite")
+            if float(value) < 0.0:
+                raise ValueError(f"{name} must be non-negative")
+        enabled_route_weights = (
+            self.code_retrieval_semantic_enabled,
+            self.code_retrieval_bm25_enabled,
+            self.code_retrieval_symbolic_enabled,
+            self.code_retrieval_graph_enabled,
+        )
+        if self.code_retrieval_enabled and not any(
+            enabled and float(value) > 0.0
+            for enabled, value in zip(enabled_route_weights, route_weights.values())
+        ):
+            raise ValueError("enabled code retrieval requires a non-zero route weight")
+        retrieval_limits = (
+            "code_retrieval_candidate_limit",
+            "code_retrieval_result_limit",
+            "code_retrieval_snippet_chars",
+            "code_retrieval_batch_chars",
+            "code_retrieval_graph_neighbor_limit",
+            "code_retrieval_route_deadline_ms",
+        )
+        for name in retrieval_limits:
+            value = getattr(self, name)
+            if isinstance(value, bool) or not isinstance(value, int) or value <= 0:
+                raise ValueError(f"{name} must be a positive integer")
+        if self.code_retrieval_candidate_limit > 10000:
+            raise ValueError("code_retrieval_candidate_limit must not exceed 10000")
+        if self.code_retrieval_result_limit > self.code_retrieval_candidate_limit:
+            raise ValueError("code_retrieval_result_limit cannot exceed candidate limit")
+        if self.code_retrieval_snippet_chars > self.code_retrieval_batch_chars:
+            raise ValueError("code_retrieval_snippet_chars cannot exceed batch chars")
+        if self.code_retrieval_route_deadline_ms > 60000:
+            raise ValueError("code_retrieval_route_deadline_ms must not exceed 60000")
+        candidate_local_limits = (
+            "code_retrieval_candidate_discovery_pool_limit",
+            "code_retrieval_candidate_file_limit",
+            "code_retrieval_candidate_snippet_limit",
+            "code_retrieval_candidate_semantic_limit",
+            "code_retrieval_candidate_embedding_chars",
+            "code_retrieval_candidate_embedding_batch_texts",
+            "code_retrieval_candidate_embedding_batch_tokens",
+            "code_retrieval_candidate_read_bytes",
+            "code_retrieval_candidate_discovery_deadline_ms",
+            "code_retrieval_candidate_embedding_deadline_ms",
+            "code_retrieval_candidate_request_deadline_ms",
+        )
+        for name in candidate_local_limits:
+            value = getattr(self, name)
+            if isinstance(value, bool) or not isinstance(value, int) or value <= 0:
+                raise ValueError(f"{name} must be a positive integer")
+        candidate_local_hard_caps = {
+            # These are frozen request-local safety ceilings, not merely
+            # defaults.  Retrieval has defensive ``min(...)`` guards for
+            # malformed programmatic configs, but a valid OgMemConfig must
+            # never accept a value that would later be silently clamped.
+            "code_retrieval_candidate_discovery_pool_limit": 300,
+            "code_retrieval_candidate_file_limit": 80,
+            "code_retrieval_candidate_snippet_limit": 500,
+            "code_retrieval_candidate_semantic_limit": 16,
+            "code_retrieval_candidate_embedding_chars": 4096,
+            "code_retrieval_candidate_embedding_batch_texts": 8,
+            "code_retrieval_candidate_embedding_batch_tokens": 8000,
+            "code_retrieval_candidate_read_bytes": 64 * 1024 * 1024,
+            "code_retrieval_candidate_discovery_deadline_ms": 15_000,
+            "code_retrieval_candidate_embedding_deadline_ms": 330_000,
+            "code_retrieval_candidate_request_deadline_ms": 360_000,
+        }
+        for name, cap in candidate_local_hard_caps.items():
+            if getattr(self, name) > cap:
+                raise ValueError(f"{name} must not exceed {cap}")
+        if self.code_retrieval_candidate_file_limit > self.code_retrieval_candidate_discovery_pool_limit:
+            raise ValueError("code_retrieval_candidate_file_limit cannot exceed discovery pool limit")
+        if self.code_retrieval_candidate_semantic_limit > self.code_retrieval_candidate_snippet_limit:
+            raise ValueError("code_retrieval_candidate_semantic_limit cannot exceed snippet limit")
+        # A pre-existing full-mode deployment may deliberately use a provider
+        # input cap below the candidate default.  Candidate-local is inactive
+        # in that process, so rejecting the otherwise valid full config would
+        # make the additive mode a startup regression.  Enforce the provider
+        # relationship when candidate-local is selected; a later switch still
+        # follows the normal restart/config-validation path.
+        if (
+            self.code_retrieval_mode == "candidate_local"
+            and self.code_retrieval_candidate_embedding_chars > self.embedding_max_input_chars
+        ):
+            raise ValueError("code_retrieval_candidate_embedding_chars cannot exceed embedding_max_input_chars")
+        if (
+            self.code_retrieval_candidate_discovery_deadline_ms
+            >= self.code_retrieval_candidate_request_deadline_ms
+            or self.code_retrieval_candidate_embedding_deadline_ms
+            >= self.code_retrieval_candidate_request_deadline_ms
+        ):
+            raise ValueError("candidate-local stage deadlines must be below request deadline")
+        if (
+            self.code_retrieval_candidate_discovery_deadline_ms
+            + self.code_retrieval_candidate_embedding_deadline_ms
+            > self.code_retrieval_candidate_request_deadline_ms
+        ):
+            raise ValueError("candidate-local discovery and embedding deadlines exceed request deadline")
         score_fields = {
             "skill_turn_score_threshold": self.skill_turn_score_threshold,
             "skill_publish_score_threshold": self.skill_publish_score_threshold,
@@ -692,6 +1058,52 @@ class OgMemConfig:
             raise ValueError("at least one retrieval fusion weight must be positive")
         if not 1 <= self.retrieval_backfill_page_size <= 10_000:
             raise ValueError("retrieval_backfill_page_size must be between 1 and 10000")
+        if self.tool_result_externalization_enabled:
+            for name in (
+                "tool_result_single_chars",
+                "tool_result_synopsis_max_chars",
+                "tool_result_stub_summary_turn_chars",
+                "tool_result_write_timeout_ms",
+                "tool_result_retry_attempts",
+                "tool_result_search_chunk_bytes",
+                "tool_result_search_overlap_bytes",
+                "tool_result_search_top_k",
+                "tool_result_search_max_artifacts",
+                "tool_result_search_deadline_ms",
+                "tool_result_read_default_bytes",
+                "tool_result_artifact_temp_grace_seconds",
+                "tool_result_http_max_response_chars",
+            ):
+                if getattr(self, name) < 1:
+                    raise ValueError(f"{name} must be positive")
+            if self.tool_result_search_overlap_bytes >= self.tool_result_search_chunk_bytes:
+                raise ValueError(
+                    "tool_result_search_overlap_bytes must be below tool_result_search_chunk_bytes"
+                )
+        if self.tool_result_semantic_turn_mode != "user_message":
+            raise ValueError(
+                "tool_result_semantic_turn_mode currently supports only "
+                "'user_message'"
+            )
+        if self.tool_result_cache_delay_enabled:
+            if not self.tool_result_externalization_enabled:
+                raise ValueError(
+                    "tool-result cache delay requires tool-result externalization"
+                )
+            if self.tool_result_cache_delay_chars < 2:
+                raise ValueError("tool_result_cache_delay_chars must be at least 2")
+            if self.tool_result_cache_delay_chars >= self.tool_result_single_chars:
+                raise ValueError(
+                    "tool_result_cache_delay_chars must be below tool_result_single_chars"
+                )
+            if self.tool_result_cache_delay_idle_ttl_seconds < 1:
+                raise ValueError(
+                    "tool_result_cache_delay_idle_ttl_seconds must be positive"
+                )
+            if not 0 < self.tool_result_cache_hit_price_ratio <= 1:
+                raise ValueError(
+                    "tool_result_cache_hit_price_ratio must be in (0, 1]"
+                )
 
     # -------------------------------------------------------------------------
     # Factory
@@ -712,6 +1124,20 @@ class OgMemConfig:
         emb = raw.get("embedding") or {}
         vdb = raw.get("vector_db") or {}
         svc = raw.get("service") or {}
+        features = raw.get("features") or {}
+        legacy_code = raw.get("code") or {}
+        code_resources = features.get("code_resources") or {}
+        code_retrieval = features.get("code_retrieval") or {}
+        code_sync = features.get("code_sync") or {}
+        legacy_code_retrieval = legacy_code.get("retrieval") or {}
+        raw_tool_output_filter = features.get("tool_output_filter")
+        if raw_tool_output_filter is None:
+            tool_output_filter = {}
+        elif not isinstance(raw_tool_output_filter, dict):
+            raise ValueError("features.tool_output_filter must be a mapping")
+        else:
+            tool_output_filter = raw_tool_output_filter
+        tool_output = features.get("tool_output") or {}
         mcp = raw.get("mcp") or {}
         storage = raw.get("storage") or {}
         agfs = raw.get("agfs") or {}
@@ -724,6 +1150,9 @@ class OgMemConfig:
         cache = raw.get("cache") or {}
         perf = raw.get("perf") or {}
         sedimentation = (raw.get("skills") or {}).get("sedimentation") or {}
+        tool_results = raw.get("tool_result_externalization") or {}
+        tool_result_optimization = raw.get("tool_result_optimization") or {}
+        tool_result_cache_delay = tool_result_optimization.get("cache_delay") or {}
 
         base_url = _normalize_url(_resolve(llm.get("base_url"), "OGMEM_BASE_URL", None))
         emb_base_url = _normalize_url(
@@ -759,6 +1188,9 @@ class OgMemConfig:
             openai_llm_model=_resolve(llm.get("model"), "OGMEM_LLM_MODEL", "gpt-4o-mini"),
             llm_temperature=_resolve(llm.get("temperature"), "LLM_TEMPERATURE", 0.7, float),
             llm_max_tokens=_resolve(llm.get("max_tokens"), "LLM_MAX_TOKENS", 4096, int),
+            llm_request_timeout_seconds=_resolve(
+                llm.get("request_timeout_seconds"), "LLM_REQUEST_TIMEOUT_SECONDS", 120.0, float
+            ),
             llm_json_mode=_resolve_bool(llm.get("json_mode"), "LLM_JSON_MODE", False),
             llm_reasoning_effort=_resolve(
                 llm.get("reasoning_effort"), "LLM_REASONING_EFFORT", None
@@ -784,30 +1216,36 @@ class OgMemConfig:
                 "OGMEM_EMBEDDING_MULTIMODAL",
                 False,
             ),
+            embedding_max_input_chars=_resolve(
+                emb.get("max_input_chars"),
+                "OGMEM_EMBEDDING_MAX_INPUT_CHARS",
+                30_000,
+                int,
+            ),
             st_model=_resolve(emb.get("st_model"), "ST_MODEL", "BAAI/bge-m3"),
-            # Vector DB
+            embedding_batch_size=_resolve(
+                emb.get("batch_size"), "OGMEM_EMBEDDING_BATCH_SIZE", 2048, int,
+            ),
+            # Vector DB. Env vars are named VECTOR_DB_* because the backend
+            # may be openGauss OR PostgreSQL+pgvector (see OpenGaussVectorIndex);
+            # the historical OPENGAUSS_* spellings still work as legacy aliases.
             vector_db_type=_resolve(vdb.get("type"), "VECTOR_DB_TYPE", "chroma"),
-            opengauss_connection_string=_resolve(
+            opengauss_connection_string=_resolve_with_alias(
                 vdb.get("connection_string"),
-                "OPENGAUSS_CONNECTION_STRING",
-                None,
+                "VECTOR_DB_CONNECTION_STRING", "OPENGAUSS_CONNECTION_STRING",
             ),
-            opengauss_dimension=_resolve(
-                vdb.get("dimension"),
-                "OPENGAUSS_DIMENSION",
-                1024,
-                int,
+            opengauss_dimension=_resolve_with_alias(
+                vdb.get("dimension"), "VECTOR_DB_DIMENSION", "OPENGAUSS_DIMENSION",
+                cast=int, default=1024,
             ),
-            opengauss_table_name=_resolve(
+            opengauss_table_name=_resolve_with_alias(
                 vdb.get("table_name"),
-                "OPENGAUSS_TABLE_NAME",
-                "vector_index",
+                "VECTOR_DB_TABLE_NAME", "OPENGAUSS_TABLE_NAME",
+                default="vector_index",
             ),
-            opengauss_pool_size=_resolve(
-                vdb.get("pool_size"),
-                "OPENGAUSS_POOL_SIZE",
-                5,
-                int,
+            opengauss_pool_size=_resolve_with_alias(
+                vdb.get("pool_size"), "VECTOR_DB_POOL_SIZE", "OPENGAUSS_POOL_SIZE",
+                cast=int, default=5,
             ),
             chroma_persist_directory=_resolve(
                 vdb.get("chroma_persist_dir"),
@@ -843,6 +1281,545 @@ class OgMemConfig:
                 "OG_HTTP_TRUSTED_PROXIES",
                 [],
             ),
+            # Code-memory features. Canonical filter settings are nested under
+            # ``features.tool_output_filter``; flat and root-level YAML forms
+            # remain accepted for compatibility.
+            code_resources_enabled=_resolve_bool(
+                _first_value(
+                    features.get("code_resources_enabled"),
+                    code_resources.get("enabled"),
+                    legacy_code.get("resources_enabled"),
+                    raw.get("code_resources_enabled"),
+                ),
+                "OGMEM_CODE_RESOURCES_ENABLED",
+                False,
+            ),
+            code_resources_max_files=_resolve(
+                _first_value(
+                    features.get("code_resources_max_files"),
+                    code_resources.get("max_files"),
+                    legacy_code.get("resources_max_files"),
+                    raw.get("code_resources_max_files"),
+                ),
+                "OGMEM_CODE_RESOURCES_MAX_FILES",
+                5000,
+                int,
+            ),
+            code_workspace_allowed_roots=_resolve_list(
+                _first_value(
+                    features.get("code_workspace_allowed_roots"),
+                    code_sync.get("allowed_roots"),
+                    raw.get("code_workspace_allowed_roots"),
+                ),
+                "OGMEM_CODE_WORKSPACE_ALLOWED_ROOTS",
+                [],
+            ),
+            code_sync_enabled=_resolve_bool(
+                _first_value(
+                    features.get("code_sync_enabled"),
+                    code_sync.get("enabled"),
+                    raw.get("code_sync_enabled"),
+                ),
+                "OGMEM_CODE_SYNC_ENABLED",
+                False,
+            ),
+            code_sync_default_trigger_mode=_resolve(
+                _first_value(
+                    features.get("code_sync_default_trigger_mode"),
+                    code_sync.get("default_trigger_mode"),
+                    raw.get("code_sync_default_trigger_mode"),
+                ),
+                "OGMEM_CODE_SYNC_DEFAULT_TRIGGER_MODE",
+                "hybrid",
+            ),
+            code_sync_default_wait_mode=_resolve(
+                _first_value(
+                    features.get("code_sync_default_wait_mode"),
+                    code_sync.get("default_wait_mode"),
+                    raw.get("code_sync_default_wait_mode"),
+                ),
+                "OGMEM_CODE_SYNC_DEFAULT_WAIT_MODE",
+                "accepted",
+            ),
+            code_sync_reconcile_interval_seconds=_resolve(
+                _first_value(
+                    features.get("code_sync_reconcile_interval_seconds"),
+                    code_sync.get("reconcile_interval_seconds"),
+                    raw.get("code_sync_reconcile_interval_seconds"),
+                ),
+                "OGMEM_CODE_SYNC_RECONCILE_INTERVAL_SECONDS",
+                300,
+                int,
+            ),
+            code_sync_watch_interval_seconds=_resolve(
+                _first_value(
+                    features.get("code_sync_watch_interval_seconds"),
+                    code_sync.get("watch_interval_seconds"),
+                    raw.get("code_sync_watch_interval_seconds"),
+                ),
+                "OGMEM_CODE_SYNC_WATCH_INTERVAL_SECONDS",
+                5,
+                int,
+            ),
+            code_sync_run_timeout_seconds=_resolve(
+                _first_value(
+                    features.get("code_sync_run_timeout_seconds"),
+                    code_sync.get("run_timeout_seconds"),
+                    raw.get("code_sync_run_timeout_seconds"),
+                ),
+                "OGMEM_CODE_SYNC_RUN_TIMEOUT_SECONDS",
+                60,
+                int,
+            ),
+            code_sync_failure_backoff_seconds=_resolve(
+                _first_value(
+                    features.get("code_sync_failure_backoff_seconds"),
+                    code_sync.get("failure_backoff_seconds"),
+                    raw.get("code_sync_failure_backoff_seconds"),
+                ),
+                "OGMEM_CODE_SYNC_FAILURE_BACKOFF_SECONDS",
+                30,
+                int,
+            ),
+            code_sync_max_pending_roots=_resolve(
+                _first_value(
+                    features.get("code_sync_max_pending_roots"),
+                    code_sync.get("max_pending_roots"),
+                    raw.get("code_sync_max_pending_roots"),
+                ),
+                "OGMEM_CODE_SYNC_MAX_PENDING_ROOTS",
+                100,
+                int,
+            ),
+            code_sync_debounce_seconds=_resolve(
+                _first_value(
+                    features.get("code_sync_debounce_seconds"),
+                    code_sync.get("debounce_seconds"),
+                    raw.get("code_sync_debounce_seconds"),
+                ),
+                "OGMEM_CODE_SYNC_DEBOUNCE_SECONDS",
+                2,
+                int,
+            ),
+            code_retrieval_enabled=_resolve_bool(
+                _first_value(
+                    features.get("code_retrieval_enabled"),
+                    code_retrieval.get("enabled"),
+                    legacy_code.get("retrieval_enabled"),
+                    raw.get("code_retrieval_enabled"),
+                ),
+                "OGMEM_CODE_RETRIEVAL_ENABLED",
+                False,
+            ),
+            code_retrieval_mode=str(
+                _resolve(
+                    _first_value(
+                        features.get("code_retrieval_mode"),
+                        code_retrieval.get("mode"),
+                        legacy_code_retrieval.get("mode"),
+                        raw.get("code_retrieval_mode"),
+                    ),
+                    "OGMEM_CODE_RETRIEVAL_MODE",
+                    "full",
+                )
+            ).strip().lower(),
+            code_retrieval_semantic_enabled=_resolve_bool(
+                _first_value(
+                    features.get("code_retrieval_semantic_enabled"),
+                    code_retrieval.get("semantic_enabled"),
+                    legacy_code_retrieval.get("semantic_enabled"),
+                    raw.get("code_retrieval_semantic_enabled"),
+                ),
+                "OGMEM_CODE_RETRIEVAL_SEMANTIC_ENABLED",
+                True,
+            ),
+            code_retrieval_bm25_enabled=_resolve_bool(
+                _first_value(
+                    features.get("code_retrieval_bm25_enabled"),
+                    code_retrieval.get("bm25_enabled"),
+                    legacy_code_retrieval.get("bm25_enabled"),
+                    raw.get("code_retrieval_bm25_enabled"),
+                ),
+                "OGMEM_CODE_RETRIEVAL_BM25_ENABLED",
+                True,
+            ),
+            code_retrieval_symbolic_enabled=_resolve_bool(
+                _first_value(
+                    features.get("code_retrieval_symbolic_enabled"),
+                    code_retrieval.get("symbolic_enabled"),
+                    legacy_code_retrieval.get("symbolic_enabled"),
+                    raw.get("code_retrieval_symbolic_enabled"),
+                ),
+                "OGMEM_CODE_RETRIEVAL_SYMBOLIC_ENABLED",
+                True,
+            ),
+            code_retrieval_graph_enabled=_resolve_bool(
+                _first_value(
+                    features.get("code_retrieval_graph_enabled"),
+                    code_retrieval.get("graph_enabled"),
+                    legacy_code_retrieval.get("graph_enabled"),
+                    raw.get("code_retrieval_graph_enabled"),
+                ),
+                "OGMEM_CODE_RETRIEVAL_GRAPH_ENABLED",
+                True,
+            ),
+            code_retrieval_fusion_mode=_resolve(
+                _first_value(
+                    features.get("code_retrieval_fusion_mode"),
+                    code_retrieval.get("fusion_mode"),
+                    legacy_code_retrieval.get("fusion_mode"),
+                    raw.get("code_retrieval_fusion_mode"),
+                ),
+                "OGMEM_CODE_RETRIEVAL_FUSION_MODE",
+                "weighted_rrf",
+            ),
+            code_retrieval_semantic_weight=_resolve(
+                _first_value(
+                    features.get("code_retrieval_semantic_weight"),
+                    code_retrieval.get("semantic_weight"),
+                    legacy_code_retrieval.get("semantic_weight"),
+                    raw.get("code_retrieval_semantic_weight"),
+                ),
+                "OGMEM_CODE_RETRIEVAL_SEMANTIC_WEIGHT",
+                0.33,
+                float,
+            ),
+            code_retrieval_bm25_weight=_resolve(
+                _first_value(
+                    features.get("code_retrieval_bm25_weight"),
+                    code_retrieval.get("bm25_weight"),
+                    legacy_code_retrieval.get("bm25_weight"),
+                    raw.get("code_retrieval_bm25_weight"),
+                ),
+                "OGMEM_CODE_RETRIEVAL_BM25_WEIGHT",
+                0.17,
+                float,
+            ),
+            code_retrieval_symbolic_weight=_resolve(
+                _first_value(
+                    features.get("code_retrieval_symbolic_weight"),
+                    code_retrieval.get("symbolic_weight"),
+                    legacy_code_retrieval.get("symbolic_weight"),
+                    raw.get("code_retrieval_symbolic_weight"),
+                ),
+                "OGMEM_CODE_RETRIEVAL_SYMBOLIC_WEIGHT",
+                0.17,
+                float,
+            ),
+            code_retrieval_graph_weight=_resolve(
+                _first_value(
+                    features.get("code_retrieval_graph_weight"),
+                    code_retrieval.get("graph_weight"),
+                    legacy_code_retrieval.get("graph_weight"),
+                    raw.get("code_retrieval_graph_weight"),
+                ),
+                "OGMEM_CODE_RETRIEVAL_GRAPH_WEIGHT",
+                0.33,
+                float,
+            ),
+            code_retrieval_candidate_limit=_resolve(
+                _first_value(
+                    features.get("code_retrieval_candidate_limit"),
+                    code_retrieval.get("candidate_limit"),
+                    legacy_code_retrieval.get("candidate_limit"),
+                    raw.get("code_retrieval_candidate_limit"),
+                ),
+                "OGMEM_CODE_RETRIEVAL_CANDIDATE_LIMIT",
+                50,
+                int,
+            ),
+            code_retrieval_result_limit=_resolve(
+                _first_value(
+                    features.get("code_retrieval_result_limit"),
+                    code_retrieval.get("result_limit"),
+                    legacy_code_retrieval.get("result_limit"),
+                    raw.get("code_retrieval_result_limit"),
+                ),
+                "OGMEM_CODE_RETRIEVAL_RESULT_LIMIT",
+                5,
+                int,
+            ),
+            code_retrieval_snippet_chars=_resolve(
+                _first_value(
+                    features.get("code_retrieval_snippet_chars"),
+                    code_retrieval.get("snippet_chars"),
+                    legacy_code_retrieval.get("snippet_chars"),
+                    raw.get("code_retrieval_snippet_chars"),
+                ),
+                "OGMEM_CODE_RETRIEVAL_SNIPPET_CHARS",
+                1200,
+                int,
+            ),
+            code_retrieval_batch_chars=_resolve(
+                _first_value(
+                    features.get("code_retrieval_batch_chars"),
+                    code_retrieval.get("batch_chars"),
+                    legacy_code_retrieval.get("batch_chars"),
+                    raw.get("code_retrieval_batch_chars"),
+                ),
+                "OGMEM_CODE_RETRIEVAL_BATCH_CHARS",
+                8000,
+                int,
+            ),
+            code_retrieval_graph_neighbor_limit=_resolve(
+                _first_value(
+                    features.get("code_retrieval_graph_neighbor_limit"),
+                    code_retrieval.get("graph_neighbor_limit"),
+                    legacy_code_retrieval.get("graph_neighbor_limit"),
+                    raw.get("code_retrieval_graph_neighbor_limit"),
+                ),
+                "OGMEM_CODE_RETRIEVAL_GRAPH_NEIGHBOR_LIMIT",
+                24,
+                int,
+            ),
+            code_retrieval_route_deadline_ms=_resolve(
+                _first_value(
+                    features.get("code_retrieval_route_deadline_ms"),
+                    code_retrieval.get("route_deadline_ms"),
+                    legacy_code_retrieval.get("route_deadline_ms"),
+                    raw.get("code_retrieval_route_deadline_ms"),
+                ),
+                "OGMEM_CODE_RETRIEVAL_ROUTE_DEADLINE_MS",
+                500,
+                int,
+            ),
+            code_retrieval_candidate_discovery_pool_limit=_resolve_filter_int(
+                _first_value(
+                    features.get("code_retrieval_candidate_discovery_pool_limit"),
+                    code_retrieval.get("candidate_discovery_pool_limit"),
+                    legacy_code_retrieval.get("candidate_discovery_pool_limit"),
+                    raw.get("code_retrieval_candidate_discovery_pool_limit"),
+                ),
+                "OGMEM_CODE_RETRIEVAL_CANDIDATE_DISCOVERY_POOL_LIMIT",
+                300,
+            ),
+            code_retrieval_candidate_file_limit=_resolve_filter_int(
+                _first_value(
+                    features.get("code_retrieval_candidate_file_limit"),
+                    code_retrieval.get("candidate_file_limit"),
+                    legacy_code_retrieval.get("candidate_file_limit"),
+                    raw.get("code_retrieval_candidate_file_limit"),
+                ),
+                "OGMEM_CODE_RETRIEVAL_CANDIDATE_FILE_LIMIT",
+                80,
+            ),
+            code_retrieval_candidate_snippet_limit=_resolve_filter_int(
+                _first_value(
+                    features.get("code_retrieval_candidate_snippet_limit"),
+                    code_retrieval.get("candidate_snippet_limit"),
+                    legacy_code_retrieval.get("candidate_snippet_limit"),
+                    raw.get("code_retrieval_candidate_snippet_limit"),
+                ),
+                "OGMEM_CODE_RETRIEVAL_CANDIDATE_SNIPPET_LIMIT",
+                500,
+            ),
+            code_retrieval_candidate_semantic_limit=_resolve_filter_int(
+                _first_value(
+                    features.get("code_retrieval_candidate_semantic_limit"),
+                    code_retrieval.get("candidate_semantic_limit"),
+                    legacy_code_retrieval.get("candidate_semantic_limit"),
+                    raw.get("code_retrieval_candidate_semantic_limit"),
+                ),
+                "OGMEM_CODE_RETRIEVAL_CANDIDATE_SEMANTIC_LIMIT",
+                16,
+            ),
+            code_retrieval_candidate_embedding_chars=_resolve_filter_int(
+                _first_value(
+                    features.get("code_retrieval_candidate_embedding_chars"),
+                    code_retrieval.get("candidate_embedding_chars"),
+                    legacy_code_retrieval.get("candidate_embedding_chars"),
+                    raw.get("code_retrieval_candidate_embedding_chars"),
+                ),
+                "OGMEM_CODE_RETRIEVAL_CANDIDATE_EMBEDDING_CHARS",
+                4096,
+            ),
+            code_retrieval_candidate_embedding_batch_texts=_resolve_filter_int(
+                _first_value(
+                    features.get("code_retrieval_candidate_embedding_batch_texts"),
+                    code_retrieval.get("candidate_embedding_batch_texts"),
+                    legacy_code_retrieval.get("candidate_embedding_batch_texts"),
+                    raw.get("code_retrieval_candidate_embedding_batch_texts"),
+                ),
+                "OGMEM_CODE_RETRIEVAL_CANDIDATE_EMBEDDING_BATCH_TEXTS",
+                8,
+            ),
+            code_retrieval_candidate_embedding_batch_tokens=_resolve_filter_int(
+                _first_value(
+                    features.get("code_retrieval_candidate_embedding_batch_tokens"),
+                    code_retrieval.get("candidate_embedding_batch_tokens"),
+                    legacy_code_retrieval.get("candidate_embedding_batch_tokens"),
+                    raw.get("code_retrieval_candidate_embedding_batch_tokens"),
+                ),
+                "OGMEM_CODE_RETRIEVAL_CANDIDATE_EMBEDDING_BATCH_TOKENS",
+                8000,
+            ),
+            code_retrieval_candidate_read_bytes=_resolve_filter_int(
+                _first_value(
+                    features.get("code_retrieval_candidate_read_bytes"),
+                    code_retrieval.get("candidate_read_bytes"),
+                    legacy_code_retrieval.get("candidate_read_bytes"),
+                    raw.get("code_retrieval_candidate_read_bytes"),
+                ),
+                "OGMEM_CODE_RETRIEVAL_CANDIDATE_READ_BYTES",
+                64 * 1024 * 1024,
+            ),
+            code_retrieval_candidate_discovery_deadline_ms=_resolve_filter_int(
+                _first_value(
+                    features.get("code_retrieval_candidate_discovery_deadline_ms"),
+                    code_retrieval.get("candidate_discovery_deadline_ms"),
+                    legacy_code_retrieval.get("candidate_discovery_deadline_ms"),
+                    raw.get("code_retrieval_candidate_discovery_deadline_ms"),
+                ),
+                "OGMEM_CODE_RETRIEVAL_CANDIDATE_DISCOVERY_DEADLINE_MS",
+                15_000,
+            ),
+            code_retrieval_candidate_embedding_deadline_ms=_resolve_filter_int(
+                _first_value(
+                    features.get("code_retrieval_candidate_embedding_deadline_ms"),
+                    code_retrieval.get("candidate_embedding_deadline_ms"),
+                    legacy_code_retrieval.get("candidate_embedding_deadline_ms"),
+                    raw.get("code_retrieval_candidate_embedding_deadline_ms"),
+                ),
+                "OGMEM_CODE_RETRIEVAL_CANDIDATE_EMBEDDING_DEADLINE_MS",
+                330_000,
+            ),
+            code_retrieval_candidate_request_deadline_ms=_resolve_filter_int(
+                _first_value(
+                    features.get("code_retrieval_candidate_request_deadline_ms"),
+                    code_retrieval.get("candidate_request_deadline_ms"),
+                    legacy_code_retrieval.get("candidate_request_deadline_ms"),
+                    raw.get("code_retrieval_candidate_request_deadline_ms"),
+                ),
+                "OGMEM_CODE_RETRIEVAL_CANDIDATE_REQUEST_DEADLINE_MS",
+                360_000,
+            ),
+            tool_output_filter_enabled=_resolve_bool(
+                _first_value(
+                    tool_output_filter.get("enabled"),
+                    features.get("tool_output_filter_enabled"),
+                    raw.get("tool_output_filter_enabled"),
+                ),
+                "OGMEM_TOOL_OUTPUT_FILTER_ENABLED",
+                False,
+            ),
+            tool_output_filter_read_enabled=_resolve_bool(
+                _first_value(
+                    tool_output_filter.get("read_enabled"),
+                    features.get("tool_output_filter_read_enabled"),
+                    raw.get("tool_output_filter_read_enabled"),
+                ),
+                "OGMEM_TOOL_OUTPUT_FILTER_READ_ENABLED",
+                True,
+            ),
+            tool_output_filter_bash_enabled=_resolve_bool(
+                _first_value(
+                    tool_output_filter.get("bash_enabled"),
+                    features.get("tool_output_filter_bash_enabled"),
+                    raw.get("tool_output_filter_bash_enabled"),
+                ),
+                "OGMEM_TOOL_OUTPUT_FILTER_BASH_ENABLED",
+                True,
+            ),
+            tool_output_filter_adaptive_enabled=_resolve_bool(
+                _first_value(
+                    tool_output_filter.get("adaptive_enabled"),
+                    features.get("tool_output_filter_adaptive_enabled"),
+                    raw.get("tool_output_filter_adaptive_enabled"),
+                ),
+                "OGMEM_TOOL_OUTPUT_FILTER_ADAPTIVE_ENABLED",
+                True,
+            ),
+            tool_output_filter_read_min_chars=_resolve_filter_int(
+                _first_value(
+                    tool_output_filter.get("read_min_chars"),
+                    features.get("tool_output_filter_read_min_chars"),
+                    raw.get("tool_output_filter_read_min_chars"),
+                ),
+                "OGMEM_TOOL_OUTPUT_FILTER_READ_MIN_CHARS",
+                8000,
+            ),
+            tool_output_filter_read_max_lines=_resolve_filter_int(
+                _first_value(
+                    tool_output_filter.get("read_max_lines"),
+                    features.get("tool_output_filter_read_max_lines"),
+                    raw.get("tool_output_filter_read_max_lines"),
+                ),
+                "OGMEM_TOOL_OUTPUT_FILTER_READ_MAX_LINES",
+                60,
+            ),
+            tool_output_filter_bash_min_chars=_resolve_filter_int(
+                _first_value(
+                    tool_output_filter.get("bash_min_chars"),
+                    features.get("tool_output_filter_bash_min_chars"),
+                    raw.get("tool_output_filter_bash_min_chars"),
+                ),
+                "OGMEM_TOOL_OUTPUT_FILTER_BASH_MIN_CHARS",
+                8000,
+            ),
+            tool_output_filter_bash_min_lines=_resolve_filter_int(
+                _first_value(
+                    tool_output_filter.get("bash_min_lines"),
+                    features.get("tool_output_filter_bash_min_lines"),
+                    raw.get("tool_output_filter_bash_min_lines"),
+                ),
+                "OGMEM_TOOL_OUTPUT_FILTER_BASH_MIN_LINES",
+                100,
+            ),
+            tool_output_filter_test_max_lines=_resolve_filter_int(
+                _first_value(
+                    tool_output_filter.get("test_max_lines"),
+                    features.get("tool_output_filter_test_max_lines"),
+                    raw.get("tool_output_filter_test_max_lines"),
+                ),
+                "OGMEM_TOOL_OUTPUT_FILTER_TEST_MAX_LINES",
+                120,
+            ),
+            tool_output_filter_diff_max_lines=_resolve_filter_int(
+                _first_value(
+                    tool_output_filter.get("diff_max_lines"),
+                    features.get("tool_output_filter_diff_max_lines"),
+                    raw.get("tool_output_filter_diff_max_lines"),
+                ),
+                "OGMEM_TOOL_OUTPUT_FILTER_DIFF_MAX_LINES",
+                100,
+            ),
+            tool_output_filter_error_max_lines=_resolve_filter_int(
+                _first_value(
+                    tool_output_filter.get("error_max_lines"),
+                    features.get("tool_output_filter_error_max_lines"),
+                    raw.get("tool_output_filter_error_max_lines"),
+                ),
+                "OGMEM_TOOL_OUTPUT_FILTER_ERROR_MAX_LINES",
+                100,
+            ),
+            tool_output_filter_generic_max_lines=_resolve_filter_int(
+                _first_value(
+                    tool_output_filter.get("generic_max_lines"),
+                    features.get("tool_output_filter_generic_max_lines"),
+                    raw.get("tool_output_filter_generic_max_lines"),
+                ),
+                "OGMEM_TOOL_OUTPUT_FILTER_GENERIC_MAX_LINES",
+                80,
+            ),
+            tool_output_filter_output_max_chars=_resolve_filter_int(
+                _first_value(
+                    tool_output_filter.get("output_max_chars"),
+                    features.get("tool_output_filter_output_max_chars"),
+                    raw.get("tool_output_filter_output_max_chars"),
+                ),
+                "OGMEM_TOOL_OUTPUT_FILTER_OUTPUT_MAX_CHARS",
+                50000,
+            ),
+            tool_output_recovery_max_chars=_resolve_filter_int(
+                _first_value(
+                    tool_output_filter.get("recovery_max_chars"),
+                    features.get("tool_output_recovery_max_chars"),
+                    tool_output.get("recovery_max_chars"),
+                    raw.get("tool_output_recovery_max_chars"),
+                ),
+                "OGMEM_TOOL_OUTPUT_FILTER_RECOVERY_MAX_CHARS",
+                50000,
+            ),
             # MCP
             mcp_enabled=_resolve_bool(mcp.get("enabled"), "OGMEM_MCP_ENABLED", True),
             mcp_host=_resolve(mcp.get("host"), "OGMEM_MCP_HOST", "127.0.0.1"),
@@ -871,6 +1848,11 @@ class OgMemConfig:
             mcp_enable_diagnostic_tools=_resolve_bool(
                 mcp.get("enable_diagnostic_tools"),
                 "OGMEM_MCP_ENABLE_DIAGNOSTIC_TOOLS",
+                False,
+            ),
+            mcp_enable_code_edit_tools=_resolve_bool(
+                mcp.get("enable_code_edit_tools"),
+                "OGMEM_MCP_ENABLE_CODE_EDIT_TOOLS",
                 False,
             ),
             mcp_max_request_bytes=_resolve(
@@ -907,7 +1889,9 @@ class OgMemConfig:
                 "OGMEM_MCP_ALLOWED_HOSTS",
                 ["127.0.0.1", "localhost"],
             ),
-            # Storage backend
+            # Storage backend. STORAGE_DB_CONNECTION_STRING is the canonical
+            # env name (paired with the STORAGE_DB_* deploy vars); the older
+            # SQL_CONNECTION_STRING spelling remains as a legacy alias.
             storage_backend=_resolve(
                 storage.get("backend"),
                 "STORAGE_BACKEND",
@@ -918,16 +1902,13 @@ class OgMemConfig:
                 "SQL_DIALECT",
                 "postgresql",
             ),
-            sql_connection_string=_resolve(
+            sql_connection_string=_resolve_with_alias(
                 storage.get("connection_string"),
-                "SQL_CONNECTION_STRING",
-                None,
+                "STORAGE_DB_CONNECTION_STRING", "SQL_CONNECTION_STRING",
             ),
-            sql_pool_size=_resolve(
-                storage.get("pool_size"),
-                "SQL_POOL_SIZE",
-                5,
-                int,
+            sql_pool_size=_resolve_with_alias(
+                storage.get("pool_size"), "STORAGE_DB_POOL_SIZE", "SQL_POOL_SIZE",
+                cast=int, default=5,
             ),
             trace_max_turn_events=_resolve(
                 storage.get("trace_max_turn_events"),
@@ -939,6 +1920,10 @@ class OgMemConfig:
             agent_memory_enabled=_resolve_bool(
                 (raw.get("agent_memory") or {}).get("enabled"), "OGMEM_AGENT_MEMORY_ENABLED", False,
             ),
+            scene_enabled=_resolve_bool(
+                (raw.get("scene") or {}).get("enabled"), "OGMEM_SCENE_ENABLED", False,
+            ),
+            scene_options=dict((raw.get("scene") or {}).get("options") or {}),
             skill_sedimentation_enabled=_resolve_bool(
                 sedimentation.get("enabled"), "OGMEM_SKILL_SEDIMENTATION_ENABLED", False,
             ),
@@ -1160,6 +2145,89 @@ class OgMemConfig:
                 "OGMEM_COMPRESSION_QUALITY_PERSIST_METADATA",
                 False,
             ),
+            # Large tool-result externalization
+            tool_result_externalization_enabled=_resolve_bool(
+                tool_results.get("enabled"), "OGMEM_TOOL_RESULT_EXTERNALIZATION_ENABLED", False,
+            ),
+            tool_result_first_view_enabled=_resolve_bool(
+                tool_results.get("first_view_enabled"),
+                "OGMEM_TOOL_RESULT_FIRST_VIEW_ENABLED",
+                True,
+            ),
+            tool_result_semantic_turn_mode=_resolve(
+                tool_results.get("semantic_turn_mode"),
+                "OGMEM_TOOL_RESULT_SEMANTIC_TURN_MODE",
+                "user_message",
+            ),
+            tool_result_single_chars=_resolve(
+                tool_results.get("single_result_chars"), "OGMEM_TOOL_RESULT_SINGLE_CHARS", 20_000, int,
+            ),
+            tool_result_synopsis_max_chars=_resolve(
+                tool_results.get("synopsis_max_chars"), "OGMEM_TOOL_RESULT_SYNOPSIS_MAX_CHARS", 2_000, int,
+            ),
+            tool_result_stub_summary_turn_chars=_resolve(
+                tool_results.get("stub_summary_turn_chars"),
+                "OGMEM_TOOL_RESULT_STUB_SUMMARY_TURN_CHARS",
+                12_000,
+                int,
+            ),
+            tool_result_write_timeout_ms=_resolve(
+                tool_results.get("write_timeout_ms"), "OGMEM_TOOL_RESULT_WRITE_TIMEOUT_MS", 3_000, int,
+            ),
+            tool_result_retry_attempts=_resolve(
+                tool_results.get("retry_attempts"), "OGMEM_TOOL_RESULT_RETRY_ATTEMPTS", 2, int,
+            ),
+            tool_result_search_chunk_bytes=_resolve(
+                tool_results.get("search_chunk_bytes"), "OGMEM_TOOL_RESULT_SEARCH_CHUNK_BYTES", 16_384, int,
+            ),
+            tool_result_search_overlap_bytes=_resolve(
+                tool_results.get("search_overlap_bytes"), "OGMEM_TOOL_RESULT_SEARCH_OVERLAP_BYTES", 1_024, int,
+            ),
+            tool_result_search_top_k=_resolve(
+                tool_results.get("search_top_k"), "OGMEM_TOOL_RESULT_SEARCH_TOP_K", 5, int,
+            ),
+            tool_result_search_max_artifacts=_resolve(
+                tool_results.get("search_max_artifacts"), "OGMEM_TOOL_RESULT_SEARCH_MAX_ARTIFACTS", 20, int,
+            ),
+            tool_result_search_deadline_ms=_resolve(
+                tool_results.get("search_deadline_ms"), "OGMEM_TOOL_RESULT_SEARCH_DEADLINE_MS", 2_000, int,
+            ),
+            tool_result_read_default_bytes=_resolve(
+                tool_results.get("read_default_bytes"), "OGMEM_TOOL_RESULT_READ_DEFAULT_BYTES", 32_768, int,
+            ),
+            tool_result_artifact_temp_grace_seconds=_resolve(
+                tool_results.get("artifact_temp_grace_seconds"), "OGMEM_TOOL_RESULT_TEMP_GRACE_SECONDS", 600, int,
+            ),
+            tool_result_http_max_response_chars=_resolve(
+                tool_results.get("http_max_response_chars"),
+                "OGMEM_TOOL_RESULT_HTTP_MAX_RESPONSE_CHARS",
+                100_000,
+                int,
+            ),
+            # Tool-result cache optimization
+            tool_result_cache_delay_enabled=_resolve_bool(
+                tool_result_cache_delay.get("enabled"),
+                "OGMEM_TOOL_RESULT_CACHE_DELAY_ENABLED",
+                False,
+            ),
+            tool_result_cache_delay_chars=_resolve(
+                tool_result_cache_delay.get("delayed_result_chars"),
+                "OGMEM_TOOL_RESULT_CACHE_DELAY_CHARS",
+                2_000,
+                int,
+            ),
+            tool_result_cache_delay_idle_ttl_seconds=_resolve(
+                tool_result_cache_delay.get("idle_ttl_seconds"),
+                "OGMEM_TOOL_RESULT_CACHE_DELAY_IDLE_TTL_SECONDS",
+                300,
+                int,
+            ),
+            tool_result_cache_hit_price_ratio=_resolve(
+                tool_result_cache_delay.get("cache_hit_price_ratio"),
+                "OGMEM_TOOL_RESULT_CACHE_HIT_PRICE_RATIO",
+                0.1,
+                float,
+            ),
             # Retrieval
             retrieval_expand_hierarchy=_resolve_expand_hierarchy(
                 retrieval.get("expand_hierarchy"),
@@ -1279,12 +2347,88 @@ class OgMemConfig:
             perf_run_id=_resolve(perf.get("run_id"), "OGMEM_PERF_RUN_ID", None),
             perf_rate_card=_resolve(perf.get("rate_card"), "OGMEM_PERF_RATE_CARD", None),
         )
+        # SQL is the only storage backend and shares the same PostgreSQL/openGauss
+        # instance as the vector index. An existing deployment that configured the
+        # vector DSN (vector_db.connection_string / VECTOR_DB_CONNECTION_STRING)
+        # but not the newer storage DSN would otherwise be left with an empty
+        # storage DSN and fail health checks / ContextFS init. Fall back to the
+        # resolved vector DSN so storage is usable.
+        if not cfg.sql_connection_string and cfg.opengauss_connection_string:
+            cfg.sql_connection_string = cfg.opengauss_connection_string
         cfg._export_perf_env()
         return cfg
 
     # -------------------------------------------------------------------------
     # Convenience helpers
     # -------------------------------------------------------------------------
+
+    @property
+    def effective_code_retrieval_semantic_enabled(self) -> bool:
+        return self.code_retrieval_enabled and self.code_retrieval_semantic_enabled
+
+    @property
+    def effective_code_retrieval_bm25_enabled(self) -> bool:
+        return self.code_retrieval_enabled and self.code_retrieval_bm25_enabled
+
+    @property
+    def effective_code_retrieval_symbolic_enabled(self) -> bool:
+        return self.code_retrieval_enabled and self.code_retrieval_symbolic_enabled
+
+    @property
+    def effective_code_retrieval_graph_enabled(self) -> bool:
+        return self.code_retrieval_enabled and self.code_retrieval_graph_enabled
+
+    # Short aliases keep the typed active-service contract independent from
+    # the historical flat configuration prefixes.
+    @property
+    def code_retrieval_candidate_cap(self) -> int:
+        return self.code_retrieval_candidate_limit
+
+    @property
+    def code_retrieval_result_cap(self) -> int:
+        return self.code_retrieval_result_limit
+
+    @property
+    def code_retrieval_snippet_body_limit(self) -> int:
+        return self.code_retrieval_snippet_chars
+
+    @property
+    def code_retrieval_batch_body_limit(self) -> int:
+        return self.code_retrieval_batch_chars
+
+    @property
+    def code_retrieval_graph_neighbors(self) -> int:
+        return self.code_retrieval_graph_neighbor_limit
+
+    @property
+    def effective_tool_output_filter_read_enabled(self) -> bool:
+        return self.tool_output_filter_enabled and self.tool_output_filter_read_enabled
+
+    @property
+    def effective_tool_output_filter_bash_enabled(self) -> bool:
+        return self.tool_output_filter_enabled and self.tool_output_filter_bash_enabled
+
+    def code_retrieval_route_enabled(self, route: str) -> bool:
+        """Return an effective code-route switch, including the master flag."""
+        route_flags = {
+            "semantic": self.effective_code_retrieval_semantic_enabled,
+            "bm25": self.effective_code_retrieval_bm25_enabled,
+            "symbolic": self.effective_code_retrieval_symbolic_enabled,
+            "graph": self.effective_code_retrieval_graph_enabled,
+        }
+        try:
+            return route_flags[route.lower()]
+        except KeyError as exc:
+            raise ValueError(f"unknown code retrieval route: {route}") from exc
+
+    def tool_output_filter_kind_enabled(self, tool_name: str) -> bool:
+        """Return an effective Read/Bash switch, including the master flag."""
+        normalized = tool_name.strip().lower()
+        if normalized == "read":
+            return self.effective_tool_output_filter_read_enabled
+        if normalized == "bash":
+            return self.effective_tool_output_filter_bash_enabled
+        raise ValueError(f"unsupported tool output filter: {tool_name}")
 
     def _export_perf_env(self) -> None:
         """Propagate YAML-sourced perf settings to OGMEM_PERF_* env vars.

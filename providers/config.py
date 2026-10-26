@@ -49,6 +49,7 @@ class ProviderConfig:
     # Model parameters
     llm_temperature: float = 0.7
     llm_max_tokens: int = 4096
+    llm_request_timeout_seconds: float = 120.0
     llm_json_mode: bool = False
     llm_reasoning_effort: str | None = None
     llm_is_reasoning_model: bool | None = None
@@ -78,6 +79,10 @@ class ProviderConfig:
     # Embedding multimodal flag
     embedding_multimodal: bool = False
 
+    # Maximum characters sent for each OpenAI-compatible embedding input.
+    embedding_max_input_chars: int = 30_000
+    embedding_batch_size: int = 2048
+
     # Lazy secrets cache
     _cached_openai_api_key: str | None = field(default=None, init=False, repr=False)
     _cached_embedding_api_key: str | None = field(default=None, init=False, repr=False)
@@ -93,10 +98,11 @@ class ProviderConfig:
             OGMEM_EMBEDDING_MODEL: Embedding model name
             OGMEM_LLM_MODEL: LLM model name
             VECTOR_DB_TYPE: Vector database type (memory/opengauss)
-            OPENGAUSS_CONNECTION_STRING: PostgreSQL connection string for opengauss
-            OPENGAUSS_DIMENSION: Embedding dimension (default 1024)
-            OPENGAUSS_TABLE_NAME: Table name for vector storage
-            OPENGAUSS_POOL_SIZE: Connection pool size
+            VECTOR_DB_CONNECTION_STRING: PostgreSQL/openGauss connection string
+                (legacy alias: OPENGAUSS_CONNECTION_STRING)
+            VECTOR_DB_DIMENSION: Embedding dimension (default 1024)
+            VECTOR_DB_TABLE_NAME: Table name for vector storage
+            VECTOR_DB_POOL_SIZE: Connection pool size
         """
         from providers.unified_config import get_config
         return get_config().to_provider_config()
@@ -115,6 +121,7 @@ class ProviderConfig:
             cache_max_size=cfg.cache_max_size,
             llm_temperature=cfg.llm_temperature,
             llm_max_tokens=cfg.llm_max_tokens,
+            llm_request_timeout_seconds=cfg.llm_request_timeout_seconds,
             llm_json_mode=getattr(cfg, 'llm_json_mode', False),
             llm_reasoning_effort=cfg.llm_reasoning_effort,
             llm_is_reasoning_model=cfg.llm_is_reasoning_model,
@@ -132,6 +139,8 @@ class ProviderConfig:
             openai_embedding_api_key=cfg.openai_embedding_api_key,
             openai_embedding_api_key_command=cfg.openai_embedding_api_key_command,
             embedding_multimodal=cfg.embedding_multimodal,
+            embedding_max_input_chars=cfg.embedding_max_input_chars,
+            embedding_batch_size=cfg.embedding_batch_size,
             embedding_dimension=cfg.opengauss_dimension,
         )
 
@@ -201,6 +210,8 @@ class ProviderConfig:
                     dimension=self.opengauss_dimension,
                     cache_max_size=self.cache_max_size,
                     multimodal=self.embedding_multimodal,
+                    max_input_chars=self.embedding_max_input_chars,
+                    batch_size=self.embedding_batch_size,
                 )
             return OpenAIEmbedder(
                 api_key=emb_key,
@@ -208,15 +219,34 @@ class ProviderConfig:
                 model=self.openai_embedding_model,
                 dimension=self.opengauss_dimension,
                 multimodal=self.embedding_multimodal,
+                max_input_chars=self.embedding_max_input_chars,
+                batch_size=self.embedding_batch_size,
             )
 
         raise ValueError(f"Unknown embedding provider: {ep}")
 
-    def create_vector_index(self) -> VectorIndex:
-        """Create a VectorIndex instance based on configuration."""
-        from providers.vector_index import create_vector_index
+    def create_vector_index(self, pool=None) -> VectorIndex:
+        """Create a VectorIndex instance based on configuration.
 
-        return create_vector_index(self)
+        Args:
+            pool: Optional SharedConnectionPool to share with other SQL stores.
+                  When provided, the vector index uses the same pool for
+                  unified connection management and cross-store atomicity.
+        """
+        from providers.vector_index.factory import create_vector_index
+
+        if pool is None or str(self.vector_db_type).strip().casefold() != "opengauss":
+            return create_vector_index(self)
+
+        from providers.vector_index.opengauss_index import OpenGaussVectorIndex
+
+        return OpenGaussVectorIndex(
+            connection_string=self.opengauss_connection_string,
+            dimension=self.opengauss_dimension,
+            table_name=self.opengauss_table_name,
+            pool_size=self.opengauss_pool_size,
+            pool=pool,
+        )
 
     def create_llm(self) -> LLM:
         """Create an LLM instance based on configuration."""
@@ -232,6 +262,7 @@ class ProviderConfig:
                     model=self.openai_llm_model,
                     temperature=self.llm_temperature,
                     max_tokens=self.llm_max_tokens,
+                    request_timeout_seconds=self.llm_request_timeout_seconds,
                     json_mode=self.llm_json_mode,
                     reasoning_effort=self.llm_reasoning_effort,
                     is_reasoning_model=self.llm_is_reasoning_model,
@@ -244,6 +275,7 @@ class ProviderConfig:
                 model=self.openai_llm_model,
                 temperature=self.llm_temperature,
                 max_tokens=self.llm_max_tokens,
+                request_timeout_seconds=self.llm_request_timeout_seconds,
                 json_mode=self.llm_json_mode,
                 reasoning_effort=self.llm_reasoning_effort,
                 is_reasoning_model=self.llm_is_reasoning_model,
@@ -264,6 +296,7 @@ class ProviderConfig:
             openai_llm_model=self.openai_llm_model,
             llm_temperature=self.llm_temperature,
             llm_max_tokens=self.llm_max_tokens,
+            llm_request_timeout_seconds=self.llm_request_timeout_seconds,
             llm_json_mode=self.llm_json_mode,
             llm_reasoning_effort=self.llm_reasoning_effort,
             llm_is_reasoning_model=self.llm_is_reasoning_model,
@@ -273,6 +306,8 @@ class ProviderConfig:
             openai_embedding_api_key=self.openai_embedding_api_key,
             openai_embedding_api_key_command=self.openai_embedding_api_key_command,
             embedding_multimodal=self.embedding_multimodal,
+            embedding_max_input_chars=self.embedding_max_input_chars,
+            embedding_batch_size=self.embedding_batch_size,
             vector_db_type=self.vector_db_type,
             opengauss_connection_string=self.opengauss_connection_string,
             opengauss_dimension=self.opengauss_dimension,

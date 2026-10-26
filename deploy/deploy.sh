@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 ################################################################################
-# OpenClaw + oGMemory 一键部署脚本
+# OpenClaw + oGMemory 一键部署脚本（legacy docker run path）
 #
 # 架构说明：
 # 本脚本会按配置启动数据库容器：
@@ -10,16 +10,22 @@
 # 4. openclaw-ogmemory 容器：OpenClaw Gateway（Web 界面，端口 18789）
 #
 # 用法:
-#   1. 编辑 deploy.env 中的配置项
+#   1. 编辑 .env 中的配置项（从 .env.example 复制）
 #   2. bash deploy.sh -password <密码>  — 部署（ENABLE_OPENGAUSS=true 时必须指定密码）
 #   3. bash deploy.sh                   — 部署（ENABLE_OPENGAUSS=false 时无需密码）
 #   4. bash deploy.sh --cleanup         — 清理所有已部署的容器
 #   5. bash deploy.sh --status          — 查看部署状态
+#
+# 推荐使用 docker compose 方式（见 README.compose.md）；本脚本保留是为了向后兼容。
 ################################################################################
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-ENV_FILE="${SCRIPT_DIR}/deploy.env"
+# Single env file shared with the compose path. We read `.env` first (the new
+# convention, also auto-loaded by `docker compose`); if absent we fall back to
+# `deploy.env` so users with an existing legacy config keep working.
+ENV_FILE="${SCRIPT_DIR}/.env"
+[[ ! -f "${ENV_FILE}" && -f "${SCRIPT_DIR}/deploy.env" ]] && ENV_FILE="${SCRIPT_DIR}/deploy.env"
 
 RED='\033[0;31m'
 GREEN='\033[0;32m'
@@ -276,7 +282,7 @@ PY
 load_config() {
     if [[ ! -f "$ENV_FILE" ]]; then
         log_error "配置文件不存在: $ENV_FILE"
-        log_error "请先复制并编辑 deploy.env 文件"
+        log_error "请先复制并编辑 .env 文件"
         exit 1
     fi
 
@@ -301,13 +307,21 @@ load_config() {
     OG_IMAGE_REPO="${OG_IMAGE_REPO:-swr.cn-north-4.myhuaweicloud.com/kunpeng-ai/opengauss-distributed}"
     OG_IMAGE_TAG="${OG_IMAGE_TAG:-0328}"
     OG_IMAGE="${OG_IMAGE_REPO}:${OG_IMAGE_TAG}"
-    OG_CONTAINER_NAME="${OG_CONTAINER_NAME:-opengauss}"
-    OG_NODE_NAME="${OG_NODE_NAME:-gaussdb}"
-    OG_USERNAME="${OG_USERNAME:-gaussdb}"
-    OG_DB_NAME="${OG_DB_NAME:-postgres}"
-    OG_PORT="${OG_PORT:-5432}"
+    # VECTOR_DB_* are the canonical .env names; OG_* kept as legacy aliases
+    # so an old deploy.env keeps working.
+    OG_CONTAINER_NAME="${VECTOR_DB_CONTAINER_NAME:-${OG_CONTAINER_NAME:-opengauss}}"
+    OG_NODE_NAME="${VECTOR_DB_NODE_NAME:-${OG_NODE_NAME:-gaussdb}}"
+    OG_USERNAME="${VECTOR_DB_USER:-${OG_USERNAME:-gaussdb}}"
+    OG_DB_NAME="${VECTOR_DB_NAME:-${OG_DB_NAME:-postgres}}"
+    OG_PORT="${VECTOR_DB_PORT:-${OG_PORT:-5432}}"
+    OG_HOST_PORT="${VECTOR_DB_HOST_PORT:-${OG_HOST_PORT:-5432}}"
+    OG_PASSWORD="${VECTOR_DB_PASSWORD:-${OG_PASSWORD:-}}"
     OG_CPUSET_CPUS="${OG_CPUSET_CPUS:-}"
     OG_WAIT_TIMEOUT="${OG_WAIT_TIMEOUT:-120}"
+    # VECTOR_DB_HOST is the vector DB's reachable address (deploy.sh uses
+    # host networking, so this is a host IP / 127.0.0.1; compose sets it to
+    # the service name). Legacy alias OPENGAUSS_HOST_IP / OPENGAUSS_HOST.
+    VECTOR_DB_HOST="${VECTOR_DB_HOST:-${OPENGAUSS_HOST:-${OPENGAUSS_HOST_IP:-127.0.0.1}}}"
 
     POSTGRES_IMAGE="${POSTGRES_IMAGE:-pgvector/pgvector:pg16}"
     POSTGRES_CONTAINER_NAME="${POSTGRES_CONTAINER_NAME:-postgres_ogmemory}"
@@ -350,7 +364,7 @@ load_config() {
 
 validate_required_config() {
     local required_vars=(
-        OPENGAUSS_HOST_IP
+        VECTOR_DB_HOST
         OPENCLAW_HOST_IP
         OG_HOST_PORT
         LLM_PROVIDER
@@ -361,7 +375,7 @@ validate_required_config() {
     local var
     for var in "${required_vars[@]}"; do
         if [[ -z "${!var:-}" || "${!var}" == your_* ]]; then
-            log_error "必填配置项 $var 未设置或仍为模板值，请在 deploy.env 中修改"
+            log_error "必填配置项 $var 未设置或仍为模板值，请在 .env 中修改"
             exit 1
         fi
     done
@@ -401,13 +415,13 @@ validate_required_config() {
         role_control_enabled="$(python3 -c "import yaml; d=yaml.safe_load(open('${SCRIPT_DIR}/ogmemory.yaml')); print(str(bool(d.get('auth',{}).get('role_control_enabled', False))).lower())" 2>/dev/null || true)"
         if [[ "${role_control_enabled}" == "true" ]]; then
             if [[ -z "${OG_AUTH_API_KEY:-${OG_ROOT_API_KEY:-}}" ]]; then
-                log_error "检测到 ogmemory.yaml 已启用多租认证(auth.role_control_enabled=true)，但 deploy.env 中未设置 OG_AUTH_API_KEY 或 OG_ROOT_API_KEY"
-                log_error "请在 deploy.env 中显式配置 OpenClaw 访问 oGMemory 使用的认证 Key"
+                log_error "检测到 ogmemory.yaml 已启用多租认证(auth.role_control_enabled=true)，但 .env 中未设置 OG_AUTH_API_KEY 或 OG_ROOT_API_KEY"
+                log_error "请在 .env 中显式配置 OpenClaw 访问 oGMemory 使用的认证 Key"
                 exit 1
             fi
             if [[ -z "${OG_AUTH_ACCOUNT_ID:-${OG_ACCOUNT_ID:-}}" ]]; then
-                log_error "检测到 ogmemory.yaml 已启用多租认证(auth.role_control_enabled=true)，但 deploy.env 中未设置 OG_AUTH_ACCOUNT_ID 或 OG_ACCOUNT_ID"
-                log_error "请在 deploy.env 中显式配置 OpenClaw 默认访问的 account_id"
+                log_error "检测到 ogmemory.yaml 已启用多租认证(auth.role_control_enabled=true)，但 .env 中未设置 OG_AUTH_ACCOUNT_ID 或 OG_ACCOUNT_ID"
+                log_error "请在 .env 中显式配置 OpenClaw 默认访问的 account_id"
                 exit 1
             fi
         fi
@@ -615,13 +629,30 @@ deploy_ogmem() {
     fi
 
     if [[ "${ENABLE_OPENGAUSS}" == "true" ]]; then
-        docker_run_args+=(-e "OPENGAUSS_HOST=${OPENGAUSS_HOST_IP}")
-        docker_run_args+=(-e "OPENGAUSS_PORT=${OG_HOST_PORT}")
-        docker_run_args+=(-e "OPENGAUSS_DBNAME=${OG_DB_NAME}")
-        docker_run_args+=(-e "OPENGAUSS_USER=${OG_USERNAME}")
-        docker_run_args+=(-e "OPENGAUSS_PASSWORD=${OG_PASSWORD}")
-        log_info "openGauss 连接信息已通过环境变量传入: ${OPENGAUSS_HOST_IP}:${OG_HOST_PORT}/${OG_DB_NAME}"
+        # VECTOR_DB_* are the canonical client-connection env vars consumed
+        # by the container entrypoint. VECTOR_DB_HOST defaults to the host
+        # address the container can reach the vector DB on. VECTOR_DB_HOST_PORT
+        # is the host port (the one the container dials via loopback), not
+        # VECTOR_DB_PORT — that name is reserved for the openGauss
+        # container-internal listen port and is not passed to ogmem.
+        docker_run_args+=(-e "VECTOR_DB_HOST=${VECTOR_DB_HOST}")
+        docker_run_args+=(-e "VECTOR_DB_HOST_PORT=${OG_HOST_PORT}")
+        docker_run_args+=(-e "VECTOR_DB_NAME=${OG_DB_NAME}")
+        docker_run_args+=(-e "VECTOR_DB_USER=${OG_USERNAME}")
+        docker_run_args+=(-e "VECTOR_DB_PASSWORD=${OG_PASSWORD}")
+        log_info "openGauss 连接信息已通过环境变量传入: ${VECTOR_DB_HOST}:${OG_HOST_PORT}/${OG_DB_NAME}"
     fi
+
+    # Storage DB env vars (mirrors the VECTOR_DB_* block above). Required
+    # for ogmem to build storage.connection_string. STORAGE_DB_HOST defaults
+    # to 127.0.0.1 since deploy.sh runs ogmem on the host network namespace;
+    # STORAGE_DB_HOST_PORT is the host port that compose / deploy.sh has
+    # forwarded to the postgres container's internal 5432.
+    docker_run_args+=(-e "STORAGE_DB_HOST=${STORAGE_DB_HOST:-127.0.0.1}")
+    docker_run_args+=(-e "STORAGE_DB_HOST_PORT=${STORAGE_DB_HOST_PORT:-5432}")
+    docker_run_args+=(-e "STORAGE_DB_NAME=${STORAGE_DB_NAME:-ogmem}")
+    docker_run_args+=(-e "STORAGE_DB_USER=${STORAGE_DB_USER:-ogmem}")
+    docker_run_args+=(-e "STORAGE_DB_PASSWORD=${STORAGE_DB_PASSWORD:-}")
 
     local env_vars_for_yaml=(
         "LLM_PROVIDER"
@@ -639,11 +670,45 @@ deploy_ogmem() {
         "OGMEM_MCP_MAX_SSE_CONNECTIONS"
         "OGMEM_MCP_ENABLE_WRITE_TOOLS"
         "OGMEM_MCP_ENABLE_DELETE_TOOLS"
+        "OGMEM_MCP_ENABLE_CODE_EDIT_TOOLS"
         "OGMEM_MCP_ALLOWED_HOSTS"
         "OGMEM_MCP_ALLOWED_ORIGINS"
         "OGMEM_MCP_MAX_REQUEST_BYTES"
         "OGMEM_MCP_MAX_RESPONSE_CHARS"
         "OGMEM_MCP_COLLECTION_LIMIT"
+        "OGMEM_CODE_RESOURCES_ENABLED"
+        "OGMEM_CODE_WORKSPACE_ALLOWED_ROOTS"
+        "OGMEM_CODE_RETRIEVAL_ENABLED"
+        "OGMEM_CODE_RETRIEVAL_MODE"
+        "OGMEM_CODE_RETRIEVAL_SEMANTIC_ENABLED"
+        "OGMEM_CODE_RETRIEVAL_BM25_ENABLED"
+        "OGMEM_CODE_RETRIEVAL_SYMBOLIC_ENABLED"
+        "OGMEM_CODE_RETRIEVAL_GRAPH_ENABLED"
+        "OGMEM_CODE_RETRIEVAL_CANDIDATE_DISCOVERY_POOL_LIMIT"
+        "OGMEM_CODE_RETRIEVAL_CANDIDATE_FILE_LIMIT"
+        "OGMEM_CODE_RETRIEVAL_CANDIDATE_SNIPPET_LIMIT"
+        "OGMEM_CODE_RETRIEVAL_CANDIDATE_SEMANTIC_LIMIT"
+        "OGMEM_CODE_RETRIEVAL_CANDIDATE_EMBEDDING_CHARS"
+        "OGMEM_CODE_RETRIEVAL_CANDIDATE_EMBEDDING_BATCH_TEXTS"
+        "OGMEM_CODE_RETRIEVAL_CANDIDATE_EMBEDDING_BATCH_TOKENS"
+        "OGMEM_CODE_RETRIEVAL_CANDIDATE_READ_BYTES"
+        "OGMEM_CODE_RETRIEVAL_CANDIDATE_DISCOVERY_DEADLINE_MS"
+        "OGMEM_CODE_RETRIEVAL_CANDIDATE_EMBEDDING_DEADLINE_MS"
+        "OGMEM_CODE_RETRIEVAL_CANDIDATE_REQUEST_DEADLINE_MS"
+        "OGMEM_TOOL_OUTPUT_FILTER_ENABLED"
+        "OGMEM_TOOL_OUTPUT_FILTER_READ_ENABLED"
+        "OGMEM_TOOL_OUTPUT_FILTER_BASH_ENABLED"
+        "OGMEM_TOOL_OUTPUT_FILTER_ADAPTIVE_ENABLED"
+        "OGMEM_TOOL_OUTPUT_FILTER_READ_MIN_CHARS"
+        "OGMEM_TOOL_OUTPUT_FILTER_READ_MAX_LINES"
+        "OGMEM_TOOL_OUTPUT_FILTER_BASH_MIN_CHARS"
+        "OGMEM_TOOL_OUTPUT_FILTER_BASH_MIN_LINES"
+        "OGMEM_TOOL_OUTPUT_FILTER_TEST_MAX_LINES"
+        "OGMEM_TOOL_OUTPUT_FILTER_DIFF_MAX_LINES"
+        "OGMEM_TOOL_OUTPUT_FILTER_ERROR_MAX_LINES"
+        "OGMEM_TOOL_OUTPUT_FILTER_GENERIC_MAX_LINES"
+        "OGMEM_TOOL_OUTPUT_FILTER_OUTPUT_MAX_CHARS"
+        "OGMEM_TOOL_OUTPUT_FILTER_RECOVERY_MAX_CHARS"
         "OG_ACCOUNT_ID"
         "OG_USER_ID"
         "OG_AGENT_ID"
@@ -657,6 +722,7 @@ deploy_ogmem() {
         "OG_HTTP_TRUSTED_PROXIES"
         "INDEX_INTERVAL"
         "INDEX_WORKERS"
+        "STORAGE_DB_CONNECTION_STRING"
     )
     for var in "${env_vars_for_yaml[@]}"; do
         if [[ -n "${!var:-}" ]]; then
@@ -664,7 +730,7 @@ deploy_ogmem() {
         fi
     done
 
-    # Pass perf monitoring vars through when set in deploy.env
+    # Pass perf monitoring vars through when set in .env
     local perf_vars=("OGMEM_PERF_ENABLED" "OGMEM_PERF_OUT" "OGMEM_PERF_HTTP_URL" "OGMEM_PERF_RUN_ID")
     for var in "${perf_vars[@]}"; do
         if [[ -n "${!var:-}" ]]; then
@@ -758,7 +824,7 @@ print_container_table() {
 }
 
 cleanup_current_env() {
-    log_step "Cleanup containers for current deploy.env"
+    log_step "Cleanup containers for current .env"
 
     local name found_any=false
     while IFS= read -r name; do
@@ -768,19 +834,19 @@ cleanup_current_env() {
             log_info "Removing container: ${name}"
             docker rm -f "${name}"
         else
-            log_info "Skip missing container from current deploy.env: ${name}"
+            log_info "Skip missing container from current .env: ${name}"
         fi
     done < <(get_target_container_names)
 
     if [[ "${found_any}" != "true" ]]; then
-        log_warn "No containers defined by current deploy.env were found"
+        log_warn "No containers defined by current .env were found"
     fi
 
     log_info "Cleanup finished"
 }
 
 show_status_current_env() {
-    log_step "Status for current deploy.env"
+    log_step "Status for current .env"
 
     local name found_any=false
     while IFS= read -r name; do
@@ -799,7 +865,7 @@ show_status_current_env() {
     done < <(get_target_container_names)
 
     if [[ "${found_any}" != "true" ]]; then
-        log_warn "No containers defined by current deploy.env were found"
+        log_warn "No containers defined by current .env were found"
         return
     fi
 
@@ -889,13 +955,13 @@ cleanup() {
             log_info "Removing container: ${name}"
             docker rm -f "${name}"
         else
-            log_info "Skip missing container from current deploy.env: ${name}"
+            log_info "Skip missing container from current .env: ${name}"
         fi
     done < <(get_target_container_names)
 
     log_info "清理完成"
     if [[ "${found_any}" != "true" ]]; then
-        log_warn "No containers defined by current deploy.env were found"
+        log_warn "No containers defined by current .env were found"
     fi
 
     log_info "Cleanup finished"

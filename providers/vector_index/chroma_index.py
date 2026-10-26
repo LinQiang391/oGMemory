@@ -17,6 +17,7 @@ from typing import Any
 from core.interfaces import VectorIndex
 from core.memory_names import memory_directory
 from core.models import IndexRecord, SeedHit
+from core.resource_identity import CODE_INDEX_METADATA_FIELDS
 
 logger = logging.getLogger(__name__)
 
@@ -214,6 +215,7 @@ class ChromaVectorIndex(VectorIndex):
         uris: list[str],
         filters: dict[str, Any],
         level: int = 0,
+        *, expected_texts: dict[str, str] | None = None,
     ) -> dict[str, list[float]]:
         if not uris:
             return {}
@@ -221,7 +223,7 @@ class ChromaVectorIndex(VectorIndex):
         with self._locked():
             result = self._collection.get(
                 where=where if where else None,
-                include=["embeddings", "metadatas"],
+                include=["embeddings", "metadatas"] + (["documents"] if expected_texts is not None else []),
             )
         output: dict[str, list[float]] = {}
         embeddings = result.get("embeddings")
@@ -231,8 +233,12 @@ class ChromaVectorIndex(VectorIndex):
         if metadatas is None:
             metadatas = []
         wanted = set(uris)
-        for embedding, metadata in zip(embeddings, metadatas):
+        documents = result.get("documents")
+        for position, (embedding, metadata) in enumerate(zip(embeddings, metadatas)):
             uri = str((metadata or {}).get("uri", ""))
+            if expected_texts is not None and (documents is None or position >= len(documents)
+                                               or documents[position] != expected_texts.get(uri)):
+                continue
             if uri in wanted:
                 output[uri] = [float(value) for value in embedding]
         return output
@@ -303,6 +309,7 @@ class ChromaVectorIndex(VectorIndex):
             "unit_key",
             "agent_memory_unit_key",
             "unit_revision",
+            *CODE_INDEX_METADATA_FIELDS,
         ):
             val = record.metadata.get(key) if record.metadata else None
             if val is not None:
@@ -315,8 +322,6 @@ class ChromaVectorIndex(VectorIndex):
                 sanitized[k] = v
             elif isinstance(v, (int, float, str)):
                 sanitized[k] = v
-            elif v is not None:
-                sanitized[k] = str(v)
         return sanitized
 
     @staticmethod
@@ -328,7 +333,7 @@ class ChromaVectorIndex(VectorIndex):
                     conditions.append({"level": {"$in": expected}})
                 else:
                     conditions.append({"level": expected})
-            elif key in ("account_id", "owner_space", "uri"):
+            elif key in ("account_id", "owner_space", "resource_type", "uri"):
                 if isinstance(expected, list):
                     conditions.append({key: {"$in": expected}})
                 else:
@@ -372,3 +377,46 @@ class ChromaVectorIndex(VectorIndex):
                 return self._collection.count()
             result = self._collection.get(where=self._build_where(filters), include=[])
             return len(result.get("ids") or [])
+
+    def get_record(self, record_id: str) -> IndexRecord | None:
+        """Fetch one :class:`IndexRecord` by id.
+
+        Returns ``None`` when no row matches. Mirrors the
+        :class:`OpenGaussVectorIndex` implementation: ``text`` comes
+        back as the full stored document, and ``metadata`` carries
+        the per-record scope columns (``extracted_node_id``,
+        ``video_id``, ``clip_id``, ``before_clip``).
+
+        Chroma's ``collection.get`` returns documents by id in one
+        round-trip; we then rehydrate the ``IndexRecord`` shape so
+        callers don't need to know which backend they're on.
+        """
+        if not record_id:
+            return None
+        result = self._collection.get(
+            ids=[record_id], include=["documents", "metadatas", "embeddings"]
+        )
+        ids = (result or {}).get("ids") or []
+        if not ids:
+            return None
+        meta = ((result.get("metadatas") or [{}])[0]) or {}
+        doc = ((result.get("documents") or [""])[0]) or ""
+        emb = ((result.get("embeddings") or [[]])[0]) or []
+        # Mirror the OpenGauss path: surface a stable ``filters``
+        # shape with account_id / owner_space so callers can re-derive
+        # the scope without inspecting raw metadata.
+        filters = {
+            "account_id": meta.get("account_id", ""),
+            "owner_space": meta.get("owner_space", ""),
+        }
+        metadata = dict(meta)
+        if emb and "_embedding" not in metadata:
+            metadata["_embedding"] = [float(x) for x in emb]
+        return IndexRecord(
+            id=str(ids[0]),
+            uri=str(meta.get("uri", "")),
+            level=int(meta.get("level", 2)),
+            text=doc,
+            filters=filters,
+            metadata=metadata,
+        )

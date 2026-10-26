@@ -9,14 +9,17 @@ from unittest.mock import MagicMock, patch
 
 import pytest
 
+import fs.sql_adapter.sql_context_fs as sql_context_fs
+from core.enums import ContextType, EventType
 from core.errors import (
     AccessDeniedError,
     ConcurrentModificationError,
     NodeBrokenError,
     NodeNotFoundError,
 )
-from core.models import ContextNode, RelationEdge, RequestContext
-from fs.sql_adapter.sql_context_fs import parse_uri
+from core.models import ContextNode, OutboxEvent, RelationEdge, RequestContext
+from core.resource_identity import RootBindingError, compute_workspace_root_id
+from fs.sql_adapter.sql_context_fs import _resource_mutation_lock_key, parse_uri
 
 # ---------------------------------------------------------------------------
 # Fixtures
@@ -45,6 +48,34 @@ def _profile_node(content="Profile content", abstract="Short abstract"):
         content=content,
         metadata={"tags": ["test"]},
     )
+
+
+def _code_resource_node(slug="chunk-a"):
+    return ContextNode(
+        uri=f"ctx://acme/resources/{slug}",
+        context_type="RESOURCE",
+        category="code",
+        level=0,
+        owner_space="resource:acme",
+        abstract="parse config",
+        overview="parse_config(path)",
+        content="def parse_config(path):\n    return path\n",
+        metadata={"resource_type": "code"},
+    )
+
+
+def _write_event(node: ContextNode) -> OutboxEvent:
+    return OutboxEvent(
+        event_id="write-event",
+        event_type=EventType.UPSERT_CONTEXT.value,
+        uri=node.uri,
+        payload={"records": []},
+        status="PENDING",
+    )
+
+
+def _sql_calls(cursor) -> list[str]:
+    return [" ".join(call.args[0].split()) for call in cursor.execute.call_args_list]
 
 
 def _pref_node(slug="coffee"):
@@ -86,6 +117,55 @@ def test_parse_legacy_generated_skill_uri():
     }
 
 
+@pytest.mark.parametrize(
+    "slug",
+    [".", "..", "%2F", "%5c", "%2E%2e", "foo%252fbar", "foo+bar"],
+)
+def test_parse_resource_uri_rejects_unsafe_slug(slug):
+    with pytest.raises(ValueError):
+        parse_uri(f"ctx://acme/resources/{slug}")
+
+
+@pytest.mark.parametrize("slug", ["a" * 32, "dataset", "repo-name_01", "repo.v1"])
+def test_parse_resource_uri_preserves_safe_slug(slug):
+    assert parse_uri(f"ctx://acme/resources/{slug}")["slug"] == slug
+
+
+def test_unsafe_resource_uri_is_rejected_before_database_access(mock_sql_fs):
+    fs, conn, cursor = mock_sql_fs
+    node = _code_resource_node(slug="foo%2F..%2F_sensitive")
+
+    with pytest.raises(AccessDeniedError, match="Invalid URI format"):
+        fs.write_node(node, _ctx())
+
+    assert fs.exists(node.uri, _ctx()) is False
+    cursor.execute.assert_not_called()
+    conn.commit.assert_not_called()
+    conn.rollback.assert_not_called()
+
+
+def test_tool_output_mutation_lock_uses_a_shared_session_advisory_lock(mock_sql_fs):
+    fs, conn, cursor = mock_sql_fs
+    uri = "ctx://acme/agents/main/memories/tool_outputs"
+
+    with patch.object(
+        sql_context_fs.time,
+        "monotonic",
+        side_effect=[0.0, 0.0, 0.0, 0.0],
+    ):
+        with fs.tool_output_mutation_lock(uri, _ctx()):
+            pass
+
+    sql = _sql_calls(cursor)
+    assert any("pg_try_advisory_lock" in statement for statement in sql)
+    assert any("pg_advisory_unlock" in statement for statement in sql)
+    assert not any(statement == "SELECT pg_advisory_lock(%s)" for statement in sql)
+    sql_context_fs.psycopg2.connect.assert_called_once_with(
+        fs._connection_string,
+        connect_timeout=sql_context_fs._TOOL_OUTPUT_LOCK_CONNECT_TIMEOUT_SECONDS,
+    )
+    conn.close.assert_called_once()
+
 
 def test_memory_identity_lock_holds_a_session_advisory_lock(mock_sql_fs):
     fs, conn, cursor = mock_sql_fs
@@ -96,6 +176,62 @@ def test_memory_identity_lock_holds_a_session_advisory_lock(mock_sql_fs):
 
     assert any("pg_advisory_unlock" in sql for sql in _sql_calls(cursor))
     conn.close.assert_called_once()
+
+
+def test_tool_output_mutation_lock_times_out_without_unlocking_unowned_lock(
+    mock_sql_fs,
+):
+    fs, conn, cursor = mock_sql_fs
+    uri = "ctx://acme/agents/main/memories/tool_outputs"
+    cursor.fetchone.return_value = (False,)
+    slots = MagicMock()
+    slots.acquire.return_value = True
+
+    with (
+        patch.object(sql_context_fs, "_TOOL_OUTPUT_LOCK_CONNECTION_SLOTS", slots),
+        patch.object(
+            sql_context_fs.time,
+            "monotonic",
+            side_effect=[0.0, 0.0, 0.0, 0.0, 6.0],
+        ),
+        patch.object(sql_context_fs.time, "sleep"),
+    ):
+        with pytest.raises(
+            TimeoutError,
+            match="SQL tool-output mutation lock",
+        ):
+            with fs.tool_output_mutation_lock(uri, _ctx()):
+                raise AssertionError("lock body must not run")
+
+    assert cursor.execute.call_count == 2  # tenant binding + try-lock
+    assert _sql_calls(cursor)[-1] == "SELECT pg_try_advisory_lock(%s)"
+    assert not any("pg_advisory_unlock" in statement for statement in _sql_calls(cursor))
+    conn.close.assert_called_once()
+    slots.release.assert_called_once()
+    sql_context_fs.psycopg2.connect.assert_called_once_with(
+        fs._connection_string,
+        connect_timeout=sql_context_fs._TOOL_OUTPUT_LOCK_CONNECT_TIMEOUT_SECONDS,
+    )
+
+
+def test_tool_output_mutation_lock_bounds_extra_connection_slots(mock_sql_fs):
+    fs, conn, cursor = mock_sql_fs
+    uri = "ctx://acme/agents/main/memories/tool_outputs"
+    slots = MagicMock()
+    slots.acquire.return_value = False
+
+    with patch.object(sql_context_fs, "_TOOL_OUTPUT_LOCK_CONNECTION_SLOTS", slots):
+        with pytest.raises(
+            TimeoutError,
+            match="SQL tool-output lock connection",
+        ):
+            with fs.tool_output_mutation_lock(uri, _ctx()):
+                raise AssertionError("lock body must not run")
+
+    slots.acquire.assert_called_once()
+    slots.release.assert_not_called()
+    sql_context_fs.psycopg2.connect.assert_not_called()
+    cursor.execute.assert_not_called()
 
 
 @pytest.fixture
@@ -111,6 +247,7 @@ def mock_sql_fs():
         patch("fs.sql_adapter.sql_context_fs.Json", mock_json),
     ):
         mock_conn = MagicMock()
+        mock_conn.closed = 0
         mock_cursor = MagicMock()
         mock_conn.cursor.return_value.__enter__ = lambda s: mock_cursor
         mock_conn.cursor.return_value.__exit__ = MagicMock(return_value=False)
@@ -153,6 +290,9 @@ class TestSQLContextFSWriteNode:
         conn.commit.assert_called_once()
         # Verify INSERT was executed (cursor.execute called)
         assert cursor.execute.called
+        sql_calls = _sql_calls(cursor)
+        assert not any("pg_advisory_xact_lock" in sql for sql in sql_calls)
+        assert not any(sql.startswith("SELECT 1 FROM outbox_events") for sql in sql_calls)
 
     def test_write_access_denied(self, mock_sql_fs):
         fs, conn, cursor = mock_sql_fs
@@ -254,6 +394,171 @@ class TestSQLContextFSWriteNode:
         insert_params = cursor.execute.call_args.args[1]
         persisted_metadata = insert_params[10]
         assert "_expected_version" not in persisted_metadata
+
+
+class TestSQLContextFSCodeResourceMutationGuard:
+    def test_mutation_lock_key_is_stable_namespaced_and_signed(self):
+        uri = "ctx://acme/resources/chunk-a"
+
+        key = _resource_mutation_lock_key("acme", uri)
+
+        assert key == -6666838223963259778
+        assert key == _resource_mutation_lock_key("acme", uri)
+        assert key == _resource_mutation_lock_key(" acme ", uri + "/")
+        assert key != _resource_mutation_lock_key("other", uri)
+        assert key != _resource_mutation_lock_key("acme", uri + "-other")
+        assert -(2**63) <= key < 2**63
+
+    def test_plain_code_write_requires_atomic_outbox_before_mutation(self, mock_sql_fs):
+        fs, conn, cursor = mock_sql_fs
+        node = _code_resource_node()
+
+        with pytest.raises(
+            RuntimeError,
+            match="code resource writes require write_node_with_outbox",
+        ):
+            fs.write_node(node, _ctx())
+
+        cursor.execute.assert_not_called()
+        conn.commit.assert_not_called()
+        conn.rollback.assert_not_called()
+
+    def test_atomic_code_write_locks_and_checks_delete_before_mutation(self, mock_sql_fs):
+        fs, conn, cursor = mock_sql_fs
+        node = _code_resource_node()
+        cursor.fetchone.return_value = None
+
+        fs.write_node_with_outbox(node, _ctx(), _write_event(node))
+
+        sql_calls = _sql_calls(cursor)
+        lock_index = next(i for i, sql in enumerate(sql_calls) if "pg_advisory_xact_lock" in sql)
+        marker_index = next(
+            i for i, sql in enumerate(sql_calls) if sql.startswith("SELECT 1 FROM outbox_events")
+        )
+        node_write_index = next(
+            i for i, sql in enumerate(sql_calls) if sql.startswith("INSERT INTO context_nodes")
+        )
+        event_write_index = next(
+            i for i, sql in enumerate(sql_calls) if sql.startswith("INSERT INTO outbox_events")
+        )
+        assert lock_index < marker_index < node_write_index < event_write_index
+        conn.commit.assert_called_once()
+
+    def test_atomic_code_update_increments_column_and_metadata_version(self, mock_sql_fs):
+        fs, conn, cursor = mock_sql_fs
+        node = _code_resource_node()
+        node.metadata["_expected_version"] = 2
+        cursor.fetchone.return_value = None
+        cursor.rowcount = 1
+
+        fs.write_node_with_outbox(node, _ctx(), _write_event(node))
+
+        update_call = next(
+            call
+            for call in cursor.execute.call_args_list
+            if "UPDATE context_nodes SET" in call.args[0]
+        )
+        update_sql = " ".join(update_call.args[0].split())
+        update_params = update_call.args[1]
+        assert "version = version + 1" in update_sql
+        assert update_params[4]["version"] == 3
+        assert update_params[-1] == 2
+        conn.commit.assert_called_once()
+
+    def test_atomic_code_write_rejects_pending_durable_delete(self, mock_sql_fs):
+        fs, conn, cursor = mock_sql_fs
+        node = _code_resource_node()
+        cursor.fetchone.return_value = (1,)
+
+        with pytest.raises(RuntimeError, match="pending durable deletion"):
+            fs.write_node_with_outbox(node, _ctx(), _write_event(node))
+
+        sql_calls = _sql_calls(cursor)
+        assert not any(sql.startswith("INSERT INTO context_nodes") for sql in sql_calls)
+        assert not any(sql.startswith("INSERT INTO outbox_events") for sql in sql_calls)
+        marker_sql = next(sql for sql in sql_calls if sql.startswith("SELECT 1 FROM outbox_events"))
+        assert "'PENDING', 'PROCESSING', 'FAILED'" in marker_sql
+        conn.rollback.assert_called_once()
+        conn.commit.assert_not_called()
+
+
+class TestSQLContextFSWorkspaceRootBinding:
+    def test_reserve_uses_the_protected_workspace_sync_row(self, mock_sql_fs):
+        fs, conn, cursor = mock_sql_fs
+        fingerprint = "a" * 64
+        cursor.fetchone.return_value = ({},)
+
+        binding = fs.reserve_code_workspace_root_binding(
+            ctx=_ctx(),
+            root_slug="repo",
+            root_fingerprint=fingerprint,
+        )
+
+        root_id = compute_workspace_root_id("acme", fingerprint)
+        assert binding == (root_id, "repo", fingerprint)
+        sql_calls = _sql_calls(cursor)
+        assert any(sql.startswith("INSERT INTO code_workspace_sync_roots") for sql in sql_calls)
+        assert any(
+            sql.startswith("SELECT state FROM code_workspace_sync_roots")
+            and sql.endswith("FOR UPDATE")
+            for sql in sql_calls
+        )
+        update_call = next(
+            call
+            for call in cursor.execute.call_args_list
+            if "UPDATE code_workspace_sync_roots" in call.args[0]
+        )
+        state = update_call.args[1][0]
+        assert state == {
+            "version": 1,
+            "by_fingerprint": {
+                fingerprint: {
+                    "root_id": root_id,
+                    "resource_root_slug": "repo",
+                }
+            },
+            "by_slug": {
+                "repo": {
+                    "root_id": root_id,
+                    "root_fingerprint": fingerprint,
+                }
+            },
+        }
+        conn.commit.assert_called_once()
+
+    def test_reserve_rejects_conflict_before_any_resource_write(self, mock_sql_fs):
+        fs, conn, cursor = mock_sql_fs
+        fingerprint = "a" * 64
+        root_id = compute_workspace_root_id("acme", fingerprint)
+        cursor.fetchone.return_value = (
+            {
+                "version": 1,
+                "by_fingerprint": {
+                    fingerprint: {
+                        "root_id": root_id,
+                        "resource_root_slug": "repo",
+                    }
+                },
+                "by_slug": {
+                    "repo": {
+                        "root_id": root_id,
+                        "root_fingerprint": fingerprint,
+                    }
+                },
+            },
+        )
+
+        with pytest.raises(RootBindingError, match="different root slug"):
+            fs.reserve_code_workspace_root_binding(
+                ctx=_ctx(),
+                root_slug="other",
+                root_fingerprint=fingerprint,
+            )
+
+        assert not any(sql.startswith("INSERT INTO context_nodes") for sql in _sql_calls(cursor))
+        assert not any(sql.startswith("INSERT INTO outbox_events") for sql in _sql_calls(cursor))
+        conn.rollback.assert_called_once()
+        conn.commit.assert_not_called()
 
 
 class TestSQLContextFSAccess:
@@ -434,6 +739,95 @@ class TestSQLContextFSDeleteNode:
 
         with pytest.raises(AccessDeniedError):
             fs.delete_node("ctx://acme/users/alice/memories/profile", ctx)
+
+    def test_plain_code_delete_requires_atomic_outbox_before_mutation(
+        self,
+        mock_sql_fs,
+    ):
+        fs, conn, cursor = mock_sql_fs
+        uri = "ctx://acme/resources/chunk-a"
+        cursor.fetchone.return_value = (
+            ContextType.RESOURCE.value,
+            {"resource_type": "code"},
+        )
+
+        with pytest.raises(
+            RuntimeError,
+            match="code resource deletes require delete_nodes_with_outbox",
+        ):
+            fs.delete_node(uri, _ctx())
+
+        sql_calls = _sql_calls(cursor)
+        assert any("pg_advisory_xact_lock" in sql for sql in sql_calls)
+        assert any(sql.endswith("FOR UPDATE") for sql in sql_calls)
+        assert not any(sql.startswith("DELETE FROM context_nodes") for sql in sql_calls)
+        conn.rollback.assert_called_once()
+        conn.commit.assert_not_called()
+
+
+class TestSQLContextFSDurableDelete:
+    @staticmethod
+    def _events(*uris):
+        from commit.sql_outbox_store import SQLOutboxStore
+
+        return [SQLOutboxStore.build_delete_event(uri) for uri in uris]
+
+    def test_delete_nodes_locks_cancels_and_enqueues_in_one_transaction(
+        self,
+        mock_sql_fs,
+    ):
+        fs, conn, cursor = mock_sql_fs
+        uris = [
+            "ctx://acme/resources/chunk-a",
+            "ctx://acme/resources/chunk-b",
+        ]
+        cursor.rowcount = 2
+
+        deleted = fs.delete_nodes_with_outbox(uris, _ctx(), self._events(*uris))
+
+        assert deleted == 2
+        sql_calls = _sql_calls(cursor)
+        advisory_indexes = [i for i, sql in enumerate(sql_calls) if "pg_advisory_xact_lock" in sql]
+        row_lock_index = next(i for i, sql in enumerate(sql_calls) if "FOR UPDATE" in sql)
+        delete_index = next(
+            i for i, sql in enumerate(sql_calls) if sql.startswith("DELETE FROM context_nodes")
+        )
+        cancel_index = next(
+            i for i, sql in enumerate(sql_calls) if sql.startswith("DELETE FROM outbox_events")
+        )
+        insert_indexes = [
+            i for i, sql in enumerate(sql_calls) if sql.startswith("INSERT INTO outbox_events")
+        ]
+        assert [cursor.execute.call_args_list[index].args[1] for index in advisory_indexes] == [
+            (_resource_mutation_lock_key("acme", uri),) for uri in sorted(uris)
+        ]
+        assert max(advisory_indexes) < row_lock_index < delete_index < cancel_index
+        assert cancel_index < min(insert_indexes)
+        assert len(insert_indexes) == 2
+        assert sum("SELECT pg_notify" in sql for sql in sql_calls) == 2
+        conn.commit.assert_called_once()
+        conn.rollback.assert_not_called()
+
+    def test_delete_nodes_rolls_back_every_step_when_event_insert_fails(
+        self,
+        mock_sql_fs,
+    ):
+        fs, conn, cursor = mock_sql_fs
+        uri = "ctx://acme/resources/chunk-a"
+        cursor.rowcount = 1
+
+        def execute(sql, params=None):
+            if "INSERT INTO outbox_events" in sql:
+                raise RuntimeError("outbox insert failed")
+            return None
+
+        cursor.execute.side_effect = execute
+
+        with pytest.raises(RuntimeError, match="outbox insert failed"):
+            fs.delete_nodes_with_outbox([uri], _ctx(), self._events(uri))
+
+        conn.rollback.assert_called_once()
+        conn.commit.assert_not_called()
 
 
 class TestSQLContextFSListChildren:
@@ -677,7 +1071,3 @@ class TestSQLContextFSMoveNode:
         assert len(select_for_upsert) == 1, (
             "Expected SELECT with `uri = %s OR uri LIKE %s` for re-index"
         )
-
-
-def _sql_calls(cursor):
-    return [call.args[0] for call in cursor.execute.call_args_list]
