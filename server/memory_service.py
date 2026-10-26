@@ -6,6 +6,7 @@ Used by both:
 """
 
 from __future__ import annotations
+from typing import Any
 
 import importlib.metadata as _metadata
 import logging
@@ -14,12 +15,13 @@ import re as _re
 import threading
 from collections.abc import Mapping
 from contextlib import ExitStack, contextmanager, nullcontext
+import hashlib
+import time
 from copy import deepcopy
 from dataclasses import replace
 from datetime import UTC
 from datetime import datetime as _dt
 from functools import wraps
-from typing import Any
 from uuid import uuid4
 
 from commit.write_receipts import WriteOutcomeUnknownError
@@ -43,7 +45,6 @@ from core.models import (
     TokenBudget,
 )
 from core.operation_deadline import check_deadline, operation_deadline
-from core.resource_identity import ResourceIdentityError, normalize_posix_relative_path
 
 # Chunking support
 from extraction.chunking import ConversationChunker
@@ -52,16 +53,6 @@ from providers.config import ProviderConfig
 from providers.llm import get_openai_llm
 from providers.token_tracker import request_usage_scope
 from providers.unified_config import OgMemConfig, get_config
-from retrieval.bm25_index import Bm25Index
-from retrieval.code_intent_filter import classify_code_retrieval_intent
-from retrieval.code_retrieval import (
-    ActiveCodeSearchOutcome,
-    ActiveCodeSearchRequest,
-    CodeRetrievalService,
-    CodeSearchBudget,
-    CodeSearchScope,
-    format_code_evidence_entries,
-)
 from retrieval.context_reader import ContextReader
 from retrieval.evidence_selector import canonical_uri, hydrate_evidence, select_evidence
 from retrieval.hierarchical_searcher import HierarchicalSearcher
@@ -72,25 +63,10 @@ from retrieval.result_ranker import ResultRanker
 from retrieval.seed_retriever import SeedRetriever
 from server.api_keys import APIKeyManager
 from server.audit import AuditService
-from server.auth import (
-    AuthenticationError,
-    AuthorizationError,
-    AuthService,
-    ControlPlaneDisabledError,
-    ResolvedIdentity,
-)
+from server.auth import AuthorizationError, AuthService, ResolvedIdentity
 from server.control_plane_store import ControlPlaneStore
 from server.internal_tool_usage import InternalToolUsageStore, InternalToolUsageTracker
-from server.mcp_security import CODE_EVIDENCE_UNTRUSTED_NOTICE
 from server.tenant_admin import TenantAdminService
-from service.code_file_edit import CodeFileEditService
-from service.code_resource_lifecycle import CodeResourceLifecycleService
-from service.code_workspace_sync import (
-    CodeWorkspaceRegistryResolver,
-    CodeWorkspaceSyncService,
-    ResolvedCodeWorkspace,
-    WorkspaceResolutionError,
-)
 from service.extraction_checkpoint import (
     EXTENSION_KEY,
     ExtractionBatchJournal,
@@ -105,7 +81,6 @@ from service.extraction_retry import (
     retry_failed_source,
 )
 from service.lifecycle_checkpoint import LifecycleBatchJournal, lifecycle_kind
-from service.tool_output import ToolOutputFilterService, ToolOutputRepository
 from session.models import ArchiveEntry, SessionMessage, SessionWindowState
 from session.rolling_compressor import RollingCompressor
 from session.session_manager import SessionManager, SessionOperationInProgress
@@ -175,10 +150,6 @@ def _guard_session_mutation(function):
             params = {**params, "sessionId": params["session_id"]}
         if function.__name__ in ("after_turn", "ingest") and not params.get("messages") and not params.get("message"):
             return function(self, params)
-        if function.__name__ == "compose" and _code_memory_only_requested(params):
-            return function(self, params)
-        if function.__name__ == "govern_first_view_tool_result" and self._tool_result_governance is None:
-            return function(self, params)
         if function.__name__ == "dispose" and not (params.get("sessionId") or params.get("session_id")):
             return function(self, params)
         from service.api import MemoryWriteAPI
@@ -220,45 +191,6 @@ def _guard_session_mutation(function):
 # be aligned with the session buffer.  It preserves a likely in-flight
 # user/assistant turn that has not reached after_turn yet.
 _ARCHIVE_TRIM_UNMATCHED_TAIL_MARGIN = 2
-# User-accepted replay-protection window. Sessions exceeding this many
-# completed semantic turns may replay a tombstone that has aged out.
-
-# The enabled Compose code-memory mode bypasses these generic read-side
-# operations.  Keep this projection fixed and content-free because the Claude
-# plugin uses it as a fail-closed response handshake.
-_CODE_MEMORY_ONLY_SKIPPED_GENERIC_STEPS = (
-    "topic_detection",
-    "profile",
-    "archives",
-    "ordinary_memory_working_set",
-    "session_state",
-    "pending_injection",
-    "message_trimming",
-)
-
-
-def _public_result_mapping(value: object, *, operation: str) -> dict[str, Any]:
-    """Validate the thin facade's serializable mapping result."""
-
-    if not isinstance(value, Mapping):
-        raise RuntimeError(f"{operation} returned an invalid result")
-    result: dict[str, Any] = {}
-    for key, item in value.items():
-        if not isinstance(key, str):
-            raise RuntimeError(f"{operation} returned an invalid result")
-        result[key] = item
-    return result
-
-
-def _code_memory_only_requested(params: Mapping[str, Any]) -> bool:
-    """Read the Compose opt-in without coercing untrusted JSON values."""
-
-    if "code_memory_only" not in params:
-        return False
-    value = params["code_memory_only"]
-    if not isinstance(value, bool):
-        raise ValidationError("code_memory_only", "must be a boolean")
-    return value
 
 
 # ---------------------------------------------------------------------------
@@ -339,7 +271,6 @@ def extract_content_text(content) -> str:
 
 def _message_diag(messages) -> list[dict]:
     """Return compact message fingerprints for extraction diagnostics."""
-    import hashlib
 
     diag = []
     for idx, msg in enumerate(messages):
@@ -439,25 +370,6 @@ def _find_last_message_sequence_start(messages: list, sequence: list) -> int | N
     for start in range(last_start, -1, -1):
         if haystack[start:start + len(needle)] == needle:
             return start
-    return None
-
-
-def _find_last_message_subsequence_start(messages: list, sequence: list) -> int | None:
-    """Find the start of the last ordered occurrence, allowing interleaving."""
-    if not messages or not sequence or len(sequence) > len(messages):
-        return None
-
-    haystack = [_message_role_content(msg) for msg in messages]
-    needle = [_message_role_content(msg) for msg in sequence]
-    needle_index = len(needle) - 1
-    matched_start = None
-    for index in range(len(haystack) - 1, -1, -1):
-        if haystack[index] != needle[needle_index]:
-            continue
-        matched_start = index
-        needle_index -= 1
-        if needle_index < 0:
-            return matched_start
     return None
 
 
@@ -580,8 +492,6 @@ def _extract_date_from_content(content: str):
     return None
 
 
-
-
 # ---------------------------------------------------------------------------
 # Archive helpers (stateless, testable)
 # ---------------------------------------------------------------------------
@@ -666,7 +576,7 @@ class MemoryService:
     """
 
     def __init__(
-        self, config: OgMemConfig | None = None, tool_result_store=None,
+        self, config: OgMemConfig | None = None,
         *, scene_manager=None, scene_ranker=None, scene_source=None,
     ):
         cfg = config or get_config()
@@ -682,11 +592,6 @@ class MemoryService:
         self._llm = None
         self._write_api = None
         self._read_api = None
-        self._code_resource_lifecycle_service: CodeResourceLifecycleService | None = None
-        self._code_workspace_sync_service: CodeWorkspaceSyncService | None = None
-        self._code_retrieval_service: CodeRetrievalService | None = None
-        self._code_file_edit_service: CodeFileEditService | None = None
-        self._tool_output_filter_service: ToolOutputFilterService | None = None
         self._session_mgr: SessionManager | None = None
         self._archive_store = None
         self._archive_store_failed = False
@@ -703,12 +608,6 @@ class MemoryService:
         self._lexical_backfill = None
         self._embedder = None
         self._model_usage_store = None
-        # Candidate-local retrieval owns a distinct provider client whose
-        # embedding-result cache is disabled.  It deliberately shares no
-        # vectors or corpus state with the durable read/outbox path.
-        self._candidate_code_embedder = None
-        self._bm25_index: Bm25Index | None = None
-        self._bm25_index_lock = threading.Lock()
         self._outbox_thread: threading.Thread | None = None
         self._extraction_retry = ExtractionRetryWorker(self)
         self._extraction_discovery = None
@@ -734,112 +633,9 @@ class MemoryService:
         self._scene_ranker = scene_ranker
         self._scene_source = scene_source
         self._scene_service = None
-        self._tool_result_store = None
-        self._configured_tool_result_store = tool_result_store
-        self._tool_result_externalizer = None
-        self._tool_result_turn_ledger = None
-        self._tool_result_io_runner = None
-        self._tool_result_governance = None
-        self._tool_result_source_attestation_key = os.urandom(32)
-        if getattr(self._cfg, "tool_result_externalization_enabled", False):
-            self._initialize_tool_result_externalization(tool_result_store)
         if self._cfg.skill_sedimentation_enabled:
             self._start_skill_sedimentation_worker()
 
-    def _create_tool_result_store(self, store=None):
-        """Create only the Artifact Store, without enabling message governance."""
-        if store is not None:
-            return store
-        if self._use_sql:
-            from features.tool_result_externalization.store_sql import (
-                SQLToolResultArtifactStore,
-            )
-
-            return SQLToolResultArtifactStore(pool=self._get_shared_sql_pool())
-        if _HAS_AGFS:
-            from features.tool_result_externalization.store_agfs import (
-                AGFSToolResultArtifactStore,
-            )
-
-            return AGFSToolResultArtifactStore(
-                AGFSClient(api_base_url=self._agfs_base_url),
-                mount_prefix=self._mount_prefix,
-            )
-        raise RuntimeError("no configured SQL or AGFS artifact backend")
-
-    def _get_tool_result_cleanup_store(self):
-        """Lazily open the Store for explicit Session cleanup while disabled."""
-        from features.tool_result_externalization.store_base import (
-            UnavailableToolResultArtifactStore,
-        )
-
-        with self._init_lock:
-            if (
-                self._tool_result_store is None
-                or isinstance(
-                    self._tool_result_store,
-                    UnavailableToolResultArtifactStore,
-                )
-            ):
-                self._tool_result_store = self._create_tool_result_store(
-                    self._configured_tool_result_store,
-                )
-            return self._tool_result_store
-
-    def _initialize_tool_result_externalization(self, store=None) -> None:
-        """Build the optional component graph without changing the service factory."""
-        from features.tool_result_externalization.externalizer import (
-            BoundedDaemonIORunner,
-            ToolResultExternalizer,
-        )
-        from features.tool_result_externalization.normalizer import ToolResultNormalizer
-        from features.tool_result_externalization.policy import ToolResultPolicy
-        from features.tool_result_externalization.store_base import (
-            UnavailableToolResultArtifactStore,
-        )
-        from features.tool_result_externalization.synopsis import ToolResultSynopsisBuilder
-
-        try:
-            store = self._create_tool_result_store(store)
-        except Exception as exc:
-            logger.warning("tool-result artifact store initialization failed: %s", exc)
-            store = UnavailableToolResultArtifactStore(exc)
-        self._tool_result_store = store
-        self._tool_result_io_runner = BoundedDaemonIORunner()
-        self._tool_result_externalizer = ToolResultExternalizer(
-            ToolResultNormalizer(),
-            ToolResultPolicy(self._cfg.tool_result_single_chars),
-            ToolResultSynopsisBuilder(self._cfg.tool_result_synopsis_max_chars),
-            store,
-            retry_attempts=self._cfg.tool_result_retry_attempts,
-            write_timeout_ms=self._cfg.tool_result_write_timeout_ms,
-            summary_per_artifact_chars=self._cfg.tool_result_synopsis_max_chars,
-            summary_per_turn_chars=self._cfg.tool_result_stub_summary_turn_chars,
-            source_attestation_key=self._tool_result_source_attestation_key,
-            io_runner=self._tool_result_io_runner,
-        )
-        from features.tool_result_externalization.turn_ledger import (
-            ToolResultTurnLedger,
-        )
-
-        self._tool_result_turn_ledger = ToolResultTurnLedger(
-            self._tool_result_source_attestation_key,
-        )
-        from features.tool_result_externalization.governance_service import (
-            ToolResultGovernanceService,
-        )
-
-        self._tool_result_governance = ToolResultGovernanceService(
-            config=self._cfg,
-            externalizer=self._tool_result_externalizer,
-            store_provider=lambda: self._tool_result_store,
-            turn_ledger=self._tool_result_turn_ledger,
-            io_runner=self._tool_result_io_runner,
-            source_attestation_key=self._tool_result_source_attestation_key,
-            session_manager_provider=self.get_session_manager,
-            context_builder=self.build_context,
-        )
-        self._tool_result_governance.initialize_cache_delay()
 
     @property
     def _use_sql(self) -> bool:
@@ -1625,6 +1421,7 @@ class MemoryService:
         self._generate_and_write_summary(
             messages, session_time, ctx, session_id, write_api,
         )
+
         chunker = self._get_chunker()
 
         if chunker is None:
@@ -2090,30 +1887,6 @@ class MemoryService:
                 ]
                 items = self._truncate_by_score_gap(items)
 
-            if getattr(self._cfg, "code_retrieval_enabled", False):
-                decision = classify_code_retrieval_intent(query)
-                stats["code_intent"] = {
-                    "is_code": decision.is_code,
-                    "reasons": list(decision.reasons),
-                    "blocked_by": list(decision.blocked_by),
-                }
-                if decision.is_code:
-                    try:
-                        code_items, code_stats = self._get_code_retrieval_service().search(
-                            query,
-                            ctx,
-                            top_k=8,
-                        )
-                        items.extend(code_items)
-                        stats.update(code_stats)
-                    except Exception as exc:
-                        stats["code_retrieval_error"] = type(exc).__name__
-                        logger.warning(
-                            "Code retrieval degraded account=%s error=%s",
-                            ctx.account_id,
-                            type(exc).__name__,
-                        )
-
             # Round 2: L0 session summary for sessionContext injection
             try:
                 summary_result = read_api.search_memory(
@@ -2301,59 +2074,21 @@ class MemoryService:
             "Use them to answer the user's question. If the answer is found in these memories, respond based on them.",
             "",
         ]
-        header_line_count = len(ws_lines)
-        code_items = [item for item in working_set if item.get("category") == "code"]
-        ordinary_items = [item for item in working_set if item.get("category") != "code"]
         working_set_budget = budget.get("working_set", 20000)
         max_chars = max(0, working_set_budget * 4)
-
-        if code_items:
-            locator_entries = format_code_evidence_entries(
-                code_items,
-                body_budget_chars=0,
-            )
-            reserved_chars = len("\n".join(ws_lines + locator_entries))
-            code_body_budget = max(
-                0,
-                max_chars - reserved_chars - len(code_items),
-            )
-            ws_lines.extend(
-                format_code_evidence_entries(
-                    code_items,
-                    body_budget_chars=code_body_budget,
-                )
-            )
-
-        if ordinary_items:
-            reserved_chars = len("\n".join(ws_lines)) + 1
-            ordinary_budget = max(0, max_chars - reserved_chars)
-            evidence, selection_stats = select_evidence(
-                ordinary_items, query, ordinary_budget,
-                embedder_factory=self._get_shared_embedder,
-            )
-            if delivery_stats is not None:
-                delivery_stats.update(selection_stats)
-            if evidence:
-                ws_lines.append(evidence)
-            elif not code_items:
-                return ""
+        remaining = max(0, max_chars - len("\n".join(ws_lines)) - 1)
+        evidence, selection_stats = select_evidence(
+            working_set, query, remaining,
+            embedder_factory=self._get_shared_embedder,
+        )
+        if delivery_stats is not None:
+            delivery_stats.update(selection_stats)
+        if not evidence:
+            return ""
+        ws_lines.append(evidence)
         ws_text = "\n".join(ws_lines)
         if len(ws_text) > max_chars and working_set_budget > 100:
-            if not code_items:
-                ws_text = ws_text[:max_chars]
-            else:
-                code_end = header_line_count + len(code_items)
-                protected_lines = ws_lines[:code_end]
-                protected_text = "\n".join(protected_lines)
-                remaining = max(0, max_chars - len(protected_text) - 1)
-                ordinary_text = "\n".join(ws_lines[code_end:])
-                ws_text = protected_text
-                if remaining and ordinary_text:
-                    ws_text += "\n" + ordinary_text[:remaining]
-        if delivery_stats is not None:
-            delivery_stats.setdefault("delivered_uris", []).extend(
-                canonical_uri(item.get("uri", "")) for item in code_items
-            )
+            ws_text = ws_text[:max_chars]
         return ws_text
 
     def _get_session_state(
@@ -2608,40 +2343,10 @@ class MemoryService:
             logger.info("Shared embedder ready: %s", type(self._embedder).__name__)
         return self._embedder
 
-    @_serialize_lazy_initialization("_candidate_code_embedder")
-    def _get_candidate_code_embedder(self):
-        """Return the candidate-local embedder without a cross-query result cache."""
-
-        if self._candidate_code_embedder is None:
-            candidate_config = replace(self._provider_cfg, enable_cache=False)
-            self._candidate_code_embedder = self._bind_model_usage(candidate_config.create_embedder())
-            logger.info(
-                "Candidate-local code embedder ready: %s",
-                type(self._candidate_code_embedder).__name__,
-            )
-        return self._candidate_code_embedder
-
-    @_serialize_lazy_initialization("_bm25_index")
-    def _get_shared_bm25_index(self) -> Bm25Index:
-        """Lazy-init the code branch's shared application-level BM25 index."""
-        bm25_index = self._bm25_index
-        if bm25_index is not None:
-            return bm25_index
-        with self._bm25_index_lock:
-            bm25_index = self._bm25_index
-            if bm25_index is None:
-                bm25_index = Bm25Index()
-                self._bm25_index = bm25_index
-                logger.info("Shared BM25 index ready")
-            return bm25_index
-
     @_serialize_lazy_initialization("_outbox_thread")
     def _start_outbox_worker(self):
         """Start OutboxWorker background thread (once, idempotent)."""
         if self._outbox_thread is not None:
-            return
-        if int(getattr(self._cfg, "index_workers", 1)) <= 0:
-            logger.info("OutboxWorker disabled by index.workers=%s", self._cfg.index_workers)
             return
         if not _HAS_AGFS and not _HAS_SQL:
             logger.info("OutboxWorker skipped: no storage backend available")
@@ -2670,11 +2375,6 @@ class MemoryService:
                 directory_summary_enabled=directory_summary_enabled,
                 agent_memory_handler=self._process_agent_memory,
                 memory_projection_handler=self._scene_projection_changed if self._cfg.scene_enabled else None,
-                bm25_index=(
-                    self._get_shared_bm25_index()
-                    if getattr(self._cfg, "code_retrieval_enabled", False)
-                    else None
-                ),
             )
 
             # SQL backend: use notify-based listener for real-time processing
@@ -2784,11 +2484,6 @@ class MemoryService:
                 directory_summary_enabled=directory_summary_enabled,
                 agent_memory_handler=self._process_agent_memory,
                 memory_projection_handler=self._scene_projection_changed if self._cfg.scene_enabled else None,
-                bm25_index=(
-                    self._get_shared_bm25_index()
-                    if getattr(self._cfg, "code_retrieval_enabled", False)
-                    else None
-                ),
             )
 
             account_ids = []
@@ -2816,11 +2511,6 @@ class MemoryService:
         if scene_index is not None and not scene_index.close(timeout=join_timeout):
             logger.warning("Scene lexical index is still closing")
             return
-        if self._code_workspace_sync_service is not None:
-            try:
-                self._code_workspace_sync_service.shutdown()
-            except Exception as exc:
-                logger.warning("Failed to stop code workspace sync scheduler: %s", exc)
         self.stop_skill_sedimentation(timeout=join_timeout)
         if self._outbox_listener is not None:
             try:
@@ -3137,7 +2827,7 @@ internal_tool_usage_tracker=self._internal_tool_usage,
 
     @_serialize_lazy_initialization("_read_api")
     def get_read_api(self, *, start_outbox_worker: bool = True):
-        """Return the shared read API without forcing worker startup for code reads."""
+        """Return the shared read API and optionally start index synchronization."""
         if self._read_api is None:
             embedder = self._get_shared_embedder()
             vector_index = self._get_shared_vector_index()
@@ -3219,399 +2909,12 @@ internal_tool_usage_tracker=self._internal_tool_usage,
                 self._cfg.storage_backend,
             )
         if start_outbox_worker:
-            # Ordinary reads retain their existing lazy worker startup.  The
-            # active code branch is read-only and requests passive construction.
             self._start_outbox_worker()
         return self._read_api
 
-    @_serialize_lazy_initialization("_code_retrieval_service")
-    def _get_code_retrieval_service(self) -> CodeRetrievalService:
-        if self._code_retrieval_service is None:
-            # The disabled public contract is dependency-free.  Construct only
-            # the lightweight canonical service so it can return its explicit
-            # disabled outcome; do not initialize ContextFS, ReadAPI, vector,
-            # BM25, relation, workspace, or embedding providers first.
-            if not bool(getattr(self._cfg, "code_retrieval_enabled", False)):
-                self._code_retrieval_service = CodeRetrievalService(config=self._cfg)
-                return self._code_retrieval_service
-            if getattr(self._cfg, "code_retrieval_mode", "full") == "candidate_local":
-                self._code_retrieval_service = CodeRetrievalService(
-                    config=self._cfg,
-                    workspace_resolver=CodeWorkspaceRegistryResolver(
-                        self.get_control_plane_store(),
-                        config=self._cfg,
-                    ),
-                    candidate_embedder=self._get_candidate_code_embedder(),
-                )
-                return self._code_retrieval_service
-            context_fs = self._get_context_fs()
-            if context_fs is None:
-                raise RuntimeError("ContextFS unavailable for code retrieval")
-            relation_store = None
-            try:
-                relation_store = self._get_relation_store()
-            except Exception:
-                logger.debug("RelationStore unavailable for active code graph", exc_info=True)
-            self._code_retrieval_service = CodeRetrievalService(
-                context_fs=context_fs,
-                read_api=self.get_read_api(start_outbox_worker=False),
-                bm25_index=self._get_shared_bm25_index(),
-                config=self._cfg,
-                relation_store=relation_store,
-            )
-        return self._code_retrieval_service
-
-    def search_code_active(
-        self,
-        request: ActiveCodeSearchRequest,
-        ctx: RequestContext,
-    ) -> ActiveCodeSearchOutcome:
-        """Delegate the typed active code contract to the canonical service."""
-
-        with request_usage_scope(ctx):
-            return self._get_code_retrieval_service().search_active(request, ctx)
 
     # Alias for downstream adapters that use the service-level verb.
-    def search_active(
-        self,
-        request: ActiveCodeSearchRequest,
-        ctx: RequestContext,
-    ) -> ActiveCodeSearchOutcome:
-        return self.search_code_active(request, ctx)
 
-    @staticmethod
-    def _active_code_search_request(params: Mapping[str, Any]) -> ActiveCodeSearchRequest:
-        """Turn an adapter DTO into the typed canonical active-search request."""
-
-        query = params.get("query")
-        if not isinstance(query, str):
-            raise ValueError("query must not be empty")
-        if not query.strip():
-            raise ValueError("query must not be empty")
-
-        raw_scope = params.get("scope")
-        if raw_scope is None:
-            scope = CodeSearchScope()
-        elif isinstance(raw_scope, CodeSearchScope):
-            scope = raw_scope
-        elif isinstance(raw_scope, Mapping):
-            try:
-                scope = CodeSearchScope(**dict(raw_scope))
-            except TypeError as exc:
-                raise ValueError("scope contains unsupported fields") from exc
-        else:
-            raise ValueError("scope must be a mapping")
-
-        raw_budget = params.get("budget")
-        if raw_budget is None:
-            budget = CodeSearchBudget()
-        elif isinstance(raw_budget, CodeSearchBudget):
-            budget = raw_budget
-        elif isinstance(raw_budget, Mapping):
-            try:
-                budget = CodeSearchBudget(**dict(raw_budget))
-            except TypeError as exc:
-                raise ValueError("budget contains unsupported fields") from exc
-        else:
-            raise ValueError("budget must be a mapping")
-        return ActiveCodeSearchRequest(query=query, scope=scope, budget=budget)
-
-    def search_code_resources(self, params: dict[str, Any]) -> dict[str, Any]:
-        """Map a public request onto the canonical active-code service.
-
-        The request carries only retrieval DTO values.  Account identity always
-        comes from the authenticated request context rather than request data.
-        """
-
-        ctx = params.get("_ctx") or self.build_context(params)
-        request = self._active_code_search_request(params)
-        return _public_result_mapping(
-            self.search_code_active(request, ctx).to_dict(),
-            operation="active code search",
-        )
-
-    def read_focused_code_snippet(self, params: dict[str, Any]) -> dict[str, Any]:
-        """Return one bounded, account-scoped code evidence item by URI."""
-
-        ctx = params.get("_ctx") or self.build_context(params)
-        uri = params.get("uri")
-        if not isinstance(uri, str):
-            raise ValueError("uri must be an exact account-local code URI")
-        max_chars = params.get("max_chars")
-        if max_chars is not None and (
-            isinstance(max_chars, bool) or not isinstance(max_chars, int)
-        ):
-            raise ValueError("max_chars must be a positive integer")
-        evidence = self._get_code_retrieval_service().read_focused_snippet(
-            uri=uri,
-            ctx=ctx,
-            max_chars=max_chars,
-        )
-        return _public_result_mapping(
-            evidence.to_dict(),
-            operation="focused code snippet",
-        )
-
-    @_serialize_lazy_initialization("_code_file_edit_service")
-    def _get_code_file_edit_service(self) -> CodeFileEditService:
-        if self._code_file_edit_service is None:
-            self._code_file_edit_service = CodeFileEditService(
-                workspace_resolver=CodeWorkspaceRegistryResolver(
-                    self.get_control_plane_store(),
-                    config=self._cfg,
-                ),
-                code_retrieval_mode=getattr(self._cfg, "code_retrieval_mode", "full"),
-                refresh_code_file=self._refresh_edited_code_file,
-                invalidate_cache=self.invalidate_code_retrieval_cache,
-            )
-        return self._code_file_edit_service
-
-    def _refresh_edited_code_file(
-        self,
-        *,
-        workspace: ResolvedCodeWorkspace,
-        relative_path: str,
-        ctx: RequestContext,
-    ) -> dict[str, Any]:
-        """Delegate an edited full-mode path to the canonical lifecycle owner."""
-
-        result = self._get_code_resource_lifecycle_service().refresh(
-            path=relative_path,
-            workspace_root=str(workspace.physical_root),
-            ctx=ctx,
-            name=workspace.root_slug,
-            language_hint=workspace.language_hints.get(relative_path),
-        )
-        self._start_outbox_worker()
-        return _public_result_mapping(result, operation="edited code resource refresh")
-
-    def edit_code_file(self, params: dict[str, Any]) -> dict[str, Any]:
-        """Atomically edit one file in an authenticated registered workspace."""
-
-        ctx = params.get("_ctx") or self.build_context(params)
-        result = self._get_code_file_edit_service().edit(
-            file_path=params.get("file_path"),
-            old_string=params.get("old_string"),
-            new_string=params.get("new_string"),
-            replace_all=params.get("replace_all", False),
-            root_slug=params.get("root_slug"),
-            ctx=ctx,
-        )
-        return _public_result_mapping(result, operation="code file edit")
-
-    @_serialize_lazy_initialization("_code_resource_lifecycle_service")
-    def _get_code_resource_lifecycle_service(self) -> CodeResourceLifecycleService:
-        if self._code_resource_lifecycle_service is None:
-            context_fs = self._get_context_fs()
-            if context_fs is None:
-                raise RuntimeError("ContextFS unavailable for code resources")
-            outbox_store = self._get_outbox_store(context_fs)
-            if outbox_store is None:
-                raise RuntimeError("Outbox unavailable for code resources")
-            self._code_resource_lifecycle_service = CodeResourceLifecycleService(
-                context_fs=context_fs,
-                outbox_store=outbox_store,
-                config=self._cfg,
-            )
-        return self._code_resource_lifecycle_service
-
-    @_serialize_lazy_initialization("_code_workspace_sync_service")
-    def _get_code_workspace_sync_service(self) -> CodeWorkspaceSyncService:
-        """Return the internal canonical workspace-sync service lazily."""
-
-        if self._code_workspace_sync_service is None:
-            self._code_workspace_sync_service = CodeWorkspaceSyncService(
-                control_store=self.get_control_plane_store(),
-                lifecycle_service=self._get_code_resource_lifecycle_service(),
-                config=self._cfg,
-                invalidate_cache=self.invalidate_code_retrieval_cache,
-                wake_outbox=self._start_outbox_worker,
-                is_index_visible=self._code_workspace_index_visible,
-                context_resolver=self._resolve_workspace_sync_context,
-            )
-            if self._cfg.code_sync_enabled:
-                self._code_workspace_sync_service.start()
-        return self._code_workspace_sync_service
-
-    def register_code_workspace(self, params: dict[str, Any]) -> dict[str, Any]:
-        """Register a workspace through the canonical protected registry."""
-
-        ctx = self._require_code_workspace_admin(params)
-        path = params.get("path")
-        if not isinstance(path, str) or not path.strip():
-            raise ValueError("workspace path is required")
-        result = self._get_code_workspace_sync_service().register(
-            path=path,
-            ctx=ctx,
-            name=params.get("name"),
-            trigger_mode=params.get("trigger_mode"),
-            watch_enabled=params.get("watch_enabled"),
-            reconcile_interval_seconds=params.get("reconcile_interval_seconds"),
-            max_files=params.get("max_files"),
-            wait_mode=params.get("wait_mode"),
-            language_hints=params.get("language_hints"),
-        )
-        return _public_result_mapping(result, operation="code workspace registration")
-
-    def sync_code_workspace(self, params: dict[str, Any]) -> dict[str, Any]:
-        """Run one explicit registered-workspace sync through the core service."""
-
-        ctx = self._require_code_workspace_admin(params)
-        root_id = params.get("root_id")
-        if not isinstance(root_id, str) or not root_id.strip():
-            raise ValueError("root_id is required")
-        result = self._get_code_workspace_sync_service().sync(
-            root_id=root_id,
-            ctx=ctx,
-            wait_mode=params.get("wait_mode"),
-        )
-        return _public_result_mapping(result, operation="code workspace sync")
-
-    def _resolve_workspace_sync_context(self, account_id: str) -> RequestContext:
-        """Build the internal account-scoped context used after scheduler restart."""
-
-        if not isinstance(account_id, str) or not account_id:
-            raise ValueError("workspace sync account_id is required")
-        return RequestContext(
-            account_id=account_id,
-            user_id=self._default_user_id,
-            agent_id=self._default_agent_id,
-            session_id="workspace-sync",
-            trace_id=f"workspace-sync-{uuid4().hex}",
-            role=Role.ROOT,
-            visible_owner_spaces=(),
-        )
-
-    def _code_workspace_index_visible(self, ctx: RequestContext) -> bool:
-        """Fail closed unless the Outbox can prove this account has no unfinished work."""
-
-        try:
-            context_fs = self._get_context_fs()
-            if context_fs is None:
-                return False
-            outbox_store = self._get_outbox_store(context_fs)
-            count_unfinished = getattr(outbox_store, "count_unfinished", None)
-            if not callable(count_unfinished):
-                return False
-            state = count_unfinished(ctx.account_id)
-            if not isinstance(state, Mapping):
-                return False
-            return (int(state.get("total", -1)) == 0
-                    and int(state.get("failed", 0)) == 0)
-        except Exception:
-            return False
-
-    @staticmethod
-    def _code_resource_tags(params: dict) -> list[str]:
-        tags = params.get("tags") or []
-        if not isinstance(tags, list) or any(not isinstance(tag, str) for tag in tags):
-            raise ValueError("tags must be a list of strings")
-        return tags
-
-    def _require_code_workspace_admin(self, params: Mapping[str, Any]) -> RequestContext:
-        """Require an authenticated administrator for server-local workspace authority."""
-
-        auth = self.get_auth_service()
-        if not auth.role_control_active():
-            raise ControlPlaneDisabledError(
-                "Code workspace APIs require enabled role control and configured API keys"
-            )
-        ctx = params.get("_ctx")
-        if not isinstance(ctx, RequestContext):
-            raise AuthorizationError("authenticated context required")
-        auth.require_role(ctx, Role.ROOT, Role.ADMIN)
-        return ctx
-
-    def _resolve_refresh_workspace(
-        self,
-        params: Mapping[str, Any],
-        *,
-        ctx: RequestContext,
-    ) -> tuple[ResolvedCodeWorkspace, str]:
-        """Resolve one registered root and a contained relative refresh path."""
-
-        if "workspace_root" in params:
-            raise ValueError("workspace_root is not accepted; use root_slug")
-        root_slug = params.get("root_slug")
-        if not isinstance(root_slug, str) or not root_slug.strip():
-            raise ValueError("root_slug is required")
-        path = params.get("path")
-        if not isinstance(path, str) or not path.strip():
-            raise ValueError("path is required")
-        try:
-            relative_path = normalize_posix_relative_path(path)
-        except (ResourceIdentityError, TypeError) as exc:
-            raise ValueError(
-                "path must be a non-empty relative path in the registered workspace"
-            ) from exc
-        try:
-            workspace = CodeWorkspaceRegistryResolver(
-                self.get_control_plane_store(),
-                config=self._cfg,
-            ).resolve_registered(ctx=ctx, root_slugs=(root_slug,))
-        except WorkspaceResolutionError as exc:
-            raise ValueError(f"registered workspace is {exc.reason}") from exc
-        return workspace, relative_path
-
-    def refresh_code_resource(self, params: dict) -> dict:
-        ctx = self._require_code_workspace_admin(params)
-        workspace, relative_path = self._resolve_refresh_workspace(params, ctx=ctx)
-        result = self._get_code_resource_lifecycle_service().refresh(
-            path=relative_path,
-            workspace_root=str(workspace.physical_root),
-            ctx=ctx,
-            name=workspace.root_slug,
-            tags=self._code_resource_tags(params),
-            description=params.get("description"),
-        )
-        self.invalidate_code_retrieval_cache(ctx.account_id)
-        self._start_outbox_worker()
-        return result
-
-    def upsert_code_resource(self, params: dict) -> dict:
-        """Expose the existing one-path refresh/upsert lifecycle facade."""
-
-        return self.refresh_code_resource(params)
-
-    def invalidate_code_retrieval_cache(self, account_id: str | None = None) -> None:
-        if self._code_retrieval_service is not None:
-            self._code_retrieval_service.invalidate(account_id)
-
-    def _get_tool_output_filter_service(self) -> ToolOutputFilterService:
-        """Lazily construct the ContextFS-backed tool-output filter service."""
-
-        if self._tool_output_filter_service is None:
-            with self._init_lock:
-                if self._tool_output_filter_service is None:
-                    context_fs = self._get_context_fs()
-                    if context_fs is None:
-                        raise RuntimeError("ContextFS unavailable for tool-output storage")
-                    self._tool_output_filter_service = ToolOutputFilterService(
-                        ToolOutputRepository(context_fs),
-                        self._cfg,
-                    )
-        return self._tool_output_filter_service
-
-    def _tool_output_context(self, params: dict) -> RequestContext:
-        ctx = params.get("_ctx") or self.build_context(params)
-        explicit_agent = params.get("agentId") or params.get("agent_id")
-        if self.get_auth_service().role_control_active() and not explicit_agent:
-            raise ValueError("agentId is required when authentication is enabled")
-        if not ctx.agent_id:
-            raise ValueError("agentId is required")
-        return ctx
-
-    def filter_read(self, params: dict) -> dict:
-        ctx = self._tool_output_context(params)
-        return self._get_tool_output_filter_service().filter_read(params, ctx)
-
-    def filter_bash(self, params: dict) -> dict:
-        ctx = self._tool_output_context(params)
-        return self._get_tool_output_filter_service().filter_bash(params, ctx)
-
-    def read_tool_output_original(self, params: dict) -> dict:
-        ctx = self._tool_output_context(params)
-        return self._get_tool_output_filter_service().recover_original(params, ctx)
 
     # -- Lifecycle handlers ---------------------------------------------------
 
@@ -3619,18 +2922,11 @@ internal_tool_usage_tracker=self._internal_tool_usage,
     def get_session_manager(self) -> SessionManager:
         """Lazy-init SessionManager with current service dependencies."""
         if self._session_mgr is None:
-            # Ordinary SessionState bridge injection and durable runtime state
-            # are separate concerns. Tool-result externalization needs the
-            # ContextFS-backed runtime_extensions for its Strong Identity Turn
-            # Ledger and TTL state even when the ordinary bridge is disabled.
-            # With externalization disabled, the historical bridge-off path
-            # remains a strict no-op and does not initialize ContextFS.
             from service.api import MemoryWriteAPI as _CheckpointWriteAPI
             checkpoint_fs = (self._write_api._fs
                              if isinstance(self._write_api, _CheckpointWriteAPI) else None)
             durable_runtime_state_enabled = bool(
                 getattr(self._cfg, "session_state_bridge_enabled", True)
-                or self._tool_result_externalizer is not None
                 or checkpoint_fs is not None
             )
             session_state_context_fs = (
@@ -3657,6 +2953,7 @@ internal_tool_usage_tracker=self._internal_tool_usage,
             )
             logger.info("SessionManager ready")
         return self._session_mgr
+
 
     def _get_archive_store(self):
         """Return an archive store instance.
@@ -3770,191 +3067,8 @@ internal_tool_usage_tracker=self._internal_tool_usage,
         )
         return {"ok": True, "evicted": evicted}
 
-    def _code_memory_only_fallback_stats(
-        self,
-        *,
-        status: str,
-        reason: str,
-    ) -> dict[str, Any]:
-        """Build a safe code-retrieval projection when no outcome is available."""
-
-        raw_mode = str(getattr(self._cfg, "code_retrieval_mode", "full") or "full")
-        mode = "candidate_local" if raw_mode.strip().lower() == "candidate_local" else "full"
-        return {
-            "code_retrieval_enabled": bool(
-                getattr(self._cfg, "code_retrieval_enabled", False)
-            ),
-            "code_retrieval_method": "candidate_local" if mode == "candidate_local" else "hybrid",
-            "code_retrieval_routes": [],
-            "code_route_hit_counts": {},
-            "code_route_errors": {},
-            "code_hydration_errors": 0,
-            "code_index_read_errors": 0,
-            "code_retrieval": {
-                "mode": mode,
-                "status": status,
-                "evidence_count": 0,
-                "reason": reason,
-                "diagnostics": {
-                    "mode": mode,
-                    "reason": reason,
-                    "duration_ms": 0,
-                },
-            },
-        }
-
-    @staticmethod
-    def _format_code_memory_only_evidence(
-        code_items: list[dict[str, Any]],
-        budget: Mapping[str, int],
-    ) -> str:
-        """Render canonical code entries without the generic memory formatter."""
-
-        if not code_items:
-            return ""
-
-        lines = [
-            "## Retrieved Code Evidence",
-            CODE_EVIDENCE_UNTRUSTED_NOTICE,
-            "The following code evidence was retrieved for the current request.",
-            "",
-        ]
-        max_chars = max(0, int(budget.get("working_set", 0) or 0) * 4)
-        locator_entries = format_code_evidence_entries(
-            code_items,
-            body_budget_chars=0,
-        )
-        reserved_chars = len("\n".join(lines + locator_entries))
-        body_budget_chars = max(0, max_chars - reserved_chars - len(code_items))
-        lines.extend(
-            format_code_evidence_entries(
-                code_items,
-                body_budget_chars=body_budget_chars,
-            )
-        )
-        return "\n".join(lines)
-
-    def _compose_code_memory_only(
-        self,
-        *,
-        messages: list[dict],
-        query: str,
-        ctx: RequestContext | None,
-        budget: Mapping[str, int],
-    ) -> dict:
-        """Compose only canonical code evidence, never the generic memory path."""
-
-        code_items: list[dict[str, Any]] = []
-        if not query:
-            code_stats = self._code_memory_only_fallback_stats(
-                status="zero_result",
-                reason="empty_query",
-            )
-        elif ctx is None:
-            code_stats = self._code_memory_only_fallback_stats(
-                status="error",
-                reason="context_unavailable",
-            )
-        else:
-            try:
-                # The disabled path uses the canonical service directly so it
-                # returns its regular disabled diagnostics without constructing
-                # full-mode ContextFS/ReadAPI dependencies.
-                code_service = (
-                    self._get_code_retrieval_service()
-                    if bool(getattr(self._cfg, "code_retrieval_enabled", False))
-                    else CodeRetrievalService(config=self._cfg)
-                )
-                raw_items, raw_stats = code_service.search(query, ctx, top_k=8)
-                if not isinstance(raw_items, list) or not isinstance(raw_stats, Mapping):
-                    raise RuntimeError("invalid code retrieval result")
-                code_items = [
-                    dict(item)
-                    for item in raw_items
-                    if isinstance(item, Mapping) and item.get("category") == "code"
-                ]
-                code_stats = dict(raw_stats)
-            except Exception:
-                logger.warning("code-only compose retrieval unavailable")
-                code_stats = self._code_memory_only_fallback_stats(
-                    status="error",
-                    reason="service_unavailable",
-                )
-
-        try:
-            retrieved_evidence = self._format_code_memory_only_evidence(
-                code_items,
-                budget,
-            )
-        except Exception:
-            logger.warning("code-only compose evidence formatting unavailable")
-            retrieved_evidence = ""
-            code_stats = self._code_memory_only_fallback_stats(
-                status="error",
-                reason="formatting_unavailable",
-            )
-
-        stats = dict(code_stats)
-        stats["code_memory_only"] = {
-            "effective": True,
-            "explicit_code_intent": bool(query),
-            "skipped_generic_steps": list(_CODE_MEMORY_ONLY_SKIPPED_GENERIC_STEPS),
-        }
-        result = ComposedContext(
-            retrieved_evidence=retrieved_evidence,
-            estimated_tokens=(
-                self._estimate_tokens(messages) + len(retrieved_evidence) // 4
-            ),
-            budget_used_by_slot={
-                "identity": 0,
-                "episodic": 0,
-                "session": 0,
-                "retrieved": len(retrieved_evidence) // 4,
-            },
-            stats=stats,
-            messages=messages,
-            archive_count=0,
-            archive_included=False,
-        )
-        # Code-only callers consume the evidence from the dedicated response
-        # slot.  Do not duplicate it into synthetic conversation messages:
-        # the code-only contract permits evidence only in retrievedEvidence.
-        return self._to_response(result, inject_retrieved_evidence=False)
-
-    def _finalize_tool_result_projection(
-        self,
-        messages: list,
-        *,
-        state=None,
-        ctx: RequestContext | None = None,
-    ) -> list:
-        if self._tool_result_governance is None:
-            return messages
-        return self._tool_result_governance.finalize_projection(
-            messages,
-            state=state,
-            ctx=ctx,
-        )
-
-    def _govern_pending_buffer(
-        self,
-        session_id: str,
-        ctx: RequestContext,
-        *,
-        _operation_held: bool = False,
-    ) -> dict:
-        if self._tool_result_governance is None:
-            return {"governed": False, "changed": 0}
-        return self._tool_result_governance.govern_pending_buffer(
-            session_id,
-            ctx,
-            _operation_held=_operation_held,
-        )
-
     @_guard_session_mutation
     def add_session_message(self, params: dict) -> dict:
-        if self._tool_result_governance is not None:
-            return self._tool_result_governance.add_session_message(params)
         session_id = params.get("sessionId", "unknown")
         ctx = params.get("_ctx") or self.build_context(params)
         return self.get_session_manager().add_message(
@@ -3967,8 +3081,6 @@ internal_tool_usage_tracker=self._internal_tool_usage,
 
     @_guard_session_mutation
     def commit_session_buffer(self, params: dict) -> dict:
-        if self._tool_result_governance is not None:
-            return self._tool_result_governance.commit_session_buffer(params)
         session_id = params.get("sessionId", "unknown")
         ctx = params.get("_ctx") or self.build_context(params)
         return self.get_session_manager().commit(
@@ -3977,182 +3089,9 @@ internal_tool_usage_tracker=self._internal_tool_usage,
             wait=params.get("wait", False),
         )
 
-    @staticmethod
-    def _externalization_disabled_error():
-        from features.tool_result_externalization.store_base import (
-            ToolResultExternalizationDisabledError,
-        )
-
-        return ToolResultExternalizationDisabledError(
-            "tool-result externalization is disabled"
-        )
-
-    def list_tool_result_artifacts(self, params: dict) -> dict:
-        if self._tool_result_governance is None:
-            raise self._externalization_disabled_error()
-        return self._tool_result_governance.list_tool_result_artifacts(params)
-
-    def read_tool_result_artifact(self, params: dict) -> dict:
-        if self._tool_result_governance is None:
-            raise self._externalization_disabled_error()
-        return self._tool_result_governance.read_tool_result_artifact(params)
-
-    def attest_tool_result_source(
-        self,
-        envelope: dict,
-        ctx: RequestContext,
-    ) -> dict:
-        if self._tool_result_governance is None:
-            raise self._externalization_disabled_error()
-        return self._tool_result_governance.attest_tool_result_source(
-            envelope,
-            ctx,
-        )
-
-    def search_tool_result_artifacts(self, params: dict) -> dict:
-        if self._tool_result_governance is None:
-            raise self._externalization_disabled_error()
-        return self._tool_result_governance.search_tool_result_artifacts(params)
-
-    @_guard_session_mutation
-    def delete_session(self, params: dict) -> dict:
-        """Delete all oGMemory resources owned by one Agent Session.
-
-        This is oGMemory's authoritative Session deletion entry point. The
-        caller must be a trusted ADMIN/ROOT lifecycle adapter, while the durable
-        owner tuple prevents a privileged request from deleting a mismatched
-        Session accidentally.
-        """
-        session_id = params.get("sessionId") or params.get("session_id") or ""
-        if not session_id:
-            raise ValueError("sessionId is required")
-        ctx = params.get("_ctx") or self.build_context(params)
-        role = ctx.role if isinstance(ctx.role, Role) else Role(str(ctx.role).upper())
-        if role not in (Role.ADMIN, Role.ROOT):
-            raise PermissionError("trusted_agent_lifecycle_adapter_required")
-        if ctx.session_id != session_id:
-            raise PermissionError("not_found_or_not_visible")
-
-        mgr = self.get_session_manager()
-        durable_owner = mgr.durable_session_owner(session_id, ctx)
-        if durable_owner is not None and durable_owner != (ctx.user_id, ctx.agent_id):
-            raise PermissionError("not_found_or_not_visible")
-        try:
-            cleanup_store = self._get_tool_result_cleanup_store()
-        except Exception as exc:
-            return {
-                "ok": False,
-                "cleaned": False,
-                "status": 503,
-                "retryable": True,
-                "session_id": session_id,
-                "steps": {
-                    "artifacts": {"ok": False, "error": str(exc)},
-                    "buffer": {"ok": False, "removed": False},
-                },
-            }
-        buf = mgr.try_begin_session_cleanup(session_id, ctx)
-        if buf is None:
-            return {
-                "ok": False,
-                "status": 409,
-                "error_code": "session_operation_in_progress",
-            }
-        if (
-            self._tool_result_io_runner is not None
-            and self._tool_result_io_runner.has_inflight(session_id)
-        ):
-            mgr.finish_session_cleanup(
-                session_id,
-                buf,
-                remove=False,
-                retry_pending=False,
-            )
-            return {
-                "ok": False,
-                "status": 409,
-                "error_code": "tool_result_io_in_progress",
-                "retryable": True,
-            }
-
-        steps: dict[str, dict] = {}
-        all_succeeded = True
-        try:
-            try:
-                deleted = mgr.delete_session_archives(session_id, ctx)
-                steps["archives"] = {"ok": True, "deleted": deleted}
-            except Exception as exc:
-                all_succeeded = False
-                steps["archives"] = {"ok": False, "error": str(exc)}
-
-            if all_succeeded:
-                try:
-                    deleted = mgr.delete_persisted_session_state(session_id, ctx)
-                    steps["session_state"] = {"ok": True, "deleted": deleted}
-                except Exception as exc:
-                    all_succeeded = False
-                    steps["session_state"] = {"ok": False, "error": str(exc)}
-            else:
-                steps["session_state"] = {"ok": False, "skipped": True}
-
-            # Artifacts are the backing data for Buffer stubs. Delete them last,
-            # only after every other durable session resource is gone, so a
-            # partial cleanup never re-enables a Buffer full of dangling refs.
-            if all_succeeded:
-                try:
-                    deleted = cleanup_store.delete_session_artifacts(
-                        session_id, ctx,
-                    )
-                    steps["artifacts"] = {"ok": True, "deleted": deleted}
-                except Exception as exc:
-                    all_succeeded = False
-                    steps["artifacts"] = {"ok": False, "error": str(exc)}
-            else:
-                steps["artifacts"] = {
-                    "ok": False,
-                    "skipped": True,
-                    "preserved": True,
-                }
-
-            steps["buffer"] = {"ok": all_succeeded, "removed": all_succeeded}
-            return {
-                "ok": all_succeeded,
-                "cleaned": all_succeeded,
-                "status": 200 if all_succeeded else 503,
-                "retryable": not all_succeeded,
-                "session_id": session_id,
-                "steps": steps,
-            }
-        finally:
-            mgr.finish_session_cleanup(
-                session_id,
-                buf,
-                remove=all_succeeded,
-                retry_pending=not all_succeeded,
-            )
-
     @_attribute_request_usage
     @_guard_session_mutation
     def compose(self, params: dict) -> dict:
-        """Guard compose-only Artifact writes against concurrent session cleanup."""
-        # The explicit code-only path is isolated from generic Compose and its
-        # tool-result governance.  The upstream path remains unchanged whenever
-        # the opt-in is absent or false.
-        if _code_memory_only_requested(params):
-            return self._compose_impl(params)
-        if self._tool_result_externalizer is None:
-            return self._compose_impl(params)
-        ctx = params.get("_ctx") or self.build_context(params)
-        session_id = params.get("sessionId") or ctx.session_id
-        buf = self.get_session_manager().begin_managed_operation(session_id, ctx)
-        try:
-            if params.get("_ctx") is None:
-                params = {**params, "_ctx": ctx}
-            return self._compose_impl(params)
-        finally:
-            buf.end_operation()
-
-    def _compose_impl(self, params: dict) -> dict:
         """Assemble memory context for the current turn.
 
         Pipeline with 3-layer architecture:
@@ -4196,55 +3135,15 @@ internal_tool_usage_tracker=self._internal_tool_usage,
                 - episodicContext: str - Semantic slot: archive history
                 - sessionContext: str - Semantic slot: structured session state
         """
-        code_memory_only = _code_memory_only_requested(params)
-        if code_memory_only:
-            messages = [
-                message
-                for message in params.get("messages", [])
-                if not (isinstance(message, dict) and message.get("_ogmem"))
-            ]
-            prompt = params.get("prompt", "") or params.get("query", "")
-            raw = prompt.strip() if prompt else extract_query(messages)
-            query = sanitize_query(raw)
-            token_budget = TokenBudget(total=params.get("tokenBudget", 128_000))
-            budget_allocation = token_budget.allocate()
-            try:
-                ctx = params.get("_ctx") or self.build_context(params)
-            except (
-                AuthenticationError,
-                AuthorizationError,
-                ControlPlaneDisabledError,
-                AccessDeniedError,
-                PermissionError,
-            ):
-                raise
-            except Exception:
-                logger.warning("code-only compose context unavailable")
-                ctx = None
-            return self._compose_code_memory_only(
-                messages=messages,
-                query=query,
-                ctx=ctx,
-                budget=budget_allocation,
-            )
-
-        messages = (
-            deepcopy(params.get("messages", []))
-            if self._tool_result_externalizer is not None
-            else params.get("messages", [])
-        )
+        messages = params.get("messages", [])
         prompt = params.get("prompt", "") or params.get("query", "")
 
-        ctx = params.get("_ctx")
-        compose_governance = None
-        if self._tool_result_governance is not None:
-            compose_governance = self._tool_result_governance.prepare_compose(
-                params,
-                messages,
-            )
-            params = compose_governance.params
-            messages = compose_governance.messages
-            ctx = compose_governance.ctx
+        # Strip previous synthetic memory messages to prevent cumulative duplication.
+        # Synthetic messages are tagged with _ogmem=True by _to_response().
+        messages = [
+            m for m in messages
+            if not (isinstance(m, dict) and m.get("_ogmem"))
+        ]
         logger.info(
             "assemble entry: msgs=%d prompt_len=%d keys=%s",
             len(messages), len(prompt), sorted(params.keys()),
@@ -4259,11 +3158,6 @@ internal_tool_usage_tracker=self._internal_tool_usage,
 
         # Empty query: return messages unchanged
         if not query:
-            messages = self._finalize_tool_result_projection(
-                messages,
-                state=compose_governance,
-                ctx=ctx,
-            )
             result = ComposedContext(
                 messages=messages,
                 estimated_tokens=self._estimate_tokens(messages),
@@ -4273,14 +3167,9 @@ internal_tool_usage_tracker=self._internal_tool_usage,
             return self._to_response(result)
 
         try:
-            ctx = ctx or self.build_context(params)
+            ctx = params.get("_ctx") or self.build_context(params)
         except Exception as exc:
             logger.warning("assemble build_context failed: %s", exc, exc_info=True)
-            messages = self._finalize_tool_result_projection(
-                messages,
-                state=compose_governance,
-                ctx=ctx,
-            )
             result = ComposedContext(
                 messages=messages,
                 estimated_tokens=self._estimate_tokens(messages),
@@ -4534,12 +3423,6 @@ internal_tool_usage_tracker=self._internal_tool_usage,
                     )
                     trim_reason = "matched_buffer"
                     if keep_from is None:
-                        keep_from = _find_last_message_subsequence_start(
-                            conversation_messages,
-                            buf.messages,
-                        )
-                        trim_reason = "matched_buffer_subsequence"
-                    if keep_from is None:
                         if "prePromptMessageCount" not in params:
                             logger.warning(
                                 "compose archive trim using tail margin without "
@@ -4659,12 +3542,6 @@ internal_tool_usage_tracker=self._internal_tool_usage,
 
         # Step 6: Assemble final output
         try:
-            if compose_governance is not None:
-                trimmed_messages = self._tool_result_governance.finalize_compose(
-                    trimmed_messages,
-                    state=compose_governance,
-                    ctx=ctx,
-                )
             system_prompt_suffix = "\n\n".join(
                 p for p in [episodic_context, session_state_suffix] if p
             )
@@ -4724,11 +3601,6 @@ internal_tool_usage_tracker=self._internal_tool_usage,
             return response
         except Exception as exc:
             logger.warning("assemble final result construction failed: %s", exc, exc_info=True)
-            trimmed_messages = self._finalize_tool_result_projection(
-                trimmed_messages,
-                state=compose_governance,
-                ctx=ctx,
-            )
             result = ComposedContext(
                 messages=trimmed_messages,
                 estimated_tokens=self._estimate_tokens(messages),
@@ -4737,12 +3609,7 @@ internal_tool_usage_tracker=self._internal_tool_usage,
             )
             return self._to_response(result)
 
-    def _to_response(
-        self,
-        result: ComposedContext,
-        *,
-        inject_retrieved_evidence: bool = True,
-    ) -> dict:
+    def _to_response(self, result: ComposedContext) -> dict:
         """Convert ComposedContext to dict for the OpenClaw plugin.
 
         Message injection order (all go into messages as user role for KV-cache):
@@ -4753,8 +3620,7 @@ internal_tool_usage_tracker=self._internal_tool_usage,
           5. Session state — dynamic suffix
 
         systemPromptAddition/systemPromptSuffix/memoryUserMessage are empty —
-        normal Compose context is in messages.  The isolated code-only branch
-        deliberately keeps its evidence in the dedicated response field.
+        all context is in messages.  The plugin only passes messages through.
         """
         injected_messages = []
 
@@ -4769,7 +3635,7 @@ internal_tool_usage_tracker=self._internal_tool_usage,
         if result.session_context:
             injected_messages.append({"role": "user", "content": result.session_context, "_ogmem": True})
 
-        if inject_retrieved_evidence and result.retrieved_evidence:
+        if result.retrieved_evidence:
             injected_messages.append({"role": "user", "content": result.retrieved_evidence, "_ogmem": True})
 
         return {
@@ -5113,21 +3979,7 @@ internal_tool_usage_tracker=self._internal_tool_usage,
         return result
 
     def _after_turn(self, params: dict) -> dict:
-        """Keep governance, thresholding, and extraction dispatch cleanup-safe."""
-        if self._tool_result_externalizer is None:
-            return self._after_turn_impl(params)
-        messages = params.get("messages", [])
-        if not messages:
-            return self._after_turn_impl(params)
-        session_id = params.get("sessionId", "unknown")
-        ctx = params.get("_ctx") or self.build_context(params)
-        buf = self.get_session_manager().begin_managed_operation(session_id, ctx)
-        try:
-            if params.get("_ctx") is None:
-                params = {**params, "_ctx": ctx}
-            return self._after_turn_impl(params)
-        finally:
-            buf.end_operation()
+        return self._after_turn_impl(params)
 
     def _after_turn_impl(self, params: dict) -> dict:
         """Reserve ordinary source preparation without serializing ordinary turns."""
@@ -5149,6 +4001,7 @@ internal_tool_usage_tracker=self._internal_tool_usage,
         finally:
             with buf.extraction_lock:
                 buf.ordinary_turns_in_progress -= 1
+
 
     def _after_turn_source_impl(self, params: dict) -> dict:
         """Unified write entry point: accumulate session buffer + extract memories.
@@ -5177,9 +4030,7 @@ internal_tool_usage_tracker=self._internal_tool_usage,
             len(messages),
         )
         if (
-            self._tool_result_externalizer is None
-            and not client_request_id
-            and not messages[pre_prompt_count:]
+            not client_request_id and (not messages[pre_prompt_count:])
         ):
             return {"ok": True, "status": "no_new_messages"}
 
@@ -5194,9 +4045,7 @@ internal_tool_usage_tracker=self._internal_tool_usage,
 
         def _save_idempotency_state() -> bool:
             if (
-                self._tool_result_externalizer is None
-                and not getattr(self._cfg, "session_state_bridge_enabled", True)
-                and not isinstance(self._write_api, _CheckpointWriteAPI)
+                not getattr(self._cfg, 'session_state_bridge_enabled', True) and (not isinstance(self._write_api, _CheckpointWriteAPI))
             ):
                 return True
             return mgr.save_session_state(session_id, ctx)
@@ -5215,21 +4064,6 @@ internal_tool_usage_tracker=self._internal_tool_usage,
                     }
                 buf.release_request(client_request_id)
             return result
-        governance_fallback_token = params.get(
-            "toolResultGovernanceFallbackToken"
-        )
-        governance_fallback_original = bool(governance_fallback_token)
-        if governance_fallback_original and (
-            self._tool_result_externalizer is None
-            or not self._tool_result_governance.validate_fallback_token(
-                governance_fallback_token,
-                params,
-                ctx,
-                session_id,
-            )
-        ):
-            raise ValueError("invalid tool-result governance fallback token")
-
         pending = buf.runtime_extensions.get("memory_extraction_recovery", {}).get("batch", {})
         pending_request_retry = bool(client_request_id and pending.get("client_request_id") == client_request_id)
         if client_request_id and buf.request_completed(client_request_id) and not pending_request_retry:
@@ -5248,24 +4082,9 @@ internal_tool_usage_tracker=self._internal_tool_usage,
                 "client_request_id": client_request_id,
             }
 
-        after_turn_governance = None
         if pending_request_retry and is_frozen_source_retry(ctx, pending):
             new_messages = deepcopy(pending["request_messages"])
-        elif self._tool_result_governance is not None:
-            after_turn_governance = self._tool_result_governance.prepare_after_turn(
-                params,
-                messages,
-                pre_prompt_count=pre_prompt_count,
-                ctx=ctx,
-                session_id=session_id,
-            )
-            params = after_turn_governance.params
-            new_messages = after_turn_governance.new_messages
-        else:
-            new_messages = messages[pre_prompt_count:]
-        if (pending_request_retry and not new_messages and after_turn_governance is not None
-                and after_turn_governance.semantic_messages is not None):
-            new_messages = after_turn_governance.semantic_messages
+        new_messages = messages[pre_prompt_count:]
         if pending_request_retry and pending.get("request_messages") != new_messages:
             return {"ok": False, "status": "needs_confirmation", "retryable": False,
                     "error": "the pending request source messages changed"}
@@ -5289,15 +4108,7 @@ internal_tool_usage_tracker=self._internal_tool_usage,
         # Step 1: Accumulate in session buffer (lightweight, every turn)
         # Dedup: skip messages already written by ingest()
         from extraction.tool_collector import update_buffer_stats
-        governance_result = None
-        if after_turn_governance is not None and not pending_request_retry:
-            governance_result = self._tool_result_governance.persist_after_turn(
-                after_turn_governance,
-                buf=buf,
-                ctx=ctx,
-                session_id=session_id,
-            )
-        elif not pending_request_retry:
+        if not pending_request_retry:
             # Snapshot buffer tail once to avoid TOCTOU race with concurrent ingest().
             buf_snapshot = list(buf.messages[-len(new_messages):]) if buf.messages else []
             for index, msg in enumerate(new_messages):
@@ -5339,13 +4150,6 @@ internal_tool_usage_tracker=self._internal_tool_usage,
                         session_id=session_id,
                     )
 
-        if governance_result is not None and governance_result.failed:
-            return {
-                "ok": False,
-                "status": "tool_result_governance_pending",
-                "retryable": True,
-                "toolResultGovernanceFallbackToken": governance_result.fallback_token,
-            }
 
         # Check pending_tokens
         session = mgr.get_session(session_id, ctx)
@@ -5826,6 +4630,7 @@ internal_tool_usage_tracker=self._internal_tool_usage,
 
         return {"ok": True, "status": "processing", "extraction_run_id": extraction_run_id}
 
+
     @_attribute_request_usage
     @_guard_session_mutation
     def ingest(self, params: dict) -> dict:
@@ -5837,12 +4642,6 @@ internal_tool_usage_tracker=self._internal_tool_usage,
         """
         session_id = params.get("sessionId", "unknown")
         messages = params.get("messages", [])
-        if (
-            self._tool_result_externalizer is not None
-            and not messages
-            and isinstance(params.get("message"), dict)
-        ):
-            messages = [params["message"]]
         if not messages:
             return {"ingested": True}
         ctx = params.get("_ctx") or self.build_context(params)
@@ -5871,59 +4670,41 @@ internal_tool_usage_tracker=self._internal_tool_usage,
                 buf.ordinary_turns_in_progress -= 1
                 buf.end_operation()
 
+
     def _ingest_source_impl(self, params, messages, ctx, session_id, mgr):
-        if self._tool_result_governance is not None:
-            return self._tool_result_governance.defer_user_message_ingest(
-                params,
-                messages,
-                ctx=ctx,
-                session_id=session_id,
-            )
-        if self._tool_result_externalizer is None:
-            client_request_id = str(params.get("clientRequestId") or params.get("client_request_id") or "").strip()
-            if len(client_request_id) > 128:
-                raise ValueError("client_request_id must be at most 128 characters")
-            buf = mgr.get_or_create(session_id, ctx=ctx)
-            pending = buf.runtime_extensions.get("memory_extraction_recovery", {}).get("batch", {})
-            if client_request_id and pending.get("client_request_id") == client_request_id:
-                if pending.get("request_messages") == messages:
-                    return {"ingested": True, "count": 0}
-                return {"ok": False, "ingested": False, "status": "needs_confirmation", "retryable": False,
-                        "error": "the pending request source messages changed"}
-            if _ambiguous_pending_replay(pending, messages, client_request_id):
-                return {"ok": False, "ingested": False, "status": "needs_confirmation", "retryable": False,
-                        "error": "ingest requires a stable source ID to distinguish a pending replay from a new message"}
-            count = 0
-            for index, msg in enumerate(messages):
-                role = msg.get("role", "user") if isinstance(msg, dict) else getattr(msg, "role", "user")
-                content_raw = msg.get("content", "") if isinstance(msg, dict) else getattr(msg, "content", "")
-                content = extract_content_and_tool_calls(content_raw).get("text", "")
-                created_at = msg.get("created_at") if isinstance(msg, dict) else getattr(msg, "created_at", None)
-                if content:
-                    message_id = (msg.get("id") if isinstance(msg, dict) else getattr(msg, "id", None))
-                    message_id = message_id or (request_message_id(ctx, client_request_id, index)
-                                                if client_request_id else None)
-                    added = mgr.add_message(session_id, role, content, ctx, created_at=created_at, message_id=message_id)
-                    with buf.extraction_lock:
-                        buf.ingest_handoff_ids.add(added["message_id"])
-                    count += 1
-            return {"ingested": True, "count": count}
-    @_guard_session_mutation
-    def govern_first_view_tool_result(self, params: dict) -> dict:
-        """Delegate trusted first-view governance to the optional coordinator."""
-        if self._tool_result_governance is None:
-            return {
-                "ok": True,
-                "externalized": 0,
-                "failed": 0,
-                "content": deepcopy(params.get("content", [])),
-                "reason": "externalization_disabled",
-            }
-        return self._tool_result_governance.govern_first_view_tool_result(params)
+        client_request_id = str(params.get("clientRequestId") or params.get("client_request_id") or "").strip()
+        if len(client_request_id) > 128:
+            raise ValueError("client_request_id must be at most 128 characters")
+        buf = mgr.get_or_create(session_id, ctx=ctx)
+        pending = buf.runtime_extensions.get("memory_extraction_recovery", {}).get("batch", {})
+        if client_request_id and pending.get("client_request_id") == client_request_id:
+            if pending.get("request_messages") == messages:
+                return {"ingested": True, "count": 0}
+            return {"ok": False, "ingested": False, "status": "needs_confirmation", "retryable": False,
+                    "error": "the pending request source messages changed"}
+        if _ambiguous_pending_replay(pending, messages, client_request_id):
+            return {"ok": False, "ingested": False, "status": "needs_confirmation", "retryable": False,
+                    "error": "ingest requires a stable source ID to distinguish a pending replay from a new message"}
+        count = 0
+        for index, msg in enumerate(messages):
+            role = msg.get("role", "user") if isinstance(msg, dict) else getattr(msg, "role", "user")
+            content_raw = msg.get("content", "") if isinstance(msg, dict) else getattr(msg, "content", "")
+            content = extract_content_and_tool_calls(content_raw).get("text", "")
+            created_at = msg.get("created_at") if isinstance(msg, dict) else getattr(msg, "created_at", None)
+            if content:
+                message_id = (msg.get("id") if isinstance(msg, dict) else getattr(msg, "id", None))
+                message_id = message_id or (request_message_id(ctx, client_request_id, index)
+                                            if client_request_id else None)
+                added = mgr.add_message(session_id, role, content, ctx, created_at=created_at, message_id=message_id)
+                with buf.extraction_lock:
+                    buf.ingest_handoff_ids.add(added["message_id"])
+                count += 1
+        return {"ingested": True, "count": count}
+
 
     @_attribute_request_usage
     def ingest_batch(self, params: dict) -> dict:
-        """Batch ingest through the standard externalization path."""
+        """Batch ingest — same as ingest() for multiple messages."""
         return self.ingest(params)
 
     @_guard_session_mutation
@@ -5962,12 +4743,6 @@ internal_tool_usage_tracker=self._internal_tool_usage,
             raise ValueError("prepare token required when prepared=true")
         else:
             prepared = self.prepare_compaction(params)
-        if prepared.get("ok") is False:
-            return {
-                "ok": False,
-                "compacted": False,
-                **prepared,
-            }
         session_id = prepared["session_id"]
         ctx = prepared["ctx"]
         token_budget = params.get("tokenBudget", 128_000)
@@ -6068,25 +4843,6 @@ internal_tool_usage_tracker=self._internal_tool_usage,
         """Build transport-agnostic compact state without mutating extraction progress."""
         session_id = params.get("sessionId", "unknown")
         ctx = params.get("_ctx") or self.build_context(params)
-        governance = self._govern_pending_buffer(session_id, ctx)
-        if governance.get("retryable"):
-            public_governance = {
-                key: governance[key]
-                for key in (
-                    "governed",
-                    "changed",
-                    "failed_count",
-                    "retryable",
-                )
-                if key in governance
-            }
-            return {
-                "ok": False,
-                "status": "tool_result_governance_pending",
-                "retryable": True,
-                "session_id": session_id,
-                "governance": public_governance,
-            }
         mgr = self.get_session_manager()
         buf = mgr.get_or_create(session_id, ctx=ctx)
         kind = lifecycle_kind(buf)
@@ -6444,12 +5200,6 @@ internal_tool_usage_tracker=self._internal_tool_usage,
         from service.api import MemoryWriteAPI as _CheckpointWriteAPI
 
         with buf.lifecycle_lock:
-            if self._tool_result_externalizer is not None:
-                ctx = ctx or self.build_context(params)
-                governance = self._govern_pending_buffer(buf.session_id, ctx, _operation_held=True)
-                if governance.get("retryable"):
-                    return {"ok": False, "status": "tool_result_governance_pending",
-                            "retryable": True, "governance": governance}
             with buf.extraction_lock:
                 if buf.extraction_in_progress:
                     return {"source_snapshot": None}
@@ -7445,7 +6195,6 @@ internal_tool_usage_tracker=self._internal_tool_usage,
                 "details": {
                     "语义检索": True,
                     "混合检索": hybrid_enabled,
-                    "代码检索": bool(self._cfg.code_retrieval_enabled),
                     "Embedding": embedding_model or "unavailable",
                 },
                 "tables": [

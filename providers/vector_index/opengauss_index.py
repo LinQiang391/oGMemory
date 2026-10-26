@@ -514,13 +514,6 @@ class OpenGaussVectorIndex(PoolAdapterMixin, VectorIndex):
             else:
                 clauses.append("COALESCE(owner_space, filters->>'owner_space') = %(f_owner_space)s")
             params["f_owner_space"] = owner
-        if "resource_type" in f:
-            resource_type = f["resource_type"]
-            if isinstance(resource_type, list):
-                clauses.append("filters->>'resource_type' = ANY(%(f_resource_type)s)")
-            else:
-                clauses.append("filters->>'resource_type' = %(f_resource_type)s")
-            params["f_resource_type"] = resource_type
         if "context_type" in f:
             ct = f["context_type"]
             if isinstance(ct, list):
@@ -681,8 +674,6 @@ class OpenGaussVectorIndex(PoolAdapterMixin, VectorIndex):
             filters["context_type"] = query.context_type
         if query.categories:
             filters["category"] = query.categories
-        if query.resource_type:
-            filters["resource_type"] = query.resource_type
 
         if embedder:
             vectors = embedder.embed_texts([query.text])

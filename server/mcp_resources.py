@@ -55,7 +55,6 @@ _HIDDEN_RESOURCE_TYPES = {"session_summary", "session_archive"}
 _WRITE_TOOLSETS = {"read-write", "read_write", "readwrite", "all", "full"}
 _DELETE_TOOLSETS = {"all", "full"}
 _READ_ONLY_TOOLSETS = {"read-only", "read_only", "readonly"}
-_CODE_TOOLSETS = {"code"}
 
 
 @dataclass(frozen=True)
@@ -286,7 +285,6 @@ def render_status_resource(service: Any) -> dict[str, Any]:
     cfg = service._cfg
     write_enabled = mcp_write_tools_enabled(cfg)
     delete_enabled = mcp_delete_tools_enabled(cfg)
-    code_edit_enabled = mcp_code_edit_tools_enabled(cfg)
     return {
         "status": "ok",
         "transport": "mcp",
@@ -294,7 +292,6 @@ def render_status_resource(service: Any) -> dict[str, Any]:
             "read_only": True,
             "write": write_enabled,
             "delete": delete_enabled,
-            "code_edit": code_edit_enabled,
             "runtime": False,
             "diagnostic": False,
         },
@@ -521,40 +518,22 @@ def _validate_public_uri_text(uri: str) -> None:
 
 
 def mcp_write_tools_enabled(cfg: Any) -> bool:
-    toolset = _normalized_toolset(cfg)
-    if toolset in _CODE_TOOLSETS:
-        return False
-    return toolset in _WRITE_TOOLSETS or bool(
+    return _normalized_toolset(cfg) in _WRITE_TOOLSETS or bool(
         getattr(cfg, "mcp_enable_write_tools", False)
     )
 
 
 def mcp_delete_tools_enabled(cfg: Any) -> bool:
-    toolset = _normalized_toolset(cfg)
-    if toolset in _CODE_TOOLSETS:
-        return False
-    return toolset in _DELETE_TOOLSETS or bool(
+    return _normalized_toolset(cfg) in _DELETE_TOOLSETS or bool(
         getattr(cfg, "mcp_enable_delete_tools", False)
     )
 
 
-def mcp_code_edit_tools_enabled(cfg: Any) -> bool:
-    """Return the independent source-edit capability state."""
-
-    return bool(getattr(cfg, "mcp_enable_code_edit_tools", False))
-
-
-def mcp_code_toolset_enabled(cfg: Any) -> bool:
-    """Return whether MCP exposes the isolated code-oriented tool surface."""
-
-    return _normalized_toolset(cfg) in _CODE_TOOLSETS
-
-
 def _normalized_toolset(cfg: Any) -> str:
     toolset = str(getattr(cfg, "mcp_default_toolset", "read-only") or "read-only").strip().lower()
-    if toolset in _READ_ONLY_TOOLSETS | _WRITE_TOOLSETS | _DELETE_TOOLSETS | _CODE_TOOLSETS:
+    if toolset in _READ_ONLY_TOOLSETS | _WRITE_TOOLSETS | _DELETE_TOOLSETS:
         return toolset
-    raise ValueError("mcp_default_toolset must be read-only, read-write, all, full, or code")
+    raise ValueError("mcp_default_toolset must be read-only, read-write, all, or full")
 
 
 def _configured_max_response_chars(service: Any) -> int:

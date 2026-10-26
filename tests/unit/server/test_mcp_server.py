@@ -3,26 +3,21 @@ from __future__ import annotations
 import asyncio
 import threading
 from concurrent.futures import ThreadPoolExecutor
-from unittest.mock import Mock
 
 import anyio
 import pytest
-from pydantic import ValidationError as PydanticValidationError
 from starlette.testclient import TestClient
 
 from core.models import ContextNode, RequestContext, Role
 from providers.unified_config import OgMemConfig
 from server.auth import ResolvedIdentity
-from server.mcp_security import CODE_EVIDENCE_UNTRUSTED_NOTICE
 from server.mcp_server import (
     DELETE_SKILL_TOOL_NAME,
-    EDIT_FILE_TOOL_NAME,
     INSTALL_SKILL_TOOL_NAME,
     LIST_MEMORY_TOOL_NAME,
     LIST_SKILL_CANDIDATES_TOOL_NAME,
     LIST_SKILLS_TOOL_NAME,
     READ_SKILL_TOOL_NAME,
-    SEARCH_CODE_TOOL_NAME,
     SEARCH_SKILLS_TOOL_NAME,
     UPDATE_SKILL_TOOL_NAME,
     _auth_kwargs_from_context,
@@ -45,7 +40,6 @@ _SKILL_DELETE_TOOLS = {DELETE_SKILL_TOOL_NAME}
 _READ_TOOLS = {
     "ogm_query_memory",
     LIST_MEMORY_TOOL_NAME,
-    SEARCH_CODE_TOOL_NAME,
     "ogm_read_memory",
 } | _SKILL_TOOLS
 
@@ -86,32 +80,6 @@ class _FakeService:
 
     def get_auth_service(self):
         return _FakeAuth()
-
-
-class _RecordingCodeSearchService(_FakeService):
-    def __init__(self):
-        self.auth = _FakeAuth(role=Role.MEMBER)
-        self.build_context_params = None
-        self.build_context_identity = None
-        self.code_search_params = None
-
-    def get_auth_service(self):
-        return self.auth
-
-    def build_context(self, params, identity=None):
-        self.build_context_params = dict(params)
-        self.build_context_identity = identity
-        return RequestContext(
-            account_id=identity.account_id,
-            user_id=identity.user_id,
-            agent_id=str(params.get("agentId") or ""),
-            session_id=str(params.get("sessionId") or "unknown"),
-            trace_id="trace-code-search",
-        )
-
-    def search_code_resources(self, params):
-        self.code_search_params = dict(params)
-        return {"status": "zero_result", "evidence": []}
 
 
 class _FakeNoAuth:
@@ -222,144 +190,12 @@ def test_create_mcp_server_excludes_context_from_tool_schema():
 
     tools = anyio.run(mcp.list_tools)
     query_tool = next(tool for tool in tools if tool.name == "ogm_query_memory")
-    search_tool = next(tool for tool in tools if tool.name == SEARCH_CODE_TOOL_NAME)
     read_tool = next(tool for tool in tools if tool.name == "ogm_read_memory")
     list_tool = next(tool for tool in tools if tool.name == LIST_MEMORY_TOOL_NAME)
 
     assert "ctx" not in query_tool.input_schema.get("properties", {})
     assert "ctx" not in read_tool.input_schema.get("properties", {})
     assert "ctx" not in list_tool.input_schema.get("properties", {})
-    assert {"code_search", "code_scope", "code_budget"}.isdisjoint(
-        query_tool.input_schema.get("properties", {})
-    )
-    search_schema = search_tool.input_schema
-    search_properties = search_schema.get("properties", {})
-    assert set(search_properties) == {"query", "scope", "budget"}
-    assert search_schema.get("required") == ["query"]
-    assert search_properties["query"] == {
-        "description": "Natural language or keyword query.",
-        "title": "Query",
-        "type": "string",
-    }
-    assert search_properties["scope"]["description"] == "Optional search scope."
-    assert search_properties["budget"]["description"] == "Optional search budget."
-
-    scope_schema = search_schema["$defs"]["CodeSearchScopeInput"]
-    assert scope_schema["additionalProperties"] is False
-    assert set(scope_schema["properties"]) == {"paths", "glob_patterns", "grep_terms"}
-    assert scope_schema["properties"]["paths"]["description"] == (
-        "Optional repository-relative files or directories."
-    )
-    assert scope_schema["properties"]["glob_patterns"]["description"] == (
-        "Optional glob patterns to narrow candidate files before ranking."
-    )
-    assert scope_schema["properties"]["grep_terms"]["description"] == (
-        "Optional keywords or symbols to narrow candidate files before ranking."
-    )
-    for field in ("paths", "glob_patterns", "grep_terms"):
-        array_schema = scope_schema["properties"][field]["anyOf"][0]
-        assert array_schema == {"items": {"type": "string"}, "type": "array"}
-
-    budget_schema = search_schema["$defs"]["CodeSearchBudgetInput"]
-    assert budget_schema["additionalProperties"] is False
-    assert set(budget_schema["properties"]) == {"result_limit"}
-    assert budget_schema["properties"]["result_limit"]["description"] == (
-        "Optional max hits; omit to use the server default."
-    )
-    assert budget_schema["properties"]["result_limit"]["anyOf"][0] == {
-        "exclusiveMinimum": 0,
-        "type": "integer",
-    }
-    assert search_tool.description == "Search code and return compact editable snippets."
-    assert "recover_original" in read_tool.input_schema.get("properties", {})
-
-
-def test_search_code_tool_converts_narrow_inputs_to_existing_adapter_mappings():
-    service = _RecordingCodeSearchService()
-    mcp = create_mcp_server(service=service, config=OgMemConfig())
-    tool = mcp._tool_manager.get_tool(SEARCH_CODE_TOOL_NAME)
-
-    arguments = tool.fn_metadata.validate_arguments(
-        {
-            "query": "find service",
-            "scope": {
-                "paths": ["src"],
-                "glob_patterns": ["**/*.py"],
-                "grep_terms": ["Service"],
-            },
-            "budget": {"result_limit": 3},
-        },
-    )
-    result = tool.fn(**arguments)
-
-    assert result == (
-        "# code_search status: zero_result\n"
-        "# query: find service\n"
-        "# hit_count: 0\n"
-        f"# {CODE_EVIDENCE_UNTRUSTED_NOTICE}\n"
-    )
-    assert service.build_context_params == {}
-    assert service.code_search_params["scope"] == {
-        "paths": ["src"],
-        "glob_patterns": ["**/*.py"],
-        "grep_terms": ["Service"],
-    }
-    assert service.code_search_params["budget"]["result_limit"] == 3
-    assert service.code_search_params["_ctx"].account_id == "acct-auth"
-    assert service.code_search_params["_ctx"].agent_id == ""
-
-
-@pytest.mark.parametrize(
-    "arguments",
-    [
-        {"query": "find service", "scope": {"root_slugs": ["repo"]}},
-        {"query": "find service", "budget": {"candidate_limit": 3}},
-        {"query": "find service", "scope": {"paths": "src"}},
-        {"query": "find service", "budget": {"result_limit": True}},
-        {"query": "find service", "budget": {"result_limit": 0}},
-    ],
-)
-def test_search_code_tool_rejects_invalid_nested_input_before_delegation(arguments):
-    service = _RecordingCodeSearchService()
-    mcp = create_mcp_server(service=service, config=OgMemConfig())
-    tool = mcp._tool_manager.get_tool(SEARCH_CODE_TOOL_NAME)
-
-    with pytest.raises(PydanticValidationError):
-        tool.fn_metadata.validate_arguments(arguments)
-
-    assert service.build_context_params is None
-    assert service.code_search_params is None
-
-
-def test_read_memory_tool_rejects_boolean_recovery_budget_before_delegation():
-    service = _FakeService()
-    service.read_tool_output_original = Mock()
-    mcp = create_mcp_server(service=service, config=OgMemConfig())
-    tool = mcp._tool_manager.get_tool("ogm_read_memory")
-
-    with pytest.raises(PydanticValidationError):
-        tool.fn_metadata.validate_arguments(
-            {
-                "uri": (
-                    "ctx://acct/agents/bot/memories/tool_outputs/"
-                    "tool_output_read_aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
-                ),
-                "recover_original": True,
-                "max_chars": True,
-            }
-        )
-
-    service.read_tool_output_original.assert_not_called()
-
-
-def test_create_mcp_server_exposes_recovery_parameter_and_instruction():
-    mcp = create_mcp_server(service=_FakeService(), config=OgMemConfig())
-    tools = {tool.name: tool for tool in anyio.run(mcp.list_tools)}
-    read_tool = tools["ogm_read_memory"]
-
-    assert "recover_original" in read_tool.input_schema.get("properties", {})
-    assert "original tool output" in read_tool.description.lower()
-    assert "recover_original=true" in mcp.instructions
 
 
 def test_create_mcp_server_defaults_to_read_only_tools():
@@ -419,8 +255,6 @@ def test_create_mcp_server_instructions_describe_generic_memory_timing():
     assert "ogm_query_memory" in instructions
     assert "ogm_read_memory" in instructions
     assert "ogm_list_memories" in instructions
-    assert SEARCH_CODE_TOOL_NAME in instructions
-    assert "recover_original=true" in instructions
     assert "ogm_list_skills" in instructions
     assert "ogm_search_skills" in instructions
     assert "ogm_read_skill" in instructions
@@ -443,17 +277,13 @@ def test_create_mcp_server_instructions_describe_generic_memory_timing():
     delete_tool = tools["ogm_delete_memory"]
 
     assert "semantically recall" in query_tool.description.lower()
-    assert "generic memory" in query_tool.description.lower()
     assert "relevance score" in query_tool.description.lower()
     assert "browse or inventory" in list_tool.description.lower()
-    assert "native summary metadata" in list_tool.description.lower()
     assert "pagination" in list_tool.description.lower()
     assert "exact ogmemory:// uri" in read_tool.description.lower()
-    assert "original tool output" in read_tool.description.lower()
     assert "deduplication" in write_tool.description.lower()
     assert "correction" in write_tool.description.lower()
     assert "explicit user forget request" in delete_tool.description.lower()
-    assert "compact editable snippets" in tools[SEARCH_CODE_TOOL_NAME].description.lower()
 
     query_schema = query_tool.input_schema["properties"]
     assert "self-contained" in query_schema["query"]["description"]
@@ -474,8 +304,6 @@ def test_create_mcp_server_instructions_describe_generic_memory_timing():
 
     delete_schema = delete_tool.input_schema["properties"]
     assert "confirmed for deletion" in delete_schema["uri"]["description"]
-    forbidden = {"search_code", "get_original_tool_output", "index_codebase", "read_filtered"}
-    assert not forbidden & set(tools)
 
 
 def test_create_mcp_server_read_only_instructions_do_not_advertise_disabled_tools():
@@ -488,7 +316,6 @@ def test_create_mcp_server_read_only_instructions_do_not_advertise_disabled_tool
     assert "ogm_list_memories" in instructions
     assert "ogm_write_memory" not in instructions
     assert "ogm_delete_memory" not in instructions
-    assert EDIT_FILE_TOOL_NAME not in instructions
 
 
 def test_run_mcp_server_rejects_disabled_config(monkeypatch):
@@ -574,8 +401,7 @@ def test_create_mcp_server_static_resources_are_readable():
     resources = anyio.run(mcp.list_resources)
     payloads = anyio.run(mcp.read_resource, "ogmemory://status")
 
-    resource_uris = {str(resource.uri) for resource in resources}
-    assert {"ogmemory://status", "ogmemory://types", "ogmemory://skills"} <= resource_uris
+    assert "ogmemory://status" in {str(resource.uri) for resource in resources}
     assert '"status": "ok"' in payloads[0].content
 
 
@@ -625,6 +451,8 @@ async def test_create_mcp_server_serves_current_protocol(monkeypatch):
     assert {tool.name for tool in tools.tools} == _READ_TOOLS
     assert result.is_error is False
     assert '"status": "ok"' in status.contents[0].text
+
+
 def test_create_mcp_server_reads_scoped_agent_pattern_resource():
     mcp = create_mcp_server(service=_FakePatternService(), config=OgMemConfig())
 
@@ -766,151 +594,6 @@ def test_create_mcp_server_exposes_skill_management_schemas():
     assert "explicit user request" in tools[DELETE_SKILL_TOOL_NAME].description
 
 
-def test_create_mcp_server_registers_code_edit_tool_only_under_independent_capability():
-    mcp = create_mcp_server(
-        service=_FakeService(),
-        config=OgMemConfig(
-            mcp_enable_code_edit_tools=True,
-            mcp_enable_write_tools=False,
-            mcp_enable_delete_tools=False,
-        ),
-    )
-
-    tools = anyio.run(mcp.list_tools)
-    edit_tool = next(tool for tool in tools if tool.name == EDIT_FILE_TOOL_NAME)
-    properties = edit_tool.input_schema.get("properties", {})
-
-    assert {tool.name for tool in tools} == _READ_TOOLS | {EDIT_FILE_TOOL_NAME}
-    assert "ctx" not in properties
-    assert set(properties) == {"locator", "old_string", "new_string", "replace_all"}
-    assert "standalone locator" in properties["locator"]["description"].lower()
-    old_string_description = properties["old_string"]["description"].lower()
-    assert "smallest unique exact text" in old_string_description
-    assert "whole file, class, or complete search excerpt" in old_string_description
-    assert "replacement for old_string only" in properties["new_string"]["description"].lower()
-    assert "smallest unique old_string" in edit_tool.description.lower()
-    assert SEARCH_CODE_TOOL_NAME in mcp.instructions
-    assert EDIT_FILE_TOOL_NAME in mcp.instructions
-    assert "old_string must be the smallest unique exact text" in mcp.instructions
-    assert "new_string replaces only that fragment" in mcp.instructions
-    assert "whole file, class, or complete search excerpt" in mcp.instructions
-
-
-def test_code_edit_tool_is_not_implied_by_generic_write_or_code_only_profile(monkeypatch):
-    monkeypatch.setenv("OGMEM_CODE_MEMORY_ONLY", "true")
-    mcp = create_mcp_server(
-        service=_FakeService(),
-        config=OgMemConfig(mcp_enable_write_tools=True, mcp_enable_code_edit_tools=False),
-    )
-
-    assert {tool.name for tool in anyio.run(mcp.list_tools)} == _READ_TOOLS | {
-        "ogm_write_memory"
-    } | _SKILL_WRITE_TOOLS
-
-
-def test_create_mcp_server_code_toolset_isolates_search_read_and_enabled_edit():
-    mcp = create_mcp_server(
-        service=_FakeService(),
-        config=OgMemConfig(
-            mcp_default_toolset="code",
-            mcp_enable_write_tools=True,
-            mcp_enable_delete_tools=True,
-            mcp_enable_code_edit_tools=True,
-        ),
-    )
-
-    tool_names = {tool.name for tool in anyio.run(mcp.list_tools)}
-
-    assert tool_names == {SEARCH_CODE_TOOL_NAME, "ogm_read_memory", EDIT_FILE_TOOL_NAME}
-    assert "ogm_query_memory" not in tool_names
-    assert tool_names.isdisjoint(_SKILL_TOOLS)
-    assert "ogm_query_memory" not in mcp.instructions
-    assert "skill" not in mcp.instructions.lower()
-    assert "ogm_write_memory" not in mcp.instructions
-    assert "ogm_delete_memory" not in mcp.instructions
-
-
-def test_create_mcp_server_code_toolset_registers_only_status_resource():
-    mcp = create_mcp_server(
-        service=_FakeService(),
-        config=OgMemConfig(mcp_default_toolset="code"),
-    )
-
-    resources = anyio.run(mcp.list_resources)
-    templates = anyio.run(mcp.list_resource_templates)
-
-    assert {str(resource.uri) for resource in resources} == {"ogmemory://status"}
-    assert templates == []
-
-
-def test_code_toolset_read_memory_only_delegates_filtered_output_recovery(monkeypatch):
-    calls = []
-
-    def fake_read_memory(service, **kwargs):
-        calls.append(kwargs)
-        return {"ok": True, "memory_uri": kwargs["uri"], "original": "full"}
-
-    monkeypatch.setattr("server.mcp_server.read_memory_tool", fake_read_memory)
-    mcp = create_mcp_server(
-        service=_FakeService(),
-        config=OgMemConfig(mcp_default_toolset="code"),
-    )
-    tool = mcp._tool_manager.get_tool("ogm_read_memory")
-
-    with pytest.raises(
-        ValueError,
-        match="only supports ogm_read_memory with recover_original=true",
-    ):
-        tool.fn(uri="ogmemory://memories/preference/editor")
-    with pytest.raises(
-        ValueError,
-        match="only supports filtered-output memory URI recovery",
-    ):
-        tool.fn(
-            uri="ogmemory://memories/preference/editor",
-            recover_original=True,
-        )
-
-    recovery_uri = (
-        "ctx://acct/agents/bot/memories/tool_outputs/"
-        "tool_output_read_aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
-    )
-    result = tool.fn(uri=recovery_uri, recover_original=True)
-
-    assert result == {"ok": True, "memory_uri": recovery_uri, "original": "full"}
-    assert calls == [
-        {
-            "uri": recovery_uri,
-            "level": "all",
-            "max_chars": 12000,
-            "recover_original": True,
-            "session_id": None,
-            "agent_id": None,
-            "transport_headers": {},
-            "allow_stdio_env_auth": True,
-            "resolved_identity": None,
-        }
-    ]
-
-
-def test_default_toolset_read_memory_still_delegates_generic_memory(monkeypatch):
-    calls = []
-
-    def fake_read_memory(service, **kwargs):
-        calls.append(kwargs)
-        return {"uri": kwargs["uri"], "content": "dark"}
-
-    monkeypatch.setattr("server.mcp_server.read_memory_tool", fake_read_memory)
-    mcp = create_mcp_server(service=_FakeService(), config=OgMemConfig())
-    tool = mcp._tool_manager.get_tool("ogm_read_memory")
-
-    uri = "ogmemory://memories/preference/editor"
-    result = tool.fn(uri=uri)
-
-    assert result == {"uri": uri, "content": "dark"}
-    assert calls[0]["recover_original"] is False
-
-
 def test_create_mcp_server_applies_streamable_http_settings():
     cfg = OgMemConfig(mcp_host="127.0.0.1", mcp_port=8092, mcp_path="/custom-mcp")
 
@@ -1024,6 +707,8 @@ def test_mcp_http_app_exposes_dispose_on_same_service():
     assert service.build_context_params == {"sessionId": "s1", "agentId": "eval-agent"}
     assert service.build_context_identity.role == Role.MEMBER
     assert service.dispose_params["_ctx"] == "ctx-from-same-service"
+
+
 def test_mcp_http_static_resource_preserves_request_headers(monkeypatch):
     captured = {}
 

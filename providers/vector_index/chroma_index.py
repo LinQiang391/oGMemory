@@ -17,7 +17,6 @@ from typing import Any
 from core.interfaces import VectorIndex
 from core.memory_names import memory_directory
 from core.models import IndexRecord, SeedHit
-from core.resource_identity import CODE_INDEX_METADATA_FIELDS
 
 logger = logging.getLogger(__name__)
 
@@ -309,7 +308,6 @@ class ChromaVectorIndex(VectorIndex):
             "unit_key",
             "agent_memory_unit_key",
             "unit_revision",
-            *CODE_INDEX_METADATA_FIELDS,
         ):
             val = record.metadata.get(key) if record.metadata else None
             if val is not None:
@@ -333,7 +331,7 @@ class ChromaVectorIndex(VectorIndex):
                     conditions.append({"level": {"$in": expected}})
                 else:
                     conditions.append({"level": expected})
-            elif key in ("account_id", "owner_space", "resource_type", "uri"):
+            elif key in ("account_id", "owner_space", "uri"):
                 if isinstance(expected, list):
                     conditions.append({key: {"$in": expected}})
                 else:

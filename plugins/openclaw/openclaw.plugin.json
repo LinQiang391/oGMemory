@@ -4,9 +4,6 @@
   "description": "oGMemory integration plugin for OpenClaw. Implements long-term memory with semantic search and knowledge extraction. Automatically starts AGFS + ContextEngine services on gateway startup.",
   "version": "1.0.0",
   "kind": "context-engine",
-  "contracts": {
-    "agentToolResultMiddleware": ["openclaw"]
-  },
   "configSchema": {
     "type": "object",
     "additionalProperties": false,
@@ -73,7 +70,7 @@
       },
       "autoCapture": {
         "type": "boolean",
-        "description": "Automatically buffer and capture new turns via ingest/afterTurn. Does not disable explicit compact, cleanup of existing buffers, trace uploads or tool-result externalization. Env: OGMEM_AUTO_CAPTURE"
+        "description": "Controls automatic ingest/afterTurn capture. Explicit compaction, cleanup and trace uploads retain their own controls. Env: OGMEM_AUTO_CAPTURE"
       },
       "autoRecall": {
         "type": "boolean",
@@ -88,32 +85,6 @@
         "type": "integer",
         "description": "Maximum prefetch hits to stage in the session topic buffer.",
         "default": 5
-      },
-      "toolResultExternalizationEnabled": {
-        "type": "boolean",
-        "description": "Enable optional large tool-result lifecycle transport and retry support. Stable host source identity is attached when available; user_message mode can use the server Turn Ledger when OpenClaw has no message IDs. Keep aligned with the oGMemory server setting.",
-        "default": false
-      },
-      "toolResultFirstViewExternalizationEnabled": {
-        "type": "boolean",
-        "description": "When externalization is enabled, intercept qualifying tool results after execution and replace them before their first model request. Env: OGMEM_TOOL_RESULT_FIRST_VIEW_ENABLED",
-        "default": true
-      },
-      "toolResultFirstViewMinChars": {
-        "type": "integer",
-        "minimum": 1,
-        "description": "Local prefilter before calling the first-view governance endpoint. Keep aligned with tool_result_externalization.single_result_chars. Env: OGMEM_TOOL_RESULT_FIRST_VIEW_MIN_CHARS",
-        "default": 20000
-      },
-      "toolResultFirstViewStateDir": {
-        "type": "string",
-        "description": "Private 0700 directory for the HMAC-attested active user_message Turn lease shared across OpenClaw plugin registry passes. Defaults under OPENCLAW_STATE_DIR. Env: OGMEM_TOOL_RESULT_FIRST_VIEW_STATE_DIR"
-      },
-      "semanticTurnMode": {
-        "type": "string",
-        "enum": ["user_message"],
-        "description": "Tool-result externalization lifecycle. OpenClaw currently supports one complete user-message Turn; the option is retained for future lifecycle extensions.",
-        "default": "user_message"
       },
       "compactTakeoverEnabled": {
         "type": "boolean",

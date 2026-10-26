@@ -1,3 +1,0 @@
-# Install the current oGMemory checkout separately: pip install -e ../..
-swebench==4.1.0
-PyYAML==6.0.3

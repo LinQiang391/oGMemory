@@ -1,11 +1,10 @@
 """Unit tests for AGFSContextFS URI to path mapping."""
 
-import json
 import time
+from threading import RLock, Event
 from concurrent.futures import ThreadPoolExecutor
-from dataclasses import replace
-from threading import Barrier, Event, RLock
 from types import SimpleNamespace
+import json
 from unittest.mock import Mock
 
 import pytest
@@ -21,7 +20,6 @@ from core.errors import (
     NodeNotFoundError,
 )
 from core.models import CandidateMemory, ContextNode, RequestContext, Role
-from core.resource_identity import CODE_WORKSPACE_SYNC_BINDINGS_ROOT_ID, RootBindingError
 from core.uri_resolver import URIResolver
 from core.validation import validate_candidate
 from extraction.schemas.registry import SchemaRegistry
@@ -29,33 +27,7 @@ from fs.agfs_adapter.agfs_context_fs import AGFSContextFS, build_uri, parse_uri,
 from providers.unified_config import OgMemConfig
 from server.mcp_tools import _list_memory_node_entries_page, _memory_list_cursor
 from server.memory_service import MemoryService
-from service.code_resource_lifecycle import CodeResourceLifecycleService
 from session.archive_store import SessionArchiveStore
-
-
-def _raise_for_missing_tombstone(path):
-    if str(path).endswith(AGFSContextFS.FILE_DELETE_TOMBSTONE):
-        raise AGFSClientError("No such file")
-
-
-_INVALID_RESOURCE_URI_SLUGS = (
-    ".",
-    "..",
-    "foo/bar",
-    r"foo\bar",
-    "%2F",
-    "%2f",
-    "%5C",
-    "%5c",
-    "%2E",
-    "%2e%2e",
-    "%2E%2e",
-    "foo%2F..%2F_sensitive",
-    "foo%252Fbar",
-    "foo%41",
-    "foo bar",
-    "foo+bar",
-)
 
 
 class _MemoryAGFSClient:
@@ -328,7 +300,7 @@ class _AtomicMemoryAGFSClient:
             self.operations.append(("rm", target, recursive))
 
 
-def _atomic_code_context() -> RequestContext:
+def _memory_context() -> RequestContext:
     return RequestContext(
         account_id="acme",
         user_id="alice",
@@ -338,57 +310,12 @@ def _atomic_code_context() -> RequestContext:
     )
 
 
-def _atomic_code_node(
-    *,
-    description: str | None = None,
-    expected_version: int = 0,
-) -> ContextNode:
-    metadata = {
-        "_expected_version": expected_version,
-        "resource_type": "code",
-        "resource_root_slug": "repo",
-        "root_fingerprint": "f" * 64,
-        "file_key": "a" * 64,
-        "file_slug": "a" * 32,
-        "relative_path": "src/service.py",
-        "source_extension": ".py",
-        "language": "python",
-        "start_line": 1,
-        "end_line": 2,
-        "symbol": "load_config",
-        "symbol_kind": "function",
-        "signature": "load_config(path)",
-        "chunk_hash": "b" * 64,
-        "chunk_key": "c" * 64,
-    }
-    if description is not None:
-        metadata["description"] = description
-    return ContextNode(
-        uri="ctx://acme/resources/" + "d" * 32,
-        context_type="RESOURCE",
-        category="code",
-        level=4,
-        owner_space="resource:acme",
-        abstract="load config",
-        overview="path: src/service.py",
-        content="def load_config(path):\n    return path\n",
-        metadata=metadata,
-    )
-
-
-def _atomic_code_stack():
-    client = _AtomicMemoryAGFSClient()
-    fs = AGFSContextFS(client, mount_prefix="/local")
-    outbox = OutboxStore(client=client, fs=fs, mount_prefix="/local")
-    return client, fs, outbox
-
-
 def test_memory_identity_lock_serializes_two_agfs_adapters():
     client = _AtomicMemoryAGFSClient()
     first = AGFSContextFS(client, mount_prefix="/local")
     second = AGFSContextFS(client, mount_prefix="/local")
     directory = "ctx://acme/users/alice/memories/preferences"
-    ctx = _atomic_code_context()
+    ctx = _memory_context()
     entered = Event()
 
     def acquire_second():
@@ -401,194 +328,6 @@ def test_memory_identity_lock_serializes_two_agfs_adapters():
             assert not entered.wait(0.1)
         pending.result(timeout=3)
     assert entered.is_set()
-
-
-def _atomic_lifecycle(fs, outbox) -> CodeResourceLifecycleService:
-    return CodeResourceLifecycleService(
-        context_fs=fs,
-        outbox_store=outbox,
-        config=SimpleNamespace(
-            code_resources_enabled=True,
-            code_resources_target_chars=2500,
-            code_resources_overlap_chars=300,
-            code_resources_chunk_max_chars=4000,
-            code_resources_max_files=5000,
-        ),
-    )
-
-
-@pytest.mark.parametrize(
-    ("first", "second"),
-    [
-        (("shared", "a" * 64), ("shared", "b" * 64)),
-        (("first", "a" * 64), ("second", "a" * 64)),
-    ],
-)
-def test_agfs_workspace_root_binding_is_atomic_across_instances(first, second):
-    client = _AtomicMemoryAGFSClient()
-    filesystems = [
-        AGFSContextFS(client, mount_prefix="/local"),
-        AGFSContextFS(client, mount_prefix="/local"),
-    ]
-    ctx = _atomic_code_context()
-    ready = Barrier(2)
-
-    def reserve(fs, binding):
-        ready.wait(timeout=2)
-        try:
-            return fs.reserve_code_workspace_root_binding(
-                ctx=ctx,
-                root_slug=binding[0],
-                root_fingerprint=binding[1],
-            )
-        except Exception as exc:  # noqa: BLE001 - asserted below
-            return exc
-
-    with ThreadPoolExecutor(max_workers=2) as executor:
-        results = list(
-            executor.map(
-                reserve,
-                filesystems,
-                (first, second),
-            )
-        )
-
-    successes = [result for result in results if isinstance(result, tuple)]
-    failures = [result for result in results if isinstance(result, Exception)]
-    assert len(successes) == 1
-    assert len(failures) == 1
-    assert isinstance(failures[0], RootBindingError)
-    root_id, root_slug, root_fingerprint = successes[0]
-    state_path = (
-        "/local/accounts/acme/_system/code_workspace_sync/"
-        f"{CODE_WORKSPACE_SYNC_BINDINGS_ROOT_ID}.json"
-    )
-    assert state_path in client.files
-    assert filesystems[0].read_code_workspace_root_binding(
-        ctx=ctx,
-        root_slug=root_slug,
-    ) == (root_id, root_slug, root_fingerprint)
-    assert filesystems[1].read_code_workspace_root_binding(
-        ctx=ctx,
-        root_fingerprint=root_fingerprint,
-    ) == (root_id, root_slug, root_fingerprint)
-    assert not any("/resources/" in operation[1] for operation in client.operations)
-    assert not any("/.outbox" in operation[1] for operation in client.operations)
-
-
-def test_agfs_workspace_binding_lost_owner_cannot_publish_over_successor():
-    client = _AtomicMemoryAGFSClient()
-    fs = AGFSContextFS(client, mount_prefix="/local")
-    ctx = _atomic_code_context()
-    state_path = (
-        "/local/accounts/acme/_system/code_workspace_sync/"
-        f"{CODE_WORKSPACE_SYNC_BINDINGS_ROOT_ID}.json"
-    )
-    lock_path = state_path + ".lock"
-
-    def after_write(path, _content):
-        if path.startswith(state_path + ".mutation-"):
-            client.files[lock_path] = json.dumps(
-                {
-                    "kind": "code_workspace_sync_mutex",
-                    "token": "successor",
-                    "expires_at": time.time() + 60,
-                }
-            ).encode("utf-8")
-
-    client.after_write = after_write
-
-    with pytest.raises(RuntimeError, match="lost AGFS workspace root binding mutex"):
-        fs.reserve_code_workspace_root_binding(
-            ctx=ctx,
-            root_slug="repo",
-            root_fingerprint="a" * 64,
-        )
-
-    assert state_path not in client.files
-    assert json.loads(client.files[lock_path])["token"] == "successor"
-
-
-def test_agfs_workspace_binding_recovery_fences_expired_owner_publish():
-    client = _AtomicMemoryAGFSClient()
-    first_fs = AGFSContextFS(client, mount_prefix="/local")
-    second_fs = AGFSContextFS(client, mount_prefix="/local")
-    ctx = _atomic_code_context()
-    state_path = (
-        "/local/accounts/acme/_system/code_workspace_sync/"
-        f"{CODE_WORKSPACE_SYNC_BINDINGS_ROOT_ID}.json"
-    )
-    lock_path = state_path + ".lock"
-    first_state_publish = Event()
-    release_first_publish = Event()
-
-    def before_mv(source, destination):
-        if destination == state_path and not first_state_publish.is_set():
-            first_state_publish.set()
-            assert release_first_publish.wait(3)
-
-    client.before_mv = before_mv
-
-    with ThreadPoolExecutor(max_workers=2) as executor:
-        first_future = executor.submit(
-            first_fs.reserve_code_workspace_root_binding,
-            ctx=ctx,
-            root_slug="first",
-            root_fingerprint="a" * 64,
-        )
-        assert first_state_publish.wait(3)
-        with client._lock:
-            marker = json.loads(client.files[lock_path])
-            marker["expires_at"] = time.time() - 1
-            client.files[lock_path] = json.dumps(marker).encode("utf-8")
-
-        second_result = second_fs.reserve_code_workspace_root_binding(
-            ctx=ctx,
-            root_slug="second",
-            root_fingerprint="b" * 64,
-        )
-        release_first_publish.set()
-        with pytest.raises(AGFSClientError):
-            first_future.result(timeout=5)
-
-    assert second_fs.read_code_workspace_root_binding(
-        ctx=ctx,
-        root_slug="second",
-    ) == second_result
-    assert second_fs.read_code_workspace_root_binding(
-        ctx=ctx,
-        root_slug="first",
-    ) is None
-
-
-def test_agfs_workspace_binding_does_not_reclaim_uninitialized_lock(monkeypatch):
-    client = _AtomicMemoryAGFSClient()
-    fs = AGFSContextFS(client, mount_prefix="/local")
-    ctx = _atomic_code_context()
-    state_path = (
-        "/local/accounts/acme/_system/code_workspace_sync/"
-        f"{CODE_WORKSPACE_SYNC_BINDINGS_ROOT_ID}.json"
-    )
-    lock_path = state_path + ".lock"
-    fs._mkdir_p(lock_path.rsplit("/", 1)[0])
-    client.create(lock_path)
-    monkeypatch.setattr(
-        "fs.agfs_adapter.agfs_context_fs._WORKSPACE_BINDING_MUTEX_TIMEOUT_SECONDS",
-        0.01,
-    )
-    monkeypatch.setattr(
-        "fs.agfs_adapter.agfs_context_fs._WORKSPACE_BINDING_MUTEX_POLL_SECONDS",
-        0.001,
-    )
-
-    with pytest.raises(RuntimeError, match="transition is busy"):
-        fs.reserve_code_workspace_root_binding(
-            ctx=ctx,
-            root_slug="repo",
-            root_fingerprint="a" * 64,
-        )
-
-    assert lock_path in client.files
 
 
 class TestUriToPath:
@@ -672,29 +411,6 @@ class TestUriToPath:
         with pytest.raises(ValueError, match="Invalid URI format"):
             uri_to_path(f"ctx://acme/users/alice/memories/entities/{slug}")
 
-    @pytest.mark.parametrize(
-        "slug",
-        _INVALID_RESOURCE_URI_SLUGS,
-    )
-    def test_resource_slug_rejects_path_segments_and_encoding(self, slug):
-        uri = f"ctx://acme/resources/{slug}"
-
-        with pytest.raises(ValueError):
-            uri_to_path(uri)
-
-    @pytest.mark.parametrize(
-        "slug",
-        ["a" * 32, "dataset", "repo-name_01", "repo.v1"],
-    )
-    def test_resource_slug_round_trip_uses_one_direct_child(self, slug):
-        uri = f"ctx://acme/resources/{slug}"
-
-        parsed = parse_uri(uri)
-
-        assert parsed["slug"] == slug
-        assert build_uri(**parsed) == uri
-        assert uri_to_path(uri) == f"/accounts/acme/resources/{slug}/"
-
     def test_invalid_uri_format(self):
         """Test that invalid URI format raises ValueError."""
         with pytest.raises(ValueError, match="Invalid URI format"):
@@ -764,14 +480,6 @@ class TestParseUri:
         uri = "ctx://acme/users/alice/memories/preferences/coffee%20shop"
         result = parse_uri(uri)
         assert result['slug'] == 'coffee shop'
-
-    @pytest.mark.parametrize(
-        "slug",
-        _INVALID_RESOURCE_URI_SLUGS,
-    )
-    def test_parse_resource_uri_rejects_unsafe_slug(self, slug):
-        with pytest.raises(ValueError):
-            parse_uri(f"ctx://acme/resources/{slug}")
 
     def test_parse_invalid_uri(self):
         """Test that invalid URI raises ValueError."""
@@ -1121,34 +829,6 @@ class TestEnsureAccessible:
             fs._ensure_accessible(uri, ctx)
         assert "Invalid URI format" in str(exc_info.value.reason)
 
-    def test_encoded_resource_traversal_is_denied_before_client_access(self):
-        client = Mock()
-        fs = AGFSContextFS(client)
-        ctx = RequestContext(
-            account_id="acme",
-            user_id="alice",
-            agent_id="gpt-4",
-            session_id="session-123",
-            trace_id="trace-456",
-        )
-        uri = "ctx://acme/resources/foo%2F..%2F_sensitive"
-        node = replace(_atomic_code_node(), uri=uri)
-
-        operations = (
-            lambda: fs.read_node(uri, ctx),
-            lambda: fs.write_node(node, ctx),
-            lambda: fs.delete_node(uri, ctx),
-        )
-        for operation in operations:
-            client.reset_mock()
-            with pytest.raises(AccessDeniedError):
-                operation()
-            assert client.method_calls == []
-
-        client.reset_mock()
-        assert fs.exists(uri, ctx) is False
-        assert client.method_calls == []
-
 
 class TestWriteNode:
     """Tests for write_node method."""
@@ -1164,7 +844,6 @@ class TestWriteNode:
             session_id="session-123",
             trace_id="trace-456",
         )
-        self.mock_client.read.side_effect = AGFSClientError("No such file")
 
     def test_write_node_creates_files_in_order(self):
         """Test that write_node creates files in the correct order."""
@@ -1272,7 +951,6 @@ class TestWriteNode:
 
     def test_versioned_update_publishes_metadata_atomically(self):
         def read(path):
-            _raise_for_missing_tombstone(path)
             if path.endswith("transaction.json"):
                 marker_write = next(
                     call for call in reversed(self.mock_client.write.call_args_list)
@@ -1365,7 +1043,6 @@ class TestWriteNode:
                 acquired = True
 
         def read(path):
-            _raise_for_missing_tombstone(path)
             if path.endswith("lease-old-owner.json"):
                 return json.dumps({
                     "owner_token": "old-owner",
@@ -1501,7 +1178,6 @@ class TestWriteNode:
                 acquired = True
 
         def read(path):
-            _raise_for_missing_tombstone(path)
             if path.endswith("transaction.json"):
                 owner = "successor" if acquired else "initial"
                 return json.dumps({"owner_token": owner}).encode()
@@ -1534,495 +1210,6 @@ class TestWriteNode:
         )
 
 
-class TestAtomicCodeResourceWrite:
-    @pytest.mark.parametrize("failure_point", ["payload", "event", "publish"])
-    def test_new_node_failure_never_exposes_node_without_event(self, failure_point):
-        client, fs, outbox = _atomic_code_stack()
-        node = _atomic_code_node()
-        event = outbox.build_write_event(node)
-        final_path = fs._uri_to_agfs_path(node.uri).rstrip("/")
-        final_event = final_path + f"/.outbox/{event.event_id}.json"
-
-        if failure_point in {"payload", "event"}:
-            def before_write(path, _content):
-                if "resource-create-" not in path:
-                    return
-                if failure_point == "payload" and path.endswith("/content.md"):
-                    raise RuntimeError("payload staging failed")
-                if failure_point == "event" and path.endswith(
-                    f"/.outbox/{event.event_id}.json"
-                ):
-                    raise RuntimeError("event staging failed")
-
-            client.before_write = before_write
-        else:
-            def before_mv(_source, destination):
-                if destination == final_path:
-                    raise RuntimeError("final publish failed")
-
-            client.before_mv = before_mv
-
-        with pytest.raises(RuntimeError, match="failed"):
-            fs.write_node_with_outbox(node, _atomic_code_context(), event)
-
-        assert final_path not in client.directories
-        assert final_path + "/.meta.json" not in client.files
-        assert final_event not in client.files
-        assert not any("resource-create-" in path for path in client.directories)
-
-    def test_new_node_uses_one_final_atomic_directory_publish(self):
-        client, fs, outbox = _atomic_code_stack()
-        node = _atomic_code_node()
-        event = outbox.build_write_event(node)
-        final_path = fs._uri_to_agfs_path(node.uri).rstrip("/")
-        staged_event_was_hidden = False
-
-        def after_write(path, _content):
-            nonlocal staged_event_was_hidden
-            if "resource-create-" in path and path.endswith(
-                f"/.outbox/{event.event_id}.json"
-            ):
-                assert outbox.list_pending("acme") == []
-                assert outbox.count_unfinished("acme")["total"] == 0
-                staged_event_was_hidden = True
-
-        client.after_write = after_write
-
-        fs.write_node_with_outbox(node, _atomic_code_context(), event)
-
-        publishes = [
-            operation
-            for operation in client.operations
-            if operation[0] == "mv" and operation[2] == final_path
-        ]
-        assert len(publishes) == 1
-        assert "resource-create-" in publishes[0][1]
-        assert staged_event_was_hidden is True
-        assert final_path + "/.meta.json" in client.files
-        assert final_path + f"/.outbox/{event.event_id}.json" in client.files
-        assert len(outbox.list_pending("acme")) == 1
-
-    def test_new_node_atomically_reclaims_verified_empty_destination(self):
-        client, fs, outbox = _atomic_code_stack()
-        node = _atomic_code_node()
-        event = outbox.build_write_event(node)
-        final_path = fs._uri_to_agfs_path(node.uri).rstrip("/")
-        client.mkdir(final_path)
-
-        fs.write_node_with_outbox(node, _atomic_code_context(), event)
-
-        assert fs.exists(node.uri, _atomic_code_context()) is True
-        assert final_path + f"/.outbox/{event.event_id}.json" in client.files
-        empty_removal = next(
-            index
-            for index, operation in enumerate(client.operations)
-            if operation[:2] == ("rm", final_path)
-        )
-        final_publish = next(
-            index
-            for index, operation in enumerate(client.operations)
-            if operation[0] == "mv" and operation[2] == final_path
-        )
-        assert empty_removal < final_publish
-
-    def test_new_node_rejects_nonempty_destination_without_metadata(self):
-        client, fs, outbox = _atomic_code_stack()
-        node = _atomic_code_node()
-        event = outbox.build_write_event(node)
-        final_path = fs._uri_to_agfs_path(node.uri).rstrip("/")
-        unexpected_path = final_path + "/unexpected.txt"
-        client.mkdir(final_path)
-        client.write(unexpected_path, b"do not delete")
-
-        with pytest.raises(RuntimeError, match="non-empty"):
-            fs.write_node_with_outbox(node, _atomic_code_context(), event)
-
-        assert client.files[unexpected_path] == b"do not delete"
-        assert not any(
-            operation[0] == "rm" and operation[1] == final_path
-            for operation in client.operations
-        )
-
-    def test_batch_failure_leaves_every_visible_node_with_an_outbox_event(self):
-        client, fs, outbox = _atomic_code_stack()
-        ctx = _atomic_code_context()
-        first = _atomic_code_node()
-        second = replace(
-            first,
-            uri="ctx://acme/resources/" + "e" * 32,
-            metadata={
-                **first.metadata,
-                "file_key": "e" * 64,
-                "file_slug": "e" * 32,
-                "chunk_key": "f" * 64,
-            },
-        )
-        lifecycle = _atomic_lifecycle(fs, outbox)
-        staged_events = 0
-
-        def before_write(path, _content):
-            nonlocal staged_events
-            if "resource-create-" not in path or "/.outbox/" not in path:
-                return
-            staged_events += 1
-            if staged_events == 2:
-                raise RuntimeError("second event staging failed")
-
-        client.before_write = before_write
-
-        with pytest.raises(RuntimeError, match="second event staging failed"):
-            lifecycle._write_nodes([first, second], ctx)
-
-        visible_uris = {
-            node.uri for node in (first, second) if fs.exists(node.uri, ctx)
-        }
-        pending_uris = {event.uri for _uri, event in outbox.list_pending("acme")}
-        assert visible_uris == {first.uri}
-        assert pending_uris == visible_uris
-
-    def test_ambiguous_final_move_is_accepted_only_when_full_commit_is_visible(self):
-        client, fs, outbox = _atomic_code_stack()
-        node = _atomic_code_node()
-        event = outbox.build_write_event(node)
-        final_path = fs._uri_to_agfs_path(node.uri).rstrip("/")
-
-        def after_mv(_source, destination):
-            if destination == final_path:
-                raise RuntimeError("lost final mv response")
-
-        client.after_mv = after_mv
-
-        fs.write_node_with_outbox(node, _atomic_code_context(), event)
-
-        assert fs.exists(node.uri, _atomic_code_context()) is True
-        assert final_path + f"/.outbox/{event.event_id}.json" in client.files
-
-    def test_ambiguous_final_move_with_unverifiable_result_fails_closed(self):
-        client, fs, outbox = _atomic_code_stack()
-        node = _atomic_code_node()
-        event = outbox.build_write_event(node)
-        final_path = fs._uri_to_agfs_path(node.uri).rstrip("/")
-        final_event = final_path + f"/.outbox/{event.event_id}.json"
-
-        def after_mv(_source, destination):
-            if destination == final_path:
-                def before_read(path):
-                    if path == final_event:
-                        raise RuntimeError("verification unavailable")
-
-                client.before_read = before_read
-                raise RuntimeError("lost final mv response")
-
-        client.after_mv = after_mv
-
-        with pytest.raises(
-            RuntimeError,
-            match="publish outcome cannot be proven",
-        ):
-            fs.write_node_with_outbox(node, _atomic_code_context(), event)
-
-        # The backend may have committed, but the caller never guesses when
-        # it cannot verify both the node and its exact event.
-        assert final_path + "/.meta.json" in client.files
-        assert final_event in client.files
-
-    def test_existing_same_records_publishes_event_before_metadata_rewrite(self):
-        client, fs, outbox = _atomic_code_stack()
-        ctx = _atomic_code_context()
-        node = _atomic_code_node(description="old")
-        fs.write_node_with_outbox(node, ctx, outbox.build_write_event(node))
-        client.operations.clear()
-
-        updated = _atomic_code_node(description="new", expected_version=1)
-        event = outbox.build_write_event(updated)
-        fs.write_node_with_outbox(updated, ctx, event)
-
-        node_path = fs._uri_to_agfs_path(node.uri)
-        event_path = node_path + f".outbox/{event.event_id}.json"
-        meta_path = node_path + fs.FILE_META
-        event_publish = next(
-            index
-            for index, operation in enumerate(client.operations)
-            if operation[0] == "mv" and operation[2] == event_path
-        )
-        meta_publish = next(
-            index
-            for index, operation in enumerate(client.operations)
-            if operation[0] == "mv" and operation[2] == meta_path
-        )
-        assert event_publish < meta_publish
-        refreshed = fs.read_node(node.uri, ctx)
-        assert refreshed.metadata["description"] == "new"
-        assert refreshed.metadata["version"] == 2
-        assert not any(
-            operation[0] == "write"
-            and operation[1] in {
-                node_path + fs.FILE_CONTENT,
-                node_path + fs.FILE_ABSTRACT,
-                node_path + fs.FILE_OVERVIEW,
-            }
-            for operation in client.operations
-        )
-
-    def test_existing_node_rejects_create_only_and_stale_version_writes(self):
-        client, fs, outbox = _atomic_code_stack()
-        ctx = _atomic_code_context()
-        node = _atomic_code_node(description="original")
-        fs.write_node_with_outbox(node, ctx, outbox.build_write_event(node))
-
-        duplicate_create = _atomic_code_node(description="original")
-        with pytest.raises(ConcurrentModificationError):
-            fs.write_node_with_outbox(
-                duplicate_create,
-                ctx,
-                outbox.build_write_event(duplicate_create),
-            )
-
-        updated = _atomic_code_node(description="updated", expected_version=1)
-        fs.write_node_with_outbox(updated, ctx, outbox.build_write_event(updated))
-        assert fs.read_node(node.uri, ctx).metadata["version"] == 2
-
-        stale = _atomic_code_node(description="stale", expected_version=1)
-        with pytest.raises(ConcurrentModificationError):
-            fs.write_node_with_outbox(stale, ctx, outbox.build_write_event(stale))
-        assert fs.read_node(node.uri, ctx).metadata["description"] == "updated"
-
-    def test_existing_different_records_fail_before_node_or_event_mutation(self):
-        client, fs, outbox = _atomic_code_stack()
-        ctx = _atomic_code_context()
-        node = _atomic_code_node()
-        fs.write_node_with_outbox(node, ctx, outbox.build_write_event(node))
-        client.operations.clear()
-
-        changed = replace(
-            node,
-            content=node.content + "# changed\n",
-            metadata={**node.metadata, "_expected_version": 1},
-        )
-        event = outbox.build_write_event(changed)
-        with pytest.raises(RuntimeError, match="different index records"):
-            fs.write_node_with_outbox(changed, ctx, event)
-
-        assert not any(
-            operation[0] == "write"
-            and (
-                "/.outbox/.mutation-" in operation[1]
-                or "/.meta.mutation-" in operation[1]
-            )
-            for operation in client.operations
-        )
-        assert fs.read_node(node.uri, ctx).content == node.content
-
-    def test_existing_nonmetadata_payload_change_fails_before_mutation(self):
-        client, fs, outbox = _atomic_code_stack()
-        ctx = _atomic_code_context()
-        node = _atomic_code_node()
-        fs.write_node_with_outbox(node, ctx, outbox.build_write_event(node))
-        client.operations.clear()
-
-        changed = replace(
-            node,
-            overview=node.overview + " (renamed)",
-            metadata={**node.metadata, "_expected_version": 1},
-        )
-        event = outbox.build_write_event(changed)
-        with pytest.raises(RuntimeError, match="different stored payload"):
-            fs.write_node_with_outbox(changed, ctx, event)
-
-        assert not any(
-            operation[0] == "write"
-            and (
-                "/.outbox/.mutation-" in operation[1]
-                or "/.meta.mutation-" in operation[1]
-            )
-            for operation in client.operations
-        )
-        assert fs.read_node(node.uri, ctx).overview == node.overview
-
-    def test_existing_metadata_failure_leaves_published_semantically_valid_event(self):
-        client, fs, outbox = _atomic_code_stack()
-        ctx = _atomic_code_context()
-        node = _atomic_code_node(description="old")
-        fs.write_node_with_outbox(node, ctx, outbox.build_write_event(node))
-        updated = _atomic_code_node(description="new", expected_version=1)
-        event = outbox.build_write_event(updated)
-        meta_path = fs._uri_to_agfs_path(node.uri) + fs.FILE_META
-
-        def before_mv(source, destination):
-            if ".meta.mutation-" in source and destination == meta_path:
-                raise RuntimeError("metadata publish failed")
-
-        client.before_mv = before_mv
-
-        with pytest.raises(RuntimeError, match="metadata publish failed"):
-            fs.write_node_with_outbox(updated, ctx, event)
-
-        event_path = fs._uri_to_agfs_path(node.uri) + f".outbox/{event.event_id}.json"
-        assert event_path in client.files
-        assert fs.read_node(node.uri, ctx).metadata["description"] == "old"
-
-    def test_stale_mutation_lock_recovery_invalidates_old_publish_sources(self):
-        client, fs, _outbox = _atomic_code_stack()
-        node = _atomic_code_node()
-        ctx = _atomic_code_context()
-        node_path = fs._uri_to_agfs_path(node.uri)
-        lock_path = fs._resource_mutation_lock_path(node_path)
-        owner_token = "old-owner"
-        staging_path = fs._resource_mutation_publish_paths(
-            node_path,
-            owner_token,
-        )[0]
-        client.mkdir(lock_path)
-        client.write(
-            lock_path + "/transaction.json",
-            json.dumps(
-                {
-                    "kind": "CODE_RESOURCE_MUTATION_LOCK",
-                    "uri": node.uri,
-                    "owner_token": owner_token,
-                }
-            ).encode(),
-        )
-        client.write(
-            lock_path + f"/lease-{owner_token}.json",
-            json.dumps(
-                {
-                    "owner_token": owner_token,
-                    "lease_updated_at": "2000-01-01T00:00:00+00:00",
-                }
-            ).encode(),
-        )
-        client.mkdir(staging_path)
-        client.write(staging_path + "/content.md", b"stale")
-
-        with fs.resource_mutation_lock(node.uri, ctx) as lease:
-            lease.ensure_owned()
-            assert staging_path not in client.directories
-
-        assert lock_path not in client.directories
-        removed = [operation[1] for operation in client.operations if operation[0] == "rm"]
-        assert staging_path in removed
-
-    def test_lost_lock_owner_cannot_publish_and_does_not_remove_successor_lock(self):
-        client, fs, outbox = _atomic_code_stack()
-        node = _atomic_code_node()
-        event = outbox.build_write_event(node)
-        node_path = fs._uri_to_agfs_path(node.uri)
-        lock_path = fs._resource_mutation_lock_path(node_path)
-        marker_path = lock_path + "/transaction.json"
-
-        def after_write(path, _content):
-            if "resource-create-" in path and path.endswith(
-                f"/.outbox/{event.event_id}.json"
-            ):
-                client.files[marker_path] = json.dumps(
-                    {
-                        "kind": "CODE_RESOURCE_MUTATION_LOCK",
-                        "uri": node.uri,
-                        "owner_token": "successor",
-                    }
-                ).encode()
-
-        client.after_write = after_write
-
-        with pytest.raises(RuntimeError, match="lost AGFS code-resource mutation lock"):
-            fs.write_node_with_outbox(node, _atomic_code_context(), event)
-
-        assert node_path.rstrip("/") not in client.directories
-        assert json.loads(client.files[marker_path])["owner_token"] == "successor"
-        assert lock_path in client.directories
-
-    @pytest.mark.parametrize("first", ["write", "delete"])
-    def test_write_delete_share_uri_lock_and_never_resurrect(self, first):
-        client, writer_fs, writer_outbox = _atomic_code_stack()
-        delete_fs = AGFSContextFS(client, mount_prefix="/local")
-        delete_outbox = OutboxStore(client=client, fs=delete_fs, mount_prefix="/local")
-        ctx = _atomic_code_context()
-        node = _atomic_code_node(description="old")
-        writer_fs.write_node_with_outbox(
-            node,
-            ctx,
-            writer_outbox.build_write_event(node),
-        )
-        updated = _atomic_code_node(description="new", expected_version=1)
-        update_event = writer_outbox.build_write_event(updated)
-        lifecycle = _atomic_lifecycle(delete_fs, delete_outbox)
-        first_holds_lock = Event()
-        allow_first_to_finish = Event()
-        second_attempted_lock = Event()
-        node_path = writer_fs._uri_to_agfs_path(node.uri)
-        canonical_lock = writer_fs._resource_mutation_lock_path(node_path)
-        tombstone_path = node_path + writer_fs.FILE_DELETE_TOMBSTONE
-
-        def before_mv(source, destination):
-            if destination == canonical_lock and first_holds_lock.is_set():
-                second_attempted_lock.set()
-            if first == "write" and destination.endswith(
-                f"/.outbox/{update_event.event_id}.json"
-            ):
-                first_holds_lock.set()
-                assert allow_first_to_finish.wait(3)
-            if first == "delete" and destination == tombstone_path:
-                first_holds_lock.set()
-                assert allow_first_to_finish.wait(3)
-
-        client.before_mv = before_mv
-
-        with ThreadPoolExecutor(max_workers=2) as executor:
-            if first == "write":
-                first_future = executor.submit(
-                    writer_fs.write_node_with_outbox,
-                    updated,
-                    ctx,
-                    update_event,
-                )
-                assert first_holds_lock.wait(3)
-                second_future = executor.submit(
-                    lifecycle.delete,
-                    slug=str(node.metadata["file_slug"]),
-                    ctx=ctx,
-                )
-            else:
-                first_future = executor.submit(
-                    lifecycle.delete,
-                    slug=str(node.metadata["file_slug"]),
-                    ctx=ctx,
-                )
-                assert first_holds_lock.wait(3)
-                second_future = executor.submit(
-                    writer_fs.write_node_with_outbox,
-                    updated,
-                    ctx,
-                    update_event,
-                )
-
-            assert second_attempted_lock.wait(3)
-            allow_first_to_finish.set()
-            first_result = first_future.result(timeout=5)
-            if first == "write":
-                assert first_result is None
-                assert second_future.result(timeout=5)["nodes_deleted"] == 1
-            else:
-                assert first_result["nodes_deleted"] == 1
-                with pytest.raises(
-                    RuntimeError,
-                    match="durable deletion is pending",
-                ):
-                    second_future.result(timeout=5)
-
-        assert delete_fs.is_tombstoned(node.uri, ctx) is True
-        assert delete_fs.exists(node.uri, ctx) is False
-        lock_destinations = [
-            operation[2]
-            for operation in client.operations
-            if operation[0] == "mv" and operation[2].endswith(
-                ".resource-mutation-lock"
-            )
-        ]
-        assert len(lock_destinations) >= 3
-        assert set(lock_destinations) == {canonical_lock}
-
-
 class TestReadNode:
     """Tests for read_node method."""
 
@@ -2043,7 +1230,6 @@ class TestReadNode:
 
     def _mock_read(self, path):
         """Mock read implementation that returns test data."""
-        _raise_for_missing_tombstone(path)
         if ".meta.json" in path:
             return json.dumps({
                 "uri": "ctx://acme/users/alice/memories/profile",
@@ -2092,7 +1278,6 @@ class TestReadNode:
     def test_read_node_pending_not_visible(self):
         """Test that PENDING nodes raise NodeNotFoundError."""
         def mock_read_pending(path):
-            _raise_for_missing_tombstone(path)
             if ".meta.json" in path:
                 return json.dumps({
                     "uri": "ctx://acme/users/alice/memories/profile",
@@ -2112,7 +1297,6 @@ class TestReadNode:
     def test_read_node_broken_raises_error(self):
         """Test that BROKEN nodes raise NodeBrokenError."""
         def mock_read_broken(path):
-            _raise_for_missing_tombstone(path)
             if ".meta.json" in path:
                 return json.dumps({
                     "uri": "ctx://acme/users/alice/memories/profile",
@@ -2143,93 +1327,6 @@ class TestReadNode:
         assert any(path.endswith(".abstract.md") for path in read_paths)
         assert not any(path.endswith("content.md") for path in read_paths)
 
-    def test_custom_metadata_round_trips_through_write_and_read(self):
-        files = {}
-        client = Mock()
-        client.write.side_effect = lambda path, content: files.__setitem__(path, bytes(content))
-
-        def _read(path):
-            if path not in files:
-                raise AGFSClientError("No such file")
-            return files[path]
-
-        client.read.side_effect = _read
-        fs = AGFSContextFS(client)
-        uri = "ctx://acme/sessions/session-123/state"
-        node = ContextNode(
-            uri=uri,
-            context_type="RESOURCE",
-            category="session_state",
-            level=0,
-            owner_space="session:session-123",
-            abstract="state",
-            overview="state",
-            content="{}",
-            metadata={
-                "owner_user_id": "alice",
-                "owner_agent_id": "gpt-4",
-                "session_id": "session-123",
-            },
-        )
-
-        fs.write_node(node, self.ctx)
-        restored = fs.read_node(uri, self.ctx)
-        summary = fs.read_node_fields(uri, self.ctx, "abstract")
-
-        assert restored.metadata["owner_user_id"] == "alice"
-        assert restored.metadata["owner_agent_id"] == "gpt-4"
-        assert restored.metadata["session_id"] == "session-123"
-        assert summary.metadata["owner_user_id"] == "alice"
-
-    def test_archive_merge_roundtrip_and_legacy_inactive_cleanup(self):
-        client = _MemoryAGFSClient()
-        fs = AGFSContextFS(client)
-        store = SessionArchiveStore(fs)
-        ctx = RequestContext(
-            "acme", "alice", "gpt-4", "session-123", "trace", Role.ADMIN,
-        )
-        written = store.write_archive(
-            "session-123",
-            "overview",
-            "abstract",
-            [{"role": "user", "content": "hello"}],
-            ctx,
-            archive_id="archive-1",
-        )
-        assert written.success is True
-        assert [entry.archive_id for entry in store.list_archives("session-123", ctx)] == [
-            "archive-1"
-        ]
-
-        assert store.mark_archive_merged(
-            "session-123", "archive-1", ctx, "archive-2",
-        ) is True
-        assert store.list_archives("session-123", ctx) == []
-        raw = fs.read_node_metadata_including_inactive(written.uri, ctx)
-        assert raw["status"] == "ACTIVE"
-        assert raw["archive_status"] == "MERGED"
-
-        assert store.unmark_archive_merged(
-            "session-123", "archive-1", ctx, "archive-2",
-        ) is True
-        assert [entry.archive_id for entry in store.list_archives("session-123", ctx)] == [
-            "archive-1"
-        ]
-
-        # Simulate a legacy deployment that overloaded AGFS node status.
-        meta_path = fs._uri_to_agfs_path(written.uri) + fs.FILE_META
-        legacy_meta = json.loads(client.read(meta_path))
-        legacy_meta.pop("archive_status", None)
-        legacy_meta["status"] = "MERGED"
-        client.write(meta_path, json.dumps(legacy_meta).encode())
-        assert fs.list_children(
-            "ctx://acme/sessions/session-123/history/", ctx,
-        ) == []
-        assert store.delete_session_archives("session-123", ctx) == 1
-        assert fs.list_children_including_inactive(
-            "ctx://acme/sessions/session-123/history/", ctx,
-        ) == []
-
 
 class TestExists:
     """Tests for exists method."""
@@ -2248,34 +1345,26 @@ class TestExists:
 
     def test_exists_active_node(self):
         """Test that exists returns True for ACTIVE nodes."""
-        def read(path):
-            _raise_for_missing_tombstone(path)
-            return json.dumps({
-                "uri": "ctx://acme/users/alice/memories/profile",
-                "status": "ACTIVE",
-            }).encode()
-
-        self.mock_client.read.side_effect = read
+        self.mock_client.read.return_value = json.dumps({
+            "uri": "ctx://acme/users/alice/memories/profile",
+            "status": "ACTIVE",
+        }).encode()
 
         assert self.fs.exists("ctx://acme/users/alice/memories/profile", self.ctx) is True
 
     def test_exists_pending_node(self):
         """Test that exists returns False for PENDING nodes."""
-        def read(path):
-            _raise_for_missing_tombstone(path)
-            return json.dumps({"status": "PENDING"}).encode()
-
-        self.mock_client.read.side_effect = read
+        self.mock_client.read.return_value = json.dumps({
+            "status": "PENDING",
+        }).encode()
 
         assert self.fs.exists("ctx://acme/users/alice/memories/profile", self.ctx) is False
 
     def test_exists_broken_node(self):
         """Test that exists returns False for BROKEN nodes."""
-        def read(path):
-            _raise_for_missing_tombstone(path)
-            return json.dumps({"status": "BROKEN"}).encode()
-
-        self.mock_client.read.side_effect = read
+        self.mock_client.read.return_value = json.dumps({
+            "status": "BROKEN",
+        }).encode()
 
         assert self.fs.exists("ctx://acme/users/alice/memories/profile", self.ctx) is False
 
@@ -2422,306 +1511,3 @@ class TestMoveNode:
         to_uri = "ctx://acme/users/alice/memories/profile_new"
         # Just verify the move is attempted (both URIs are accessible to acme account)
         self.fs.move_node(from_uri, to_uri, self.ctx)
-
-
-class TestDurableDeleteTombstone:
-    def setup_method(self):
-        self.mock_client = Mock()
-        self.fs = AGFSContextFS(self.mock_client)
-        self.ctx = RequestContext(
-            account_id="acme",
-            user_id="alice",
-            agent_id="gpt-4",
-            session_id="session-123",
-            trace_id="trace-456",
-        )
-        self.uri = "ctx://acme/resources/chunk-1"
-
-    def test_write_delete_tombstone_commits_a_typed_marker_atomically(self):
-        self.fs.write_delete_tombstone(
-            self.uri,
-            self.ctx,
-            {"delete_event_id": "evt-delete"},
-        )
-
-        temp_path, raw = self.mock_client.write.call_args.args
-        marker = json.loads(raw.decode("utf-8"))
-        assert marker["kind"] == "DELETE_TOMBSTONE"
-        assert marker["uri"] == self.uri
-        assert marker["delete_event_id"] == "evt-delete"
-        final_path = self.mock_client.mv.call_args.args[1]
-        assert temp_path.startswith(final_path + ".tmp-")
-
-    def test_tombstone_publish_accepts_lost_response_when_exact_marker_exists(self):
-        node_path = self.fs._uri_to_agfs_path(self.uri)
-        tombstone_path = node_path + self.fs.FILE_DELETE_TOMBSTONE
-        staged: dict[str, bytes] = {}
-        committed: dict[str, bytes] = {}
-
-        def write(path, raw):
-            staged[path] = bytes(raw)
-
-        def move(source, destination):
-            committed[destination] = staged.pop(source)
-            raise RuntimeError("lost tombstone mv response")
-
-        def read(path):
-            try:
-                return committed[path]
-            except KeyError as exc:
-                raise AGFSClientError("No such file") from exc
-
-        self.mock_client.write.side_effect = write
-        self.mock_client.mv.side_effect = move
-        self.mock_client.read.side_effect = read
-
-        self.fs.write_delete_tombstone(
-            self.uri,
-            self.ctx,
-            {"delete_event_id": "evt-delete", "record_ids": ["l0", "l2"]},
-        )
-
-        marker = json.loads(committed[tombstone_path].decode("utf-8"))
-        assert marker["status"] == "PENDING"
-        assert marker["delete_event_id"] == "evt-delete"
-
-    @pytest.mark.parametrize("method_name", ["clear_delete_tombstone", "delete_node_payload"])
-    def test_delete_mutation_cleanup_rejects_lost_lease(self, method_name):
-        lease = Mock()
-        lease.uri = self.uri
-        lease.ensure_owned.side_effect = RuntimeError("lost mutation lease")
-
-        with pytest.raises(RuntimeError, match="lost mutation lease"):
-            getattr(self.fs, method_name)(
-                self.uri,
-                self.ctx,
-                mutation_lease=lease,
-            )
-
-        self.mock_client.rm.assert_not_called()
-
-    def test_acknowledging_tombstone_with_live_event_remains_blocked(self):
-        node_path = self.fs._uri_to_agfs_path(self.uri)
-        tombstone_path = node_path + self.fs.FILE_DELETE_TOMBSTONE
-        event_path = node_path + ".outbox/evt-delete.json"
-        marker = {
-            "kind": "DELETE_TOMBSTONE",
-            "uri": self.uri,
-            "status": "ACKNOWLEDGING",
-            "created_at": "2026-08-25T08:00:00+00:00",
-            "delete_event_id": "evt-delete",
-            "record_ids": ["l0", "l1", "l2"],
-        }
-
-        def read(path):
-            if path == tombstone_path:
-                return json.dumps(marker).encode("utf-8")
-            if path == event_path:
-                return b"{}"
-            raise AGFSClientError("No such file")
-
-        self.mock_client.read.side_effect = read
-
-        assert self.fs.is_tombstoned(self.uri, self.ctx) is True
-        self.mock_client.rm.assert_not_called()
-
-    def test_acknowledging_tombstone_without_event_recovers_idempotently(self):
-        node_path = self.fs._uri_to_agfs_path(self.uri)
-        tombstone_path = node_path + self.fs.FILE_DELETE_TOMBSTONE
-        processing_path = node_path + ".outbox/evt-delete.processing"
-        outbox_path = node_path + ".outbox"
-        marker = {
-            "kind": "DELETE_TOMBSTONE",
-            "uri": self.uri,
-            "status": "ACKNOWLEDGING",
-            "created_at": "2026-08-25T08:00:00+00:00",
-            "delete_event_id": "evt-delete",
-            "record_ids": ["l0", "l1", "l2"],
-        }
-        tombstone_present = True
-
-        def read(path):
-            if path == tombstone_path and tombstone_present:
-                return json.dumps(marker).encode("utf-8")
-            raise AGFSClientError("No such file")
-
-        def remove(path, recursive=False):
-            nonlocal tombstone_present
-            if path == tombstone_path:
-                tombstone_present = False
-
-        self.mock_client.read.side_effect = read
-        self.mock_client.rm.side_effect = remove
-        self.mock_client.ls.return_value = []
-
-        assert self.fs.is_tombstoned(self.uri, self.ctx) is False
-        assert self.fs.is_tombstoned(self.uri, self.ctx) is False
-
-        node = ContextNode(
-            uri=self.uri,
-            context_type="RESOURCE",
-            category="code",
-            level=0,
-            owner_space="account:acme",
-            abstract="chunk",
-            overview="chunk",
-            content="print('ok')",
-        )
-        self.fs.write_node(node, self.ctx)
-
-        removed = [item.args[0] for item in self.mock_client.rm.call_args_list]
-        assert removed.index(processing_path) < removed.index(outbox_path)
-        assert removed.index(outbox_path) < removed.index(tombstone_path)
-        assert node_path not in removed
-        assert any(
-            item.args[0].endswith(self.fs.FILE_META)
-            for item in self.mock_client.write.call_args_list
-        )
-
-    def test_pending_tombstone_without_event_remains_blocked(self):
-        marker = {
-            "kind": "DELETE_TOMBSTONE",
-            "uri": self.uri,
-            "status": "PENDING",
-            "created_at": "2026-08-25T08:00:00+00:00",
-            "delete_event_id": "evt-delete",
-            "record_ids": ["l0", "l1", "l2"],
-        }
-        self.mock_client.read.return_value = json.dumps(marker).encode("utf-8")
-
-        assert self.fs.is_tombstoned(self.uri, self.ctx) is True
-        assert self.mock_client.read.call_count == 1
-        self.mock_client.rm.assert_not_called()
-
-    @pytest.mark.parametrize(
-        "raw",
-        [
-            b"",
-            b"   ",
-            b"{}",
-            b"[]",
-            b'{"kind":"OTHER","uri":"ctx://acme/resources/chunk-1"}',
-        ],
-    )
-    def test_invalid_or_empty_tombstone_fails_closed(self, raw):
-        self.mock_client.read.return_value = raw
-
-        with pytest.raises(RuntimeError, match="invalid durable delete tombstone"):
-            self.fs.is_tombstoned(self.uri, self.ctx)
-
-        self.mock_client.rm.assert_not_called()
-
-    def test_acknowledging_recovery_retries_processing_cleanup_failure(self):
-        node_path = self.fs._uri_to_agfs_path(self.uri)
-        tombstone_path = node_path + self.fs.FILE_DELETE_TOMBSTONE
-        processing_path = node_path + ".outbox/evt-delete.processing"
-        marker = {
-            "kind": "DELETE_TOMBSTONE",
-            "uri": self.uri,
-            "status": "ACKNOWLEDGING",
-            "created_at": "2026-08-25T08:00:00+00:00",
-            "delete_event_id": "evt-delete",
-            "record_ids": ["l0", "l1", "l2"],
-        }
-        tombstone_present = True
-        processing_remove_attempts = 0
-
-        def read(path):
-            if path == tombstone_path and tombstone_present:
-                return json.dumps(marker).encode("utf-8")
-            raise AGFSClientError("No such file")
-
-        def remove(path, recursive=False):
-            nonlocal processing_remove_attempts, tombstone_present
-            if path == processing_path:
-                processing_remove_attempts += 1
-                if processing_remove_attempts == 1:
-                    raise RuntimeError("processing cleanup failed")
-            if path == tombstone_path:
-                tombstone_present = False
-
-        self.mock_client.read.side_effect = read
-        self.mock_client.rm.side_effect = remove
-        self.mock_client.ls.return_value = []
-
-        with pytest.raises(RuntimeError, match="processing cleanup failed"):
-            self.fs.is_tombstoned(self.uri, self.ctx)
-
-        assert tombstone_present is True
-        assert self.fs.is_tombstoned(self.uri, self.ctx) is False
-        assert self.fs.is_tombstoned(self.uri, self.ctx) is False
-        assert processing_remove_attempts == 2
-
-    def test_acknowledging_recovery_retries_marker_remove_failure(self):
-        node_path = self.fs._uri_to_agfs_path(self.uri)
-        tombstone_path = node_path + self.fs.FILE_DELETE_TOMBSTONE
-        marker = {
-            "kind": "DELETE_TOMBSTONE",
-            "uri": self.uri,
-            "status": "ACKNOWLEDGING",
-            "created_at": "2026-08-25T08:00:00+00:00",
-            "delete_event_id": "evt-delete",
-            "record_ids": ["l0", "l1", "l2"],
-        }
-        tombstone_present = True
-        marker_remove_attempts = 0
-
-        def read(path):
-            if path == tombstone_path and tombstone_present:
-                return json.dumps(marker).encode("utf-8")
-            raise AGFSClientError("No such file")
-
-        def remove(path, recursive=False):
-            nonlocal marker_remove_attempts, tombstone_present
-            if path != tombstone_path:
-                return
-            marker_remove_attempts += 1
-            if marker_remove_attempts == 1:
-                raise RuntimeError("transient marker remove failure")
-            tombstone_present = False
-
-        self.mock_client.read.side_effect = read
-        self.mock_client.rm.side_effect = remove
-        self.mock_client.ls.return_value = []
-
-        with pytest.raises(RuntimeError, match="transient marker remove failure"):
-            self.fs.is_tombstoned(self.uri, self.ctx)
-
-        assert self.fs.is_tombstoned(self.uri, self.ctx) is False
-        assert self.fs.is_tombstoned(self.uri, self.ctx) is False
-        assert marker_remove_attempts == 2
-
-    def test_delete_node_payload_preserves_tombstone_and_outbox(self):
-        self.fs.is_tombstoned = Mock(return_value=True)
-
-        self.fs.delete_node_payload(self.uri, self.ctx)
-
-        removed = {call.args[0] for call in self.mock_client.rm.call_args_list}
-        assert len(removed) == 5
-        assert not any(".delete_tombstone.json" in path for path in removed)
-        assert not any(".outbox" in path for path in removed)
-
-    def test_delete_node_payload_accepts_already_completed_concurrent_cleanup(self):
-        self.fs.is_tombstoned = Mock(return_value=False)
-        self.mock_client.read.side_effect = AGFSClientError("No such file")
-
-        self.fs.delete_node_payload(self.uri, self.ctx)
-
-        assert self.mock_client.read.call_count == 5
-        self.mock_client.rm.assert_not_called()
-
-    def test_delete_node_payload_still_requires_tombstone_when_payload_exists(self):
-        self.fs.is_tombstoned = Mock(return_value=False)
-        self.mock_client.read.side_effect = [
-            AGFSClientError("No such file"),
-            AGFSClientError("No such file"),
-            AGFSClientError("No such file"),
-            AGFSClientError("No such file"),
-            b'{"status":"ACTIVE"}',
-        ]
-
-        with pytest.raises(RuntimeError, match="durable delete tombstone is required"):
-            self.fs.delete_node_payload(self.uri, self.ctx)
-
-        assert self.mock_client.read.call_count == 5
-        self.mock_client.rm.assert_not_called()

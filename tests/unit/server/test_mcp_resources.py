@@ -132,7 +132,6 @@ def test_status_resource_reports_implemented_toolsets_only():
         OgMemConfig(
             mcp_enable_write_tools=True,
             mcp_enable_delete_tools=True,
-            mcp_enable_code_edit_tools=True,
             mcp_enable_runtime_tools=True,
             mcp_enable_diagnostic_tools=True,
         ),
@@ -146,7 +145,6 @@ def test_status_resource_reports_implemented_toolsets_only():
     assert payload["toolsets"]["read_only"] is True
     assert payload["toolsets"]["write"] is True
     assert payload["toolsets"]["delete"] is True
-    assert payload["toolsets"]["code_edit"] is True
     assert payload["toolsets"]["runtime"] is False
     assert payload["toolsets"]["diagnostic"] is False
 
@@ -156,24 +154,6 @@ def test_status_resource_rejects_invalid_default_toolset():
 
     with pytest.raises(ValueError, match="mcp_default_toolset"):
         render_resource(service, "ogmemory://status", _ctx())
-
-
-def test_code_toolset_status_suppresses_generic_write_and_delete_flags():
-    service = _FakeService(
-        OgMemConfig(
-            mcp_default_toolset="code",
-            mcp_enable_write_tools=True,
-            mcp_enable_delete_tools=True,
-            mcp_enable_code_edit_tools=True,
-        ),
-        [],
-    )
-
-    payload = render_resource(service, "ogmemory://status", _ctx())
-
-    assert payload["toolsets"]["write"] is False
-    assert payload["toolsets"]["delete"] is False
-    assert payload["toolsets"]["code_edit"] is True
 
 
 def test_types_resource_exposes_public_memory_types_without_internal_types():

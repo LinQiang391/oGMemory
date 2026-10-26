@@ -11,10 +11,6 @@ from datetime import UTC, datetime
 
 from pyagfs import AGFSClient
 
-from commit.code_resource_events import (
-    build_code_resource_delete_event,
-    build_code_resource_write_event,
-)
 from core.enums import EventType
 from core.interfaces import ContextFS
 from core.logging_config import get_logger
@@ -22,29 +18,6 @@ from core.models import ContextNode, OutboxEvent, RequestContext
 
 logger = get_logger(__name__)
 _AGENT_PROCESSING_LEASE = ContextVar("agent_processing_lease", default=None)
-
-
-class OutboxPublishOutcomeUnknownError(RuntimeError):
-    """Raised when an atomic event publish cannot be classified safely."""
-
-
-def serialize_outbox_event(event: OutboxEvent) -> bytes:
-    """Return the canonical on-disk representation of an Outbox event."""
-
-    return json.dumps(
-        {
-            "event_id": event.event_id,
-            "event_type": event.event_type,
-            "uri": event.uri,
-            "payload": event.payload,
-            "status": event.status,
-            "retry_count": event.retry_count,
-            "created_at": event.created_at,
-            "next_retry_at": event.next_retry_at,
-        },
-        ensure_ascii=False,
-        indent=2,
-    ).encode("utf-8")
 
 
 class OutboxStore:
@@ -56,17 +29,6 @@ class OutboxStore:
     These are processed by OutboxWorker (index package) to sync
     changes to the vector index.
     """
-
-    _DELETE_TOMBSTONE_NAME = ".delete_tombstone.json"
-    _DELETE_TOMBSTONE_PENDING = "PENDING"
-    _DELETE_TOMBSTONE_ACKNOWLEDGING = "ACKNOWLEDGING"
-    _NODE_PAYLOAD_NAMES = (
-        "content.md",
-        ".relations.json",
-        ".abstract.md",
-        ".overview.md",
-        ".meta.json",
-    )
 
     def __init__(self, client: AGFSClient, fs: ContextFS, mount_prefix: str = "/local"):
         """Initialize OutboxStore.
@@ -106,12 +68,28 @@ class OutboxStore:
         """
         self._check_agent_lease()
         event = self.build_write_event(node)
-        self.persist_event(event, node.uri)
+
+        self._write_event(event, node.uri)
         return event
 
-    def build_write_event(self, node: ContextNode) -> OutboxEvent:
-        """Build a self-contained UPSERT event without persisting it."""
-        return build_code_resource_write_event(node)
+    @staticmethod
+    def build_write_event(node: ContextNode) -> OutboxEvent:
+        """Build a memory write event before publication."""
+        from commit.write_events import build_write_event
+        return build_write_event(node)
+
+    def is_event_current(self, event_id: str, node_uri: str | None = None) -> bool:
+        """Return whether the stored event remains available for processing."""
+        if not node_uri:
+            raise ValueError("node_uri is required for AGFS event liveness checks")
+        path = self._uri_to_agfs_path(node_uri) + ".outbox/" + event_id + ".json"
+        try:
+            self._client.read(path)
+            return True
+        except Exception as exc:
+            if self._is_not_found_error(exc):
+                return False
+            raise
 
     def register_delete(
         self,
@@ -127,23 +105,16 @@ class OutboxStore:
         Returns:
             OutboxEvent that was registered
         """
-        event = self.build_delete_event(uri)
-        self.persist_event(event, uri)
-        return event
+        event_id = str(uuid.uuid4())
+        event = OutboxEvent(
+            event_id=event_id,
+            event_type=EventType.DELETE_CONTEXT.value,
+            uri=uri,
+            payload={},
+            status="PENDING",
+        )
 
-    @staticmethod
-    def build_delete_event(uri: str) -> OutboxEvent:
-        """Build a DELETE event containing every canonical record id."""
-        return build_code_resource_delete_event(uri)
-
-    def persist_event(
-        self,
-        event: OutboxEvent,
-        node_uri: str | None = None,
-    ) -> OutboxEvent:
-        """Persist a pre-built event at its owning node Outbox."""
-
-        self._write_event(event, node_uri or event.uri)
+        self._write_event(event, uri)
         return event
 
     def register_once(self, event: OutboxEvent, ctx: RequestContext) -> None:
@@ -160,13 +131,13 @@ class OutboxStore:
                     except Exception as exc:
                         if "exists" not in str(exc).lower():
                             raise
-                self.persist_event(event)
+                self._write_event(event, event.uri)
 
     def save_payload(self, event: OutboxEvent) -> None:
         with self._agent_event_lock(event):
             self._check_agent_lease(event)
             if not self._cleanup_completed_agent_event(event):
-                self.persist_event(event)
+                self._write_event(event, event.uri)
 
     def _agent_event_done(self, event: OutboxEvent) -> bool:
         try:
@@ -183,6 +154,18 @@ class OutboxStore:
         ctx = RequestContext(**event.payload["context"])
         fs = AGFSContextFS(self._client, mount_prefix=self._mount_prefix)
         return fs.resource_mutation_lock(event.uri, ctx)
+
+    @staticmethod
+    def _is_not_found_error(exc: Exception) -> bool:
+        message = str(exc).lower()
+        return "no such file" in message or "not found" in message
+
+    def _rm_if_present(self, path: str) -> None:
+        try:
+            self._client.rm(path)
+        except Exception as exc:
+            if not self._is_not_found_error(exc):
+                raise
 
     def _remove_agent_event_files(self, event: OutboxEvent) -> None:
         prefix = self._uri_to_agfs_path(event.uri) + ".outbox/" + event.event_id
@@ -472,157 +455,37 @@ class OutboxStore:
         except Exception:
             pass  # Directory may already exist
 
-        event_bytes = serialize_outbox_event(event)
+        # Serialize event
+        event_json = json.dumps({
+            "event_id": event.event_id,
+            "event_type": event.event_type,
+            "uri": event.uri,
+            "payload": event.payload,
+            "status": event.status,
+            "retry_count": event.retry_count,
+            "created_at": event.created_at,
+            "next_retry_at": event.next_retry_at,
+        }, ensure_ascii=False, indent=2)
 
         # Write to temporary file first
         try:
-            self._client.write(temp_path, event_bytes)
+            self._client.write(temp_path, event_json.encode('utf-8'))
         except Exception as e:
             # Temp write failed - no state change
             logger.error("Failed to write temp outbox event %s: %s", event.event_id, e)
             raise
 
-        # Move to the final path.  AGFS exposes same-backend atomic rename as
-        # ``mv``; a direct final write would expose a partially written event.
+        # Rename to final path (atomic if AGFS supports it)
         try:
-            self._client.mv(temp_path, event_path)
-        except Exception as exc:
-            try:
-                final_raw = self._client.read(event_path)
-            except Exception as inspect_exc:
-                if self._is_not_found_error(inspect_exc):
-                    try:
-                        self._client.rm(temp_path)
-                    except Exception:
-                        pass
-                    raise exc
-                try:
-                    self._client.rm(temp_path)
-                except Exception:
-                    pass
-                raise OutboxPublishOutcomeUnknownError(
-                    "AGFS Outbox publish outcome cannot be proven"
-                ) from inspect_exc
-
-            if isinstance(final_raw, bytearray):
-                final_raw = bytes(final_raw)
-            elif isinstance(final_raw, str):
-                final_raw = final_raw.encode("utf-8")
-            if final_raw == event_bytes:
-                try:
-                    self._client.rm(temp_path)
-                except Exception:
-                    pass
-                return
+            # AGFS rename is atomic for same-backend operations
+            self._client.rename(temp_path, event_path)
+        except Exception:
+            # If rename fails, attempt direct write (last resort)
             try:
                 self._client.rm(temp_path)
             except Exception:
                 pass
-            raise OutboxPublishOutcomeUnknownError(
-                "AGFS Outbox publish outcome cannot be proven"
-            ) from exc
-
-    @staticmethod
-    def _is_not_found_error(exc: Exception) -> bool:
-        message = str(exc).lower()
-        return "no such file" in message or "not found" in message
-
-    def _rm_if_present(self, path: str, *, recursive: bool = False) -> bool:
-        try:
-            if recursive:
-                self._client.rm(path, recursive=True)
-            else:
-                self._client.rm(path)
-            return True
-        except Exception as exc:
-            if self._is_not_found_error(exc):
-                return False
-            raise
-
-    @staticmethod
-    def _load_event_json(raw) -> dict:
-        if isinstance(raw, (bytes, bytearray)):
-            raw = raw.decode("utf-8")
-        if not isinstance(raw, str):
-            raise TypeError("Outbox event content must be bytes or text")
-        data = json.loads(raw)
-        if not isinstance(data, dict):
-            raise ValueError("Outbox event content must be a JSON object")
-        return data
-
-    def cancel_pending_upserts(self, node_uri: str) -> list[str]:
-        """Cancel exact-URI UPSERT events, including claimed lock files."""
-
-        node_path = self._uri_to_agfs_path(node_uri)
-        outbox_dir = node_path + ".outbox"
-        try:
-            entries = self._client.ls(outbox_dir + "/")
-        except Exception as exc:
-            if self._is_not_found_error(exc):
-                return []
-            raise
-
-        cancelled: list[str] = []
-        for entry in entries:
-            name = str(entry.get("name", "")).rsplit("/", 1)[-1]
-            is_dir = entry.get("is_dir", entry.get("isDir", False))
-            if is_dir or not name.endswith(".json") or name.startswith("."):
-                continue
-            event_path = outbox_dir + "/" + name
-            try:
-                raw = self._client.read(event_path)
-                data = self._load_event_json(raw)
-            except Exception as exc:
-                if self._is_not_found_error(exc):
-                    continue
-                raise
-            if data.get("uri") != node_uri:
-                continue
-            if data.get("event_type") not in {
-                EventType.UPSERT_CONTEXT.value,
-                EventType.UPSERT_DIRECTORY.value,
-            }:
-                continue
-            if data.get("status", "PENDING") not in {"PENDING", "PROCESSING"}:
-                continue
-            event_id = str(data.get("event_id") or name[:-5])
-            self._rm_if_present(event_path)
-            self._rm_if_present(outbox_dir + "/" + event_id + ".processing")
-            cancelled.append(event_id)
-        return cancelled
-
-    def is_event_current(self, event_id: str, node_uri: str | None = None) -> bool:
-        """Return whether an event remains live and is not suppressed by a tombstone."""
-
-        if not node_uri:
-            raise ValueError("node_uri is required for AGFS event liveness checks")
-        node_path = self._uri_to_agfs_path(node_uri)
-        event_path = node_path + ".outbox/" + event_id + ".json"
-        try:
-            raw = self._client.read(event_path)
-            data = self._load_event_json(raw)
-        except Exception as exc:
-            if self._is_not_found_error(exc):
-                return False
-            raise
-
-        if data.get("event_type") not in {
-            EventType.UPSERT_CONTEXT.value,
-            EventType.UPSERT_DIRECTORY.value,
-        }:
-            return True
-        tombstone_path = node_path + ".delete_tombstone.json"
-        try:
-            raw = self._client.read(tombstone_path)
-            marker = self._load_event_json(raw)
-            return not (
-                marker.get("kind") == "DELETE_TOMBSTONE"
-                and marker.get("uri") == node_uri
-            )
-        except Exception as exc:
-            if self._is_not_found_error(exc):
-                return True
-            raise
+            self._client.write(event_path, event_json.encode('utf-8'))
 
     def mark_processing(self, event: OutboxEvent, node_uri: str) -> None:
         """Mark an event as being processed.
@@ -667,188 +530,17 @@ class OutboxStore:
                 self._remove_agent_event_files(event)
             return
 
-        if event.event_type != EventType.DELETE_CONTEXT.value:
-            for path in (event_path, processing_path):
-                try:
-                    self._rm_if_present(path)
-                except Exception:
-                    pass
-            return
-
-        # Keep the live event available until payload cleanup is verified and
-        # the tombstone records that acknowledgement has started.  A crash
-        # after the event removal is then recoverable from ACKNOWLEDGING.
-        self._verify_delete_payload_absent(node_uri)
-        has_tombstone = self._transition_delete_tombstone_to_acknowledging(
-            event,
-            node_uri,
-        )
-
-        if not has_tombstone:
-            # Generic DELETE events predate the durable resource tombstone
-            # protocol.  Preserve their existing strict lock cleanup.
-            self._rm_if_present(event_path)
-            self._rm_if_present(processing_path)
-            self._cleanup_empty_outbox_directory(node_uri)
-            return
-
-        if not self._remove_acknowledged_delete_event(event_path, node_uri):
-            return
-
-        # Once event removal succeeds, do not raise back into the worker: its
-        # generic error path would recreate the DELETE event and race with
-        # ACKNOWLEDGING recovery.  The marker remains a durable recovery token
-        # if any best-effort cleanup below is interrupted or fails.
-        try:
-            self._rm_if_present(processing_path)
-        except Exception as exc:
-            logger.warning(
-                "Failed to remove DELETE processing lock for %s: %s",
-                node_uri,
-                exc,
-            )
-            return
-        try:
-            self._cleanup_empty_outbox_directory(node_uri)
-        except Exception as exc:
-            logger.warning(
-                "Failed to clean empty DELETE Outbox for %s: %s",
-                node_uri,
-                exc,
-            )
-            return
-        try:
-            self._rm_if_present(node_path + self._DELETE_TOMBSTONE_NAME)
-        except Exception as exc:
-            logger.warning(
-                "Failed to remove acknowledged DELETE tombstone for %s: %s",
-                node_uri,
-                exc,
-            )
-
-    def _remove_acknowledged_delete_event(
-        self,
-        event_path: str,
-        node_uri: str,
-    ) -> bool:
-        """Remove the live DELETE event without replaying an ambiguous delete."""
-
+        # Delete the event file
         try:
             self._client.rm(event_path)
-            return True
-        except Exception as exc:
-            if self._is_not_found_error(exc):
-                return True
-
-            # A lost response may mean the durable remove succeeded.  Re-read
-            # before propagating: recreating an event that is already absent
-            # would let an old DELETE replay after lazy ACK recovery releases
-            # the URI for a new write.
-            try:
-                self._client.read(event_path)
-            except Exception as verify_exc:
-                if self._is_not_found_error(verify_exc):
-                    logger.warning(
-                        "DELETE event removal returned an error but %s is absent",
-                        node_uri,
-                    )
-                    return True
-                logger.warning(
-                    "DELETE event removal outcome is unknown for %s; "
-                    "retaining ACKNOWLEDGING state",
-                    node_uri,
-                )
-                return False
-
-            # The event is confirmed live, so the worker may safely use its
-            # normal retry path while ACKNOWLEDGING continues to block writes.
-            raise
-
-    def _verify_delete_payload_absent(self, node_uri: str) -> None:
-        """Fail before acknowledgement while any node payload may remain."""
-
-        node_path = self._uri_to_agfs_path(node_uri)
-        for name in self._NODE_PAYLOAD_NAMES:
-            try:
-                self._client.read(node_path + name)
-            except Exception as exc:
-                if self._is_not_found_error(exc):
-                    continue
-                raise
-            raise RuntimeError(
-                f"cannot acknowledge DELETE_CONTEXT while payload exists: {name}"
-            )
-
-    def _transition_delete_tombstone_to_acknowledging(
-        self,
-        event: OutboxEvent,
-        node_uri: str,
-    ) -> bool:
-        """Atomically publish the recoverable DELETE acknowledgement state."""
-
-        node_path = self._uri_to_agfs_path(node_uri)
-        tombstone_path = node_path + self._DELETE_TOMBSTONE_NAME
-        try:
-            raw = self._client.read(tombstone_path)
-        except Exception as exc:
-            if self._is_not_found_error(exc):
-                return False
-            raise
-
-        try:
-            marker = self._load_event_json(raw)
-        except (TypeError, ValueError) as exc:
-            raise RuntimeError("invalid durable delete tombstone") from exc
-        if (
-            marker.get("kind") != "DELETE_TOMBSTONE"
-            or marker.get("uri") != node_uri
-            or marker.get("delete_event_id") != event.event_id
-        ):
-            raise RuntimeError("durable delete tombstone does not match event")
-
-        status = marker.get("status", self._DELETE_TOMBSTONE_PENDING)
-        if status == self._DELETE_TOMBSTONE_ACKNOWLEDGING:
-            return True
-        if status != self._DELETE_TOMBSTONE_PENDING:
-            raise RuntimeError("durable delete tombstone has invalid status")
-
-        acknowledging = dict(marker)
-        acknowledging["status"] = self._DELETE_TOMBSTONE_ACKNOWLEDGING
-        temp_path = tombstone_path + f".tmp-{uuid.uuid4().hex}"
-        encoded = json.dumps(
-            acknowledging,
-            ensure_ascii=False,
-            indent=2,
-        ).encode("utf-8")
-        self._client.write(temp_path, encoded)
-        try:
-            self._client.mv(temp_path, tombstone_path)
         except Exception:
-            try:
-                self._client.rm(temp_path)
-            except Exception:
-                pass
-            raise
-        return True
+            pass
 
-    def _cleanup_empty_outbox_directory(self, node_uri: str) -> None:
-        """Remove an empty Outbox without recursively deleting the node."""
-
-        node_path = self._uri_to_agfs_path(node_uri)
-        outbox_dir = node_path + ".outbox"
+        # Delete the processing lock file
         try:
-            entries = self._client.ls(outbox_dir + "/")
-            remaining = [
-                entry
-                for entry in entries
-                if entry.get("name") not in {"", ".", ".."}
-            ]
-            if not remaining:
-                self._rm_if_present(outbox_dir, recursive=True)
-        except Exception as exc:
-            if self._is_not_found_error(exc):
-                return
-            raise
+            self._client.rm(processing_path)
+        except Exception:
+            pass
 
     def list_pending(self, account_id: str) -> list[tuple[str, "OutboxEvent"]]:
         """Scan AGFS for all pending OutboxEvents under an account.
@@ -856,13 +548,24 @@ class OutboxStore:
         Scans /accounts/{account_id}/**/.outbox/*.json (excluding dlq/).
         Returns list of (node_uri, OutboxEvent) tuples.
         """
-        results: list[tuple[str, OutboxEvent]] = []
+        results = []
         prefix = self._mount_prefix + f"/accounts/{account_id}/"
         try:
             self._scan_outbox_recursive(prefix, results)
         except Exception:
             pass
         return results
+
+    @staticmethod
+    def _load_event_json(raw) -> dict:
+        if isinstance(raw, (bytes, bytearray)):
+            raw = raw.decode("utf-8")
+        if not isinstance(raw, str):
+            raise TypeError("Outbox event content must be bytes or text")
+        data = json.loads(raw)
+        if not isinstance(data, dict):
+            raise ValueError("Outbox event content must be a JSON object")
+        return data
 
     def count_unfinished(self, account_id: str | None = None) -> dict[str, int]:
         """Count every live account Outbox event without claiming it.
@@ -926,19 +629,6 @@ class OutboxStore:
                 return True
         return False
 
-    @staticmethod
-    def _is_atomic_resource_staging_directory(name: str) -> bool:
-        """Return whether ``name`` is a hidden atomic code publish tree."""
-
-        prefix, separator, token = name.rpartition(".resource-create-")
-        return bool(
-            separator
-            and prefix.startswith(".")
-            and len(prefix) > 1
-            and len(token) == 32
-            and all(char in "0123456789abcdef" for char in token)
-        )
-
     def _count_unfinished_entries(
         self,
         path: str,
@@ -960,7 +650,6 @@ class OutboxStore:
             elif (
                 is_dir
                 and name != ".outbox"
-                and not self._is_atomic_resource_staging_directory(name)
             ):
                 self._count_unfinished_recursive(child_path + "/", counts)
 
@@ -1022,11 +711,7 @@ class OutboxStore:
                 except Exception:
                     continue
                 self._collect_outbox_events(child_path, ev_entries, results)
-            elif (
-                is_dir
-                and name not in (".outbox", "dlq")
-                and not self._is_atomic_resource_staging_directory(str(name))
-            ):
+            elif is_dir and name not in (".outbox", "dlq"):
                 self._scan_outbox_recursive(child_path + "/", results)
 
     def _collect_outbox_events(self, outbox_path: str, entries: list[dict], results: list) -> None:
@@ -1184,16 +869,6 @@ class OutboxStore:
         Returns:
             True if lock was acquired, False if already locked
         """
-        if (
-            event.event_type == EventType.DELETE_CONTEXT.value
-            and event.payload.get("durable_delete") is True
-        ):
-            # Durable DELETE acknowledgement may remove the tombstone.  Cancel
-            # every older UPSERT before the DELETE can be claimed so an
-            # in-flight stale write will fail its event-liveness check even
-            # after acknowledgement releases the URI.
-            self.cancel_pending_upserts(node_uri)
-
         node_path = self._uri_to_agfs_path(node_uri)
         processing_path = node_path + ".outbox/" + event.event_id + ".processing"
 

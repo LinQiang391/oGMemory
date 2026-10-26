@@ -114,55 +114,6 @@ def auto_recall_enabled() -> bool:
     return _env_bool("OGMEM_AUTO_RECALL", True)
 
 
-def effective_code_retrieval_mode() -> str:
-    """Resolve the process-selected retrieval mode used by Claude transports.
-
-    Explicit environment configuration wins, while a YAML-loaded
-    ``OgMemConfig`` supplies the mode when no environment override is present.
-    The plugin must make the same mode choice as the server before selecting a
-    transport timeout.
-    """
-
-    raw_env = os.environ.get("OGMEM_CODE_RETRIEVAL_MODE")
-    if raw_env is not None and raw_env.strip():
-        mode = raw_env.strip().lower()
-        return mode if mode in {"full", "candidate_local"} else "full"
-    cfg = _try_ogmem_config()
-    if cfg is not None:
-        raw_mode = getattr(cfg, "code_retrieval_mode", "full")
-        mode = str(raw_mode or "full").strip().lower()
-        if mode in {"full", "candidate_local"}:
-            return mode
-    return "full"
-
-
-def effective_tool_output_filter_enabled(tool_name: str) -> bool:
-    """Return the canonical master/child filter state for a native tool.
-
-    When the monorepo configuration is importable, use its effective values so
-    the standalone plugin and server share one configuration owner.  Hooks run
-    outside the monorepo in normal installations, where the same canonical
-    environment variable names and defaults are used.
-    """
-    normalized = str(tool_name or "").strip().lower()
-    child_attr = {
-        "read": "effective_tool_output_filter_read_enabled",
-        "bash": "effective_tool_output_filter_bash_enabled",
-    }.get(normalized)
-    if child_attr:
-        cfg = _try_ogmem_config()
-        if cfg is not None and hasattr(cfg, child_attr):
-            return bool(getattr(cfg, child_attr))
-
-    if not _env_bool("OGMEM_TOOL_OUTPUT_FILTER_ENABLED", False):
-        return False
-    child_name = {
-        "read": "OGMEM_TOOL_OUTPUT_FILTER_READ_ENABLED",
-        "bash": "OGMEM_TOOL_OUTPUT_FILTER_BASH_ENABLED",
-    }.get(normalized)
-    return _env_bool(child_name, True) if child_name else False
-
-
 def mcp_recovery_enabled() -> bool:
     """Return whether Claude has an explicitly configured MCP recovery path.
 

@@ -10,10 +10,10 @@ Phase 1 implementation:
 - P1-W4: read_node/exists/list_children/delete_node
 """
 
+import time
 import json
 import logging
 import re
-import time
 import uuid
 from collections.abc import Iterator, Mapping
 from contextlib import ExitStack, contextmanager
@@ -21,7 +21,6 @@ from contextvars import ContextVar
 from datetime import UTC, datetime, timedelta, timezone
 from pathlib import PurePosixPath
 from threading import Event, Thread
-from typing import cast
 from urllib.parse import unquote
 
 from pyagfs import AGFSClient
@@ -36,13 +35,6 @@ from core.errors import (
 )
 from core.memory_names import is_safe_memory_key
 from core.models import ContextNode, OutboxEvent, RelationEdge, RequestContext
-from core.resource_identity import (
-    CODE_WORKSPACE_SYNC_BINDINGS_ROOT_ID,
-    RootBindingError,
-    reserve_workspace_root_binding_state,
-    resolve_workspace_root_binding_state,
-    validate_resource_uri_slug,
-)
 from fs.access_control import check_uri_access
 
 logger = logging.getLogger(__name__)
@@ -54,9 +46,6 @@ _RESOURCE_MUTATION_LOCK_RENEW_INTERVAL_SECONDS = 20
 _RESOURCE_MUTATION_LOCK_TIMEOUT_SECONDS = 10.0
 _MEMORY_IDENTITY_LOCK_TIMEOUT_SECONDS = 120.0
 _RESOURCE_MUTATION_LOCK_POLL_SECONDS = 0.05
-_WORKSPACE_BINDING_MUTEX_TTL_SECONDS = 60.0
-_WORKSPACE_BINDING_MUTEX_TIMEOUT_SECONDS = 10.0
-_WORKSPACE_BINDING_MUTEX_POLL_SECONDS = 0.05
 _SESSION_RECOVERY = ContextVar("agfs_session_recovery", default=None)
 
 
@@ -90,13 +79,15 @@ class _ResourceMutationLease:
             self.owner_token,
         ):
             raise RuntimeError(
-                f"lost AGFS code-resource mutation lock for {self.uri}"
+                f"lost AGFS memory mutation lock for {self.uri}"
             )
 
 
 def _is_not_found_error(exc: AGFSClientError) -> bool:
     message = str(exc).lower()
     return "no such file" in message or "not found" in message
+
+from core.interfaces import ContextFS
 
 
 # URI patterns for different memory types
@@ -114,14 +105,6 @@ _LEGACY_SKILL_URI_PATTERN = re.compile(
 _SKILLS_DIR_PATTERN = re.compile(
     r'^ctx://(?P<account>[^/]+)/agents/(?P<owner_id>[^/]+)/'
     r'(?P<skill_root>skills)(?:/(?P<skill_source>generated|imported))?/?$'
-)
-
-# Account-scoped Resource nodes have no user/agent owner segment.
-_RESOURCE_URI_PATTERN = re.compile(
-    r'^ctx://(?P<account>[^/]+)/resources/(?P<slug>[^/]+)$'
-)
-_RESOURCES_DIR_PATTERN = re.compile(
-    r'^ctx://(?P<account>[^/]+)/resources/?$'
 )
 
 # Pattern 2: Profile (no slug)
@@ -223,23 +206,6 @@ def uri_to_path(uri: str) -> str:
         path = PurePosixPath('/accounts') / account / 'agents' / owner_id / groups['skill_root']
         if groups.get('skill_source'):
             path /= groups['skill_source']
-        return str(path) + '/'
-
-    match = _RESOURCE_URI_PATTERN.match(uri)
-    if match:
-        groups = match.groupdict()
-        slug = validate_resource_uri_slug(groups['slug'])
-        resources_path = (
-            PurePosixPath('/accounts') / groups['account'] / 'resources'
-        )
-        path = resources_path / slug
-        if path.parent != resources_path or path.name != slug:
-            raise ValueError(f"Invalid URI format: {uri}")
-        return str(path) + '/'
-
-    match = _RESOURCES_DIR_PATTERN.match(uri.rstrip('/'))
-    if match:
-        path = PurePosixPath('/accounts') / match.group('account') / 'resources'
         return str(path) + '/'
 
     # Try profile pattern (no slug)
@@ -353,27 +319,6 @@ def parse_uri(uri: str) -> dict:
                 if groups.get('skill_source')
                 else groups['skill_root']
             ),
-            'slug': '',
-        }
-
-    match = _RESOURCE_URI_PATTERN.match(uri)
-    if match:
-        groups = match.groupdict()
-        return {
-            'account': groups['account'],
-            'owner_type': 'resources',
-            'owner_id': '',
-            'category': 'resource',
-            'slug': validate_resource_uri_slug(groups['slug']),
-        }
-
-    match = _RESOURCES_DIR_PATTERN.match(uri.rstrip('/'))
-    if match:
-        return {
-            'account': match.group('account'),
-            'owner_type': 'resources',
-            'owner_id': '',
-            'category': 'resource',
             'slug': '',
         }
 
@@ -492,10 +437,6 @@ def build_uri(
     if category == 'skills' or category.startswith('skills/'):
         return f"ctx://{account}/{owner_type}/{owner_id}/{category}/{slug}"
 
-    if owner_type in ('resource', 'resources') or category == 'resource':
-        base = f"ctx://{account}/resources"
-        return f"{base}/{slug}" if slug else base
-
     # Profile has no slug component
     if category == 'profile':
         return f"ctx://{account}/{owner_type}/{owner_id}/memories/profile"
@@ -525,24 +466,7 @@ class AGFSContextFS:
     FILE_ABSTRACT = ".abstract.md"
     FILE_OVERVIEW = ".overview.md"
     FILE_META = ".meta.json"
-    FILE_DELETE_TOMBSTONE = ".delete_tombstone.json"
     DIR_OUTBOX = ".outbox"
-    _DELETE_TOMBSTONE_PENDING = "PENDING"
-    _DELETE_TOMBSTONE_ACKNOWLEDGING = "ACKNOWLEDGING"
-    _STRUCTURAL_META_FIELDS = {
-        "uri",
-        "context_type",
-        "category",
-        "level",
-        "owner_space",
-        "expected_version",
-    }
-    _WRITE_RESERVED_META_FIELDS = _STRUCTURAL_META_FIELDS | {
-        "status",
-        "created_at",
-        "updated_at",
-        "version",
-    }
 
     def __init__(self, client: AGFSClient, mount_prefix: str = "/local"):
         """Initialize AGFS context filesystem adapter.
@@ -786,396 +710,6 @@ class AGFSContextFS:
                 raise NodeNotFoundError(path)
             raise
 
-    def read_code_workspace_root_binding(
-        self,
-        *,
-        ctx: RequestContext,
-        root_slug: str | None = None,
-        root_fingerprint: str | None = None,
-    ) -> tuple[str, str, str] | None:
-        """Read one protected account-wide code-workspace root binding."""
-
-        state = self._read_code_workspace_binding_state(ctx.account_id)
-        return cast(
-            tuple[str, str, str] | None,
-            resolve_workspace_root_binding_state(
-                state,
-                account_id=ctx.account_id,
-                root_slug=root_slug,
-                root_fingerprint=root_fingerprint,
-            ),
-        )
-
-    def reserve_code_workspace_root_binding(
-        self,
-        *,
-        ctx: RequestContext,
-        root_slug: str,
-        root_fingerprint: str,
-    ) -> tuple[str, str, str]:
-        """Atomically reserve the account-wide slug/fingerprint bijection."""
-
-        state_path = self._code_workspace_binding_state_path(ctx.account_id)
-        self._mkdir_p(state_path.rsplit("/", 1)[0])
-        lock = self._acquire_workspace_binding_mutex(state_path)
-        try:
-            self._ensure_workspace_binding_mutex_owned(lock[0], lock[1])
-            current = self._read_code_workspace_binding_state(ctx.account_id)
-            updated = reserve_workspace_root_binding_state(
-                current,
-                account_id=ctx.account_id,
-                root_slug=root_slug,
-                root_fingerprint=root_fingerprint,
-            )
-            self._write_code_workspace_binding_state(state_path, updated, lock[1])
-        finally:
-            self._release_workspace_binding_mutex(lock)
-        binding = cast(
-            tuple[str, str, str] | None,
-            resolve_workspace_root_binding_state(
-                updated,
-                account_id=ctx.account_id,
-                root_fingerprint=root_fingerprint,
-            ),
-        )
-        if binding is None:
-            raise RootBindingError("workspace root binding state is invalid")
-        return binding
-
-    def _code_workspace_binding_state_path(self, account_id: str) -> str:
-        if (
-            not isinstance(account_id, str)
-            or not account_id
-            or len(account_id) > 128
-            or "/" in account_id
-            or "\\" in account_id
-            or account_id in {".", ".."}
-        ):
-            raise ValueError("workspace binding account_id is invalid")
-        path = str(
-            PurePosixPath("/accounts")
-            / account_id
-            / "_system"
-            / "code_workspace_sync"
-            / f"{CODE_WORKSPACE_SYNC_BINDINGS_ROOT_ID}.json"
-        )
-        return self._mount_prefix + path if self._mount_prefix else path
-
-    def _read_code_workspace_binding_state(self, account_id: str) -> dict | None:
-        state_path = self._code_workspace_binding_state_path(account_id)
-        try:
-            raw = self._client.read(state_path)
-        except Exception as exc:
-            if self._is_not_found_error(exc):
-                return None
-            raise
-        try:
-            if isinstance(raw, (bytes, bytearray)):
-                raw = raw.decode("utf-8")
-            state = json.loads(raw)
-        except (TypeError, UnicodeDecodeError, json.JSONDecodeError) as exc:
-            raise RootBindingError("workspace root binding state is invalid") from exc
-        if not isinstance(state, Mapping):
-            raise RootBindingError("workspace root binding state is invalid")
-        return dict(state)
-
-    def _write_code_workspace_binding_state(
-        self,
-        state_path: str,
-        state: Mapping[str, object],
-        owner_token: str,
-    ) -> None:
-        lock_path = state_path + ".lock"
-        temporary_path = state_path + f".mutation-{owner_token}"
-        payload = json.dumps(state, ensure_ascii=False, separators=(",", ":"))
-        self._write_file(temporary_path, payload)
-        try:
-            self._ensure_workspace_binding_mutex_owned(lock_path, owner_token)
-            try:
-                self._client.mv(temporary_path, state_path)
-            except Exception:
-                try:
-                    persisted = self._read_code_workspace_binding_state_from_path(
-                        state_path
-                    )
-                except Exception:
-                    persisted = None
-                if persisted != dict(state):
-                    raise
-        finally:
-            self._remove_file_if_present(temporary_path)
-        self._ensure_workspace_binding_mutex_owned(lock_path, owner_token)
-        persisted = self._read_code_workspace_binding_state_from_path(state_path)
-        if persisted != dict(state):
-            raise RuntimeError("AGFS workspace root binding publication is ambiguous")
-
-    def _read_code_workspace_binding_state_from_path(self, state_path: str) -> dict | None:
-        try:
-            raw = self._client.read(state_path)
-        except Exception as exc:
-            if self._is_not_found_error(exc):
-                return None
-            raise
-        if isinstance(raw, (bytes, bytearray)):
-            raw = raw.decode("utf-8")
-        state = json.loads(raw)
-        return dict(state) if isinstance(state, Mapping) else None
-
-    def _acquire_workspace_binding_mutex(self, state_path: str) -> tuple[str, str]:
-        create = getattr(self._client, "create", None)
-        remove = getattr(self._client, "rm", None) or getattr(self._client, "remove", None)
-        stat = getattr(self._client, "stat", None)
-        if not callable(create) or not callable(remove) or not callable(stat):
-            raise RuntimeError("AGFS does not support atomic workspace root binding")
-
-        lock_path = state_path + ".lock"
-        owner_token = uuid.uuid4().hex
-        payload = json.dumps(
-            {
-                "kind": "code_workspace_sync_mutex",
-                "token": owner_token,
-                "expires_at": time.time() + _WORKSPACE_BINDING_MUTEX_TTL_SECONDS,
-            },
-            separators=(",", ":"),
-        ).encode("utf-8")
-        deadline = time.monotonic() + _WORKSPACE_BINDING_MUTEX_TIMEOUT_SECONDS
-        while True:
-            try:
-                create(lock_path)
-            except Exception as exc:
-                if "exists" not in str(exc).lower():
-                    raise
-                marker = self._read_workspace_binding_mutex(lock_path)
-                if marker is not None and marker.get("token") == owner_token:
-                    self._ensure_workspace_binding_mutex_owned(lock_path, owner_token)
-                    return lock_path, owner_token
-                if self._recover_workspace_binding_mutex(
-                    state_path=state_path,
-                    lock_path=lock_path,
-                    marker=marker,
-                    owner_token=owner_token,
-                    payload=payload,
-                    create=create,
-                    remove=remove,
-                ):
-                    return lock_path, owner_token
-                if time.monotonic() >= deadline:
-                    raise RuntimeError("workspace root binding transition is busy") from exc
-                time.sleep(_WORKSPACE_BINDING_MUTEX_POLL_SECONDS)
-                continue
-            try:
-                self._client.write(lock_path, payload)
-            except Exception:
-                try:
-                    remove(lock_path)
-                except Exception:
-                    pass
-                raise
-            marker = self._read_workspace_binding_mutex(lock_path)
-            if marker is not None and marker.get("token") == owner_token:
-                self._ensure_workspace_binding_mutex_owned(lock_path, owner_token)
-                return lock_path, owner_token
-            if time.monotonic() >= deadline:
-                raise RuntimeError("workspace root binding transition is busy")
-            time.sleep(_WORKSPACE_BINDING_MUTEX_POLL_SECONDS)
-
-    def _release_workspace_binding_mutex(self, lock: tuple[str, str]) -> None:
-        lock_path, owner_token = lock
-        remove = getattr(self._client, "rm", None) or getattr(self._client, "remove", None)
-        if not callable(remove):
-            return
-        try:
-            marker = self._read_workspace_binding_mutex(lock_path)
-            if marker is not None and marker.get("token") == owner_token:
-                remove(lock_path)
-        except Exception:
-            return
-
-    def _read_workspace_binding_mutex(self, lock_path: str) -> dict | None:
-        try:
-            raw = self._client.read(lock_path)
-        except Exception as exc:
-            if self._is_not_found_error(exc):
-                return None
-            raise
-        if isinstance(raw, (bytes, bytearray)):
-            raw = raw.decode("utf-8")
-        if not isinstance(raw, str):
-            return None
-        try:
-            marker = json.loads(raw)
-        except (TypeError, ValueError):
-            return None
-        return dict(marker) if isinstance(marker, Mapping) else None
-
-    @staticmethod
-    def _workspace_binding_mutex_expires_at(
-        marker: Mapping[str, object],
-    ) -> float | None:
-        if marker.get("kind") != "code_workspace_sync_mutex":
-            return None
-        value = marker.get("expires_at")
-        if not isinstance(value, (int, float, str, bytes, bytearray)):
-            return None
-        try:
-            return float(value)
-        except (TypeError, ValueError):
-            return None
-
-    def _ensure_workspace_binding_mutex_owned(
-        self,
-        lock_path: str,
-        owner_token: str,
-    ) -> dict:
-        """Fail closed unless the caller owns a live binding mutex."""
-
-        marker = self._read_workspace_binding_mutex(lock_path)
-        expires_at = (
-            self._workspace_binding_mutex_expires_at(marker)
-            if marker is not None
-            else None
-        )
-        if (
-            marker is None
-            or marker.get("token") != owner_token
-            or expires_at is None
-            or expires_at <= time.time()
-        ):
-            raise RuntimeError("lost AGFS workspace root binding mutex")
-        return marker
-
-    @staticmethod
-    def _workspace_binding_mutex_expired(marker: Mapping[str, object]) -> bool:
-        expires_at = AGFSContextFS._workspace_binding_mutex_expires_at(marker)
-        return expires_at is not None and expires_at <= time.time()
-
-    def _remove_workspace_binding_path_and_verify(
-        self,
-        path: str,
-        remove,
-    ) -> bool:
-        try:
-            remove(path)
-        except Exception as exc:
-            if not self._is_not_found_error(exc):
-                try:
-                    self._client.read(path)
-                except Exception as inspect_exc:
-                    if not self._is_not_found_error(inspect_exc):
-                        return False
-                else:
-                    return False
-        try:
-            self._client.read(path)
-        except Exception as exc:
-            return self._is_not_found_error(exc)
-        return False
-
-    def _recover_workspace_binding_mutex(
-        self,
-        *,
-        state_path: str,
-        lock_path: str,
-        marker: Mapping[str, object] | None,
-        owner_token: str,
-        payload: bytes,
-        create,
-        remove,
-    ) -> bool:
-        """Fence one expired owner before acquiring its canonical mutex."""
-
-        if marker is None or not self._workspace_binding_mutex_expired(marker):
-            return False
-        old_token = marker.get("token")
-        if not isinstance(old_token, str) or not old_token:
-            return False
-        inherited_retired_tokens = marker.get("retired_tokens", [])
-        if not isinstance(inherited_retired_tokens, list) or any(
-            not isinstance(token, str) or not token
-            for token in inherited_retired_tokens
-        ):
-            return False
-        retired_tokens = tuple(
-            dict.fromkeys([*inherited_retired_tokens, old_token])
-        )
-
-        try:
-            recovery_payload = json.loads(payload.decode("utf-8"))
-        except (UnicodeDecodeError, json.JSONDecodeError) as exc:
-            raise RuntimeError("invalid workspace binding mutex payload") from exc
-        if not isinstance(recovery_payload, dict):
-            raise RuntimeError("invalid workspace binding mutex payload")
-        recovery_payload["retired_tokens"] = list(retired_tokens)
-        encoded_recovery_payload = json.dumps(
-            recovery_payload,
-            separators=(",", ":"),
-        ).encode("utf-8")
-
-        created_lock = False
-        owns_lock = False
-        try:
-            confirmed = self._read_workspace_binding_mutex(lock_path)
-            if (
-                confirmed is None
-                or confirmed.get("token") != old_token
-                or not self._workspace_binding_mutex_expired(confirmed)
-            ):
-                return False
-
-            old_publish_sources = tuple(
-                state_path + f".mutation-{token}"
-                for token in retired_tokens
-            )
-            for old_publish_source in old_publish_sources:
-                if not self._remove_workspace_binding_path_and_verify(
-                    old_publish_source,
-                    remove,
-                ):
-                    return False
-
-            confirmed = self._read_workspace_binding_mutex(lock_path)
-            if (
-                confirmed is None
-                or confirmed.get("token") != old_token
-                or not self._workspace_binding_mutex_expired(confirmed)
-            ):
-                return False
-            if not self._remove_workspace_binding_path_and_verify(lock_path, remove):
-                return False
-
-            try:
-                create(lock_path)
-            except Exception as exc:
-                for old_publish_source in old_publish_sources:
-                    self._remove_workspace_binding_path_and_verify(
-                        old_publish_source,
-                        remove,
-                    )
-                if "exists" in str(exc).lower():
-                    return False
-                raise
-            created_lock = True
-            self._client.write(lock_path, encoded_recovery_payload)
-            self._ensure_workspace_binding_mutex_owned(lock_path, owner_token)
-            owns_lock = True
-            for old_publish_source in old_publish_sources:
-                if not self._remove_workspace_binding_path_and_verify(
-                    old_publish_source,
-                    remove,
-                ):
-                    raise RuntimeError(
-                        "AGFS workspace root binding fencing cannot be proven"
-                    )
-            return True
-        finally:
-            if created_lock and not owns_lock:
-                try:
-                    marker = self._read_workspace_binding_mutex(lock_path)
-                    if marker is None or marker.get("token") == owner_token:
-                        remove(lock_path)
-                except Exception:
-                    pass
-
     @staticmethod
     def _is_not_found_error(exc: Exception) -> bool:
         message = str(exc).lower()
@@ -1207,7 +741,7 @@ class AGFSContextFS:
         *,
         timeout_seconds: float = _RESOURCE_MUTATION_LOCK_TIMEOUT_SECONDS,
     ) -> Iterator[_ResourceMutationLease]:
-        """Serialize code-resource writes and deletes across AGFS processes."""
+        """Serialize memory writes and recovery across AGFS processes."""
 
         self._ensure_accessible(uri, ctx)
         node_path = self._uri_to_agfs_path(uri)
@@ -1245,7 +779,7 @@ class AGFSContextFS:
                         continue
                     if time.monotonic() >= deadline:
                         raise TimeoutError(
-                            f"timed out acquiring AGFS code-resource mutation lock: {uri}"
+                            f"timed out acquiring AGFS memory mutation lock: {uri}"
                         ) from exc
                     time.sleep(_RESOURCE_MUTATION_LOCK_POLL_SECONDS)
 
@@ -1277,7 +811,7 @@ class AGFSContextFS:
                         self._client.rm(lock_path, recursive=True)
                 except Exception:
                     logger.warning(
-                        "Failed to release AGFS code-resource mutation lock: %s",
+                        "Failed to release AGFS memory mutation lock: %s",
                         lock_path,
                     )
 
@@ -1309,17 +843,6 @@ class AGFSContextFS:
     @staticmethod
     def active_session_recovery():
         return _SESSION_RECOVERY.get()
-
-    @contextmanager
-    def tool_output_mutation_lock(
-        self,
-        uri: str,
-        ctx: RequestContext,
-    ) -> Iterator[_ResourceMutationLease]:
-        """Reuse the durable cross-process lease for Tool Output retention."""
-
-        with self.resource_mutation_lock(uri, ctx) as lease:
-            yield lease
 
     @contextmanager
     def memory_identity_lock(self, directory: str, ctx: RequestContext):
@@ -1388,9 +911,9 @@ class AGFSContextFS:
                 raw = raw.decode("utf-8")
             marker = json.loads(raw)
         except (TypeError, UnicodeDecodeError, json.JSONDecodeError) as exc:
-            raise RuntimeError("invalid AGFS code-resource mutation lock") from exc
+            raise RuntimeError("invalid AGFS memory mutation lock") from exc
         if not isinstance(marker, dict):
-            raise RuntimeError("invalid AGFS code-resource mutation lock")
+            raise RuntimeError("invalid AGFS memory mutation lock")
         return marker
 
     def _owns_resource_mutation_lock(
@@ -1442,7 +965,7 @@ class AGFSContextFS:
             or not isinstance(owner_token, str)
             or not owner_token
         ):
-            raise RuntimeError("invalid AGFS code-resource mutation lock")
+            raise RuntimeError("invalid AGFS memory mutation lock")
 
         lease_updated_at = self._read_resource_mutation_lease(
             lock_path,
@@ -1494,223 +1017,6 @@ class AGFSContextFS:
                 return False
         return True
 
-    def is_tombstoned(self, uri: str, ctx: RequestContext) -> bool:
-        """Return whether a durable delete tombstone exists for ``uri``."""
-
-        self._ensure_accessible(uri, ctx)
-        node_path = self._uri_to_agfs_path(uri)
-        tombstone_path = node_path + self.FILE_DELETE_TOMBSTONE
-        try:
-            raw = self._client.read(tombstone_path)
-            if isinstance(raw, (bytes, bytearray)):
-                raw = raw.decode("utf-8")
-            if not isinstance(raw, str) or not raw.strip():
-                raise RuntimeError("invalid durable delete tombstone")
-            marker = json.loads(raw)
-        except Exception as exc:
-            if self._is_not_found_error(exc):
-                return False
-            if isinstance(exc, (UnicodeDecodeError, json.JSONDecodeError)):
-                raise RuntimeError("invalid durable delete tombstone") from exc
-            raise
-
-        if (
-            not isinstance(marker, dict)
-            or marker.get("kind") != "DELETE_TOMBSTONE"
-            or marker.get("uri") != uri
-        ):
-            raise RuntimeError("invalid durable delete tombstone")
-
-        status = marker.get("status", self._DELETE_TOMBSTONE_PENDING)
-        if status == self._DELETE_TOMBSTONE_PENDING:
-            # A missing event in PENDING is ambiguous: publication may have
-            # crashed before the event became visible.  Keep writes blocked.
-            return True
-        if status != self._DELETE_TOMBSTONE_ACKNOWLEDGING:
-            raise RuntimeError("invalid durable delete tombstone status")
-        return self._recover_acknowledging_delete(node_path, tombstone_path, marker)
-
-    def _recover_acknowledging_delete(
-        self,
-        node_path: str,
-        tombstone_path: str,
-        marker: dict,
-    ) -> bool:
-        """Finish an interrupted acknowledgement without exposing stale work."""
-
-        event_id = marker.get("delete_event_id")
-        if not isinstance(event_id, str) or not event_id:
-            raise RuntimeError("invalid durable delete tombstone")
-
-        outbox_dir = node_path + self.DIR_OUTBOX
-        event_path = outbox_dir + "/" + event_id + ".json"
-        try:
-            self._client.read(event_path)
-            return True
-        except Exception as exc:
-            if not self._is_not_found_error(exc):
-                raise
-
-        # The ACKNOWLEDGING marker proves payload cleanup completed before the
-        # live event was removed.  Complete stale lock/directory cleanup while
-        # the marker still blocks writes; marker removal is the final release
-        # point and must succeed before this URI is reported writable again.
-        processing_path = outbox_dir + "/" + event_id + ".processing"
-        try:
-            self._client.rm(processing_path)
-        except Exception as exc:
-            if not self._is_not_found_error(exc):
-                raise
-        try:
-            entries = self._client.ls(outbox_dir + "/")
-            remaining = [
-                entry
-                for entry in entries
-                if entry.get("name") not in {"", ".", ".."}
-            ]
-            if not remaining:
-                self._client.rm(outbox_dir, recursive=True)
-        except Exception as exc:
-            if not self._is_not_found_error(exc):
-                raise
-
-        try:
-            self._client.rm(tombstone_path)
-        except Exception as exc:
-            if self._is_not_found_error(exc):
-                return False
-            raise
-        return False
-
-    def write_delete_tombstone(
-        self,
-        uri: str,
-        ctx: RequestContext,
-        payload: dict | None = None,
-        *,
-        mutation_lease: _ResourceMutationLease | None = None,
-    ) -> None:
-        """Atomically persist the durable-delete marker for a node."""
-
-        self._ensure_accessible(uri, ctx)
-        if mutation_lease is not None:
-            if mutation_lease.uri != uri:
-                raise ValueError("mutation lease URI does not match tombstone URI")
-            mutation_lease.ensure_owned()
-        node_path = self._uri_to_agfs_path(uri)
-        self._mkdir_p(node_path)
-        tombstone_path = node_path + self.FILE_DELETE_TOMBSTONE
-        if mutation_lease is None:
-            temp_path = tombstone_path + f".tmp-{uuid.uuid4().hex}"
-        else:
-            temp_path = (
-                node_path
-                + f".delete_tombstone.mutation-{mutation_lease.owner_token}.json"
-            )
-        now = datetime.now(UTC).isoformat()
-        tombstone = {
-            "kind": "DELETE_TOMBSTONE",
-            "uri": uri,
-            "status": "PENDING",
-            "created_at": now,
-            **dict(payload or {}),
-        }
-        encoded = json.dumps(tombstone, ensure_ascii=False, indent=2).encode("utf-8")
-        self._client.write(temp_path, encoded)
-        try:
-            if mutation_lease is not None:
-                mutation_lease.ensure_owned()
-            try:
-                self._client.mv(temp_path, tombstone_path)
-            except Exception as exc:
-                try:
-                    final_raw = self._read_optional_raw(tombstone_path)
-                except Exception as inspect_exc:
-                    raise RuntimeError(
-                        "AGFS delete tombstone publish outcome cannot be proven"
-                    ) from inspect_exc
-                if final_raw == encoded:
-                    return
-                if final_raw is None:
-                    raise
-                raise RuntimeError(
-                    "AGFS delete tombstone publish outcome cannot be proven"
-                ) from exc
-        finally:
-            self._remove_file_if_present(temp_path)
-
-    def clear_delete_tombstone(
-        self,
-        uri: str,
-        ctx: RequestContext,
-        *,
-        mutation_lease: _ResourceMutationLease | None = None,
-    ) -> None:
-        """Remove a tombstone when deletion has not yet been durably accepted."""
-
-        self._ensure_accessible(uri, ctx)
-        if mutation_lease is not None:
-            if mutation_lease.uri != uri:
-                raise ValueError("mutation lease URI does not match tombstone URI")
-            mutation_lease.ensure_owned()
-        tombstone_path = self._uri_to_agfs_path(uri) + self.FILE_DELETE_TOMBSTONE
-        try:
-            if mutation_lease is not None:
-                mutation_lease.ensure_owned()
-            self._client.rm(tombstone_path)
-        except Exception as exc:
-            if not self._is_not_found_error(exc):
-                raise
-
-    def delete_node_payload(
-        self,
-        uri: str,
-        ctx: RequestContext,
-        *,
-        mutation_lease: _ResourceMutationLease | None = None,
-    ) -> None:
-        """Delete node payload files while preserving tombstone and Outbox."""
-
-        self._ensure_accessible(uri, ctx)
-        if mutation_lease is not None:
-            if mutation_lease.uri != uri:
-                raise ValueError("mutation lease URI does not match payload URI")
-            mutation_lease.ensure_owned()
-        node_path = self._uri_to_agfs_path(uri)
-        payload_filenames = (
-            self.FILE_CONTENT,
-            self.FILE_RELATIONS,
-            self.FILE_ABSTRACT,
-            self.FILE_OVERVIEW,
-            self.FILE_META,
-        )
-        if not self.is_tombstoned(uri, ctx):
-            # The worker may have completed and acknowledged the same delete
-            # before the lifecycle caller reaches this idempotent cleanup.
-            # Accept that race only when every payload file is already absent.
-            for filename in payload_filenames:
-                try:
-                    self._client.read(node_path + filename)
-                except Exception as exc:
-                    if self._is_not_found_error(exc):
-                        continue
-                    raise
-                raise RuntimeError(
-                    "durable delete tombstone is required before payload deletion"
-                )
-            return
-
-        for filename in payload_filenames:
-            try:
-                if mutation_lease is not None:
-                    mutation_lease.ensure_owned()
-                self._client.rm(node_path + filename)
-            except Exception as exc:
-                if not self._is_not_found_error(exc):
-                    raise
-        if mutation_lease is not None:
-            mutation_lease.ensure_owned()
-
     def _relation_edge_to_dict(self, edge: RelationEdge) -> dict:
         """Convert RelationEdge to dict for JSON serialization."""
         return {
@@ -1730,443 +1036,6 @@ class AGFSContextFS:
             weight=d["weight"],
             reason=d["reason"],
         )
-
-    @classmethod
-    def _context_metadata(cls, meta: dict, **extra) -> dict:
-        """Round-trip every non-structural .meta.json field to ContextNode."""
-        metadata = {
-            key: value
-            for key, value in meta.items()
-            if key not in cls._STRUCTURAL_META_FIELDS
-        }
-        metadata.update(extra)
-        return metadata
-
-    @staticmethod
-    def _canonical_index_records(records: object) -> str:
-        """Serialize the Worker-visible IndexRecord fields deterministically."""
-
-        if not isinstance(records, list):
-            raise ValueError("UPSERT event records must be a list")
-        required = {"id", "uri", "level", "text", "filters", "metadata"}
-        normalized = []
-        for record in records:
-            if not isinstance(record, dict) or not required.issubset(record):
-                raise ValueError("UPSERT event contains an incomplete IndexRecord")
-            normalized.append({key: record[key] for key in sorted(required)})
-        normalized.sort(
-            key=lambda record: (
-                str(record["id"]),
-                int(record["level"]),
-                str(record["uri"]),
-            )
-        )
-        return json.dumps(
-            normalized,
-            ensure_ascii=False,
-            sort_keys=True,
-            separators=(",", ":"),
-        )
-
-    @classmethod
-    def _canonical_node_index_records(cls, node: ContextNode) -> str:
-        from index.index_record_builder import build_index_records
-
-        records = [
-            {
-                "id": record.id,
-                "uri": record.uri,
-                "level": record.level,
-                "text": record.text,
-                "filters": record.filters,
-                "metadata": record.metadata,
-            }
-            for record in build_index_records(node)
-        ]
-        return cls._canonical_index_records(records)
-
-    def _validate_code_resource_write_event(
-        self,
-        node: ContextNode,
-        event: OutboxEvent,
-    ) -> str:
-        if (
-            node.context_type != "RESOURCE"
-            or node.category != "code"
-            or node.metadata.get("resource_type") != "code"
-        ):
-            raise ValueError(
-                "AGFS atomic node/Outbox writes are limited to code RESOURCE nodes"
-            )
-        if (
-            event.event_type != EventType.UPSERT_CONTEXT.value
-            or event.uri != node.uri
-            or event.status != "PENDING"
-        ):
-            raise ValueError("invalid code RESOURCE UPSERT event")
-        event_records = self._canonical_index_records(event.payload.get("records"))
-        node_records = self._canonical_node_index_records(node)
-        if event_records != node_records:
-            raise ValueError("UPSERT event records do not match the code RESOURCE node")
-        return event_records
-
-    @staticmethod
-    def _code_resource_storage_payload_matches(
-        existing: ContextNode,
-        requested: ContextNode,
-    ) -> bool:
-        """Return whether an existing-URI rewrite changes only metadata."""
-
-        return bool(
-            existing.uri == requested.uri
-            and existing.context_type == requested.context_type
-            and existing.category == requested.category
-            and existing.level == requested.level
-            and existing.owner_space == requested.owner_space
-            and existing.abstract == requested.abstract
-            and existing.overview == requested.overview
-            and existing.content == requested.content
-            and existing.metadata.get("_relations", [])
-            == requested.metadata.get("_relations", [])
-        )
-
-    @staticmethod
-    def supports_atomic_outbox_write(node: ContextNode) -> bool:
-        """Return whether this AGFS protocol owns the supplied node type."""
-
-        resource_type = node.metadata.get("resource_type")
-        return (
-            node.context_type == "RESOURCE"
-            and node.category == "code"
-            and isinstance(resource_type, str)
-            and resource_type == "code"
-        )
-
-    def write_node_with_outbox(
-        self,
-        node: ContextNode,
-        ctx: RequestContext,
-        event: OutboxEvent,
-    ) -> None:
-        """Atomically publish a deterministic code node with its UPSERT event."""
-
-        self._ensure_accessible(node.uri, ctx)
-        expected_version = node.metadata.get("_expected_version")
-        if (
-            isinstance(expected_version, bool)
-            or not isinstance(expected_version, int)
-            or expected_version < 0
-        ):
-            raise ValueError(
-                "AGFS atomic code-resource writes require _expected_version"
-            )
-        event_records = self._validate_code_resource_write_event(node, event)
-        final_node_path = self._uri_to_agfs_path(node.uri)
-        meta_path = final_node_path + self.FILE_META
-
-        with self.resource_mutation_lock(node.uri, ctx) as lease:
-            lease.ensure_owned()
-            if self.is_tombstoned(node.uri, ctx):
-                raise RuntimeError("cannot write a node while durable deletion is pending")
-
-            existing_meta_raw = self._read_optional_raw(meta_path)
-            if existing_meta_raw is None:
-                if expected_version != 0:
-                    raise ConcurrentModificationError(
-                        node.uri,
-                        expected_version,
-                        0,
-                    )
-                self._remove_empty_code_resource_destination(
-                    final_node_path,
-                    lease,
-                )
-                self._publish_new_code_resource(
-                    node,
-                    ctx,
-                    event,
-                    event_records,
-                    expected_version,
-                    lease,
-                )
-                return
-
-            try:
-                existing_meta = json.loads(existing_meta_raw.decode("utf-8"))
-            except (UnicodeDecodeError, json.JSONDecodeError) as exc:
-                raise RuntimeError("invalid committed AGFS code-resource metadata") from exc
-            if not isinstance(existing_meta, dict):
-                raise RuntimeError("invalid committed AGFS code-resource metadata")
-            actual_version = existing_meta.get("version")
-            if (
-                isinstance(actual_version, bool)
-                or not isinstance(actual_version, int)
-                or actual_version < 1
-            ):
-                raise RuntimeError("invalid committed AGFS code-resource version")
-            if expected_version != actual_version:
-                raise ConcurrentModificationError(
-                    node.uri,
-                    expected_version,
-                    actual_version,
-                )
-
-            existing = self.read_node(node.uri, ctx)
-            if self._canonical_node_index_records(existing) != event_records:
-                raise RuntimeError(
-                    "cannot rewrite a deterministic code RESOURCE with different index records"
-                )
-            if not self._code_resource_storage_payload_matches(existing, node):
-                raise RuntimeError(
-                    "cannot rewrite a deterministic code RESOURCE with "
-                    "different stored payload"
-                )
-
-            # The durable event is published first.  If the metadata rewrite
-            # fails, the event still exactly describes the committed node.
-            self._publish_existing_code_event(final_node_path, event, lease)
-            self._publish_existing_code_metadata(
-                final_node_path,
-                node,
-                existing_meta,
-                expected_version,
-                lease,
-            )
-
-    def _remove_empty_code_resource_destination(
-        self,
-        node_path: str,
-        lease: _ResourceMutationLease,
-    ) -> None:
-        """Remove only a verified-empty legacy destination before atomic create."""
-
-        final_path = node_path.rstrip("/")
-        try:
-            self._client.stat(final_path)
-        except Exception as exc:
-            if self._is_not_found_error(exc):
-                return
-            raise
-
-        try:
-            entries = self._client.ls(final_path + "/")
-        except Exception as exc:
-            if self._is_not_found_error(exc):
-                return
-            raise
-        remaining = [
-            entry
-            for entry in entries
-            if str(entry.get("name", "")).rsplit("/", 1)[-1]
-            not in {"", ".", ".."}
-        ]
-        if remaining:
-            raise RuntimeError(
-                "cannot replace a non-empty AGFS code-resource destination"
-            )
-
-        lease.ensure_owned()
-        try:
-            self._client.rm(final_path, recursive=True)
-        except Exception as exc:
-            try:
-                self._client.stat(final_path)
-            except Exception as inspect_exc:
-                if self._is_not_found_error(inspect_exc):
-                    lease.ensure_owned()
-                    return
-                raise RuntimeError(
-                    "AGFS empty destination removal cannot be proven"
-                ) from inspect_exc
-            raise RuntimeError(
-                "AGFS empty destination removal cannot be proven"
-            ) from exc
-
-        lease.ensure_owned()
-        try:
-            self._client.stat(final_path)
-        except Exception as exc:
-            if self._is_not_found_error(exc):
-                return
-            raise RuntimeError(
-                "AGFS empty destination removal cannot be proven"
-            ) from exc
-        raise RuntimeError("AGFS empty code-resource destination still exists")
-
-    def _publish_new_code_resource(
-        self,
-        node: ContextNode,
-        ctx: RequestContext,
-        event: OutboxEvent,
-        event_records: str,
-        expected_version: int,
-        lease: _ResourceMutationLease,
-    ) -> None:
-        """Publish a hidden complete node+event tree through one directory mv."""
-
-        from commit.outbox_store import serialize_outbox_event
-
-        final_node_path = self._uri_to_agfs_path(node.uri)
-        final_path = PurePosixPath(final_node_path.rstrip("/"))
-        parent_path = str(final_path.parent) + "/"
-        staging_path = (
-            f"{parent_path}.{final_path.name}.resource-create-{lease.owner_token}"
-        )
-        staging_node_path = staging_path + "/"
-        staging_outbox_path = staging_node_path + self.DIR_OUTBOX
-        staging_event_path = staging_outbox_path + f"/{event.event_id}.json"
-
-        try:
-            self._mkdir_p(staging_node_path)
-            self._write_node_files(staging_node_path, node, expected_version)
-            self._mkdir_p(staging_outbox_path)
-            self._client.write(staging_event_path, serialize_outbox_event(event))
-            lease.ensure_owned()
-            try:
-                self._client.mv(staging_path, final_node_path.rstrip("/"))
-            except Exception as exc:
-                try:
-                    outcome = self._inspect_new_code_resource_publish(
-                        node,
-                        ctx,
-                        event,
-                        event_records,
-                    )
-                except Exception as inspect_exc:
-                    raise RuntimeError(
-                        "AGFS code-resource publish outcome cannot be proven"
-                    ) from inspect_exc
-                if outcome == "COMMITTED":
-                    return
-                if outcome == "ABSENT":
-                    raise
-                raise RuntimeError(
-                    "AGFS code-resource publish outcome cannot be proven"
-                ) from exc
-            lease.ensure_owned()
-        finally:
-            self._remove_tree_if_present(staging_path)
-
-    def _inspect_new_code_resource_publish(
-        self,
-        node: ContextNode,
-        ctx: RequestContext,
-        event: OutboxEvent,
-        event_records: str,
-    ) -> str:
-        """Classify an ambiguous final directory move without guessing."""
-
-        from commit.outbox_store import serialize_outbox_event
-
-        final_node_path = self._uri_to_agfs_path(node.uri)
-        meta_raw = self._read_optional_raw(final_node_path + self.FILE_META)
-        event_raw = self._read_optional_raw(
-            final_node_path + self.DIR_OUTBOX + f"/{event.event_id}.json"
-        )
-        if meta_raw is None and event_raw is None:
-            return "ABSENT"
-        if meta_raw is None or event_raw is None:
-            return "UNKNOWN"
-        if event_raw != serialize_outbox_event(event):
-            return "UNKNOWN"
-        try:
-            committed = self.read_node(node.uri, ctx)
-        except Exception:
-            return "UNKNOWN"
-        if self._canonical_node_index_records(committed) != event_records:
-            return "UNKNOWN"
-        return "COMMITTED"
-
-    def _publish_existing_code_event(
-        self,
-        node_path: str,
-        event: OutboxEvent,
-        lease: _ResourceMutationLease,
-    ) -> None:
-        """Publish the UPSERT before a same-record metadata rewrite."""
-
-        from commit.outbox_store import serialize_outbox_event
-
-        outbox_path = node_path + self.DIR_OUTBOX
-        self._mkdir_p(outbox_path)
-        event_path = outbox_path + f"/{event.event_id}.json"
-        temporary_path = outbox_path + f"/.mutation-{lease.owner_token}.json"
-        encoded = serialize_outbox_event(event)
-        self._client.write(temporary_path, encoded)
-        try:
-            lease.ensure_owned()
-            try:
-                self._client.mv(temporary_path, event_path)
-            except Exception as exc:
-                try:
-                    final_raw = self._read_optional_raw(event_path)
-                except Exception as inspect_exc:
-                    raise RuntimeError(
-                        "AGFS code-resource Outbox publish outcome cannot be proven"
-                    ) from inspect_exc
-                if final_raw == encoded:
-                    return
-                if final_raw is None:
-                    raise
-                raise RuntimeError(
-                    "AGFS code-resource Outbox publish outcome cannot be proven"
-                ) from exc
-            lease.ensure_owned()
-        finally:
-            self._remove_file_if_present(temporary_path)
-
-    def _publish_existing_code_metadata(
-        self,
-        node_path: str,
-        node: ContextNode,
-        existing_meta: dict,
-        expected_version: int,
-        lease: _ResourceMutationLease,
-    ) -> None:
-        """Atomically rewrite non-index storage metadata after event publish."""
-
-        meta = self._build_node_metadata(
-            node,
-            expected_version,
-            created_at=existing_meta.get("created_at"),
-        )
-        encoded = json.dumps(meta, ensure_ascii=False, indent=2).encode("utf-8")
-        meta_path = node_path + self.FILE_META
-        temporary_path = node_path + f".meta.mutation-{lease.owner_token}.json"
-        self._client.write(temporary_path, encoded)
-        try:
-            lease.ensure_owned()
-            try:
-                self._client.mv(temporary_path, meta_path)
-            except Exception as exc:
-                final_raw = self._read_optional_raw(meta_path)
-                if final_raw == encoded:
-                    return
-                if final_raw is None:
-                    raise RuntimeError(
-                        "committed AGFS code-resource metadata disappeared"
-                    ) from exc
-                # The old committed node remains valid and the event was
-                # deliberately published first, so report the storage failure.
-                raise
-            lease.ensure_owned()
-        finally:
-            self._remove_file_if_present(temporary_path)
-
-    def _read_optional_raw(self, path: str) -> bytes | None:
-        try:
-            raw = self._client.read(path)
-        except Exception as exc:
-            if self._is_not_found_error(exc):
-                return None
-            raise
-        if isinstance(raw, bytes):
-            return raw
-        if isinstance(raw, bytearray):
-            return bytes(raw)
-        if isinstance(raw, str):
-            return raw.encode("utf-8")
-        raise RuntimeError(f"invalid AGFS file payload: {path}")
 
     def write_node(self, node: ContextNode, ctx: RequestContext) -> None:
         """Write a node to AGFS with atomic 4-step write order.
@@ -2189,8 +1058,6 @@ class AGFSContextFS:
         recovery = self.active_session_recovery()
         if recovery is not None:
             recovery[0].ensure_owned()
-        if self.is_tombstoned(node.uri, ctx):
-            raise RuntimeError("cannot write a node while durable deletion is pending")
 
         expected_version = node.metadata.get(
             "_expected_version", node.metadata.get("expected_version")
@@ -2524,48 +1391,6 @@ class AGFSContextFS:
         meta_json = json.dumps(meta, ensure_ascii=False, indent=2)
         write_file(meta_path, meta_json)
 
-    def _build_node_metadata(
-        self,
-        node: ContextNode,
-        expected_version: int | None,
-        *,
-        created_at: object = None,
-        version: object = None,
-    ) -> dict:
-        """Build the committed metadata document for a node write."""
-
-        now = datetime.now(UTC).isoformat()
-        # Determine version: increment for merge, default to 1 for create
-        if expected_version is not None:
-            # Merge operation: increment from expected version
-            new_version = expected_version + 1
-        elif isinstance(version, int) and not isinstance(version, bool):
-            new_version = version
-        else:
-            # Create operation: use existing version or default to 1
-            new_version = node.metadata.get("version", 1)
-
-        meta = {
-            "uri": node.uri,
-            "context_type": node.context_type,
-            "category": node.category,
-            "level": node.level,
-            "owner_space": node.owner_space,
-            "status": NodeStatus.ACTIVE.value,
-            "created_at": created_at or node.metadata.get("created_at", now),
-            "updated_at": now,
-            "version": new_version,
-        }
-
-        # Add any additional metadata (excluding internal _relations)
-        extra_meta = {
-            key: value
-            for key, value in node.metadata.items()
-            if not key.startswith("_") and key not in self._WRITE_RESERVED_META_FIELDS
-        }
-        meta.update(extra_meta)
-        return meta
-
     def read_node(self, uri: str, ctx: RequestContext) -> ContextNode:
         """Read a node from AGFS.
 
@@ -2583,8 +1408,6 @@ class AGFSContextFS:
         """
         # Access control check
         self._ensure_accessible(uri, ctx)
-        if self.is_tombstoned(uri, ctx):
-            raise NodeNotFoundError(uri)
 
         node_path = self._uri_to_agfs_path(uri)
         meta_path = node_path + self.FILE_META
@@ -2631,7 +1454,18 @@ class AGFSContextFS:
             relations = []
 
         # Build metadata dict
-        metadata = self._context_metadata(meta, _relations=relations)
+        metadata = {
+            "created_at": meta.get("created_at", ""),
+            "updated_at": meta.get("updated_at", ""),
+            "version": meta.get("version", 1),
+            "_relations": relations,
+        }
+        # Preserve extension metadata such as complete managed Skill packages.
+        core_keys = {
+            "uri", "context_type", "category", "level", "owner_space",
+            "created_at", "updated_at", "version",
+        }
+        metadata.update({key: value for key, value in meta.items() if key not in core_keys})
 
         return ContextNode(
             uri=meta["uri"],
@@ -2651,8 +1485,6 @@ class AGFSContextFS:
         if level not in {"abstract", "overview", "content", "all"}:
             raise ValueError("level must be one of: abstract, overview, content, all")
         self._ensure_accessible(uri, ctx)
-        if self.is_tombstoned(uri, ctx):
-            raise NodeNotFoundError(uri)
 
         node_path = self._uri_to_agfs_path(uri)
         meta_path = node_path + self.FILE_META
@@ -2681,7 +1513,17 @@ class AGFSContextFS:
         else:
             content = ""
 
-        metadata = self._context_metadata(meta, has_content=True)
+        metadata = {
+            "created_at": meta.get("created_at", ""),
+            "updated_at": meta.get("updated_at", ""),
+            "version": meta.get("version", 1),
+            "has_content": True,
+        }
+        core_keys = {
+            "uri", "context_type", "category", "level", "owner_space",
+            "created_at", "updated_at", "version",
+        }
+        metadata.update({key: value for key, value in meta.items() if key not in core_keys})
 
         return ContextNode(
             uri=meta["uri"],
@@ -2712,8 +1554,6 @@ class AGFSContextFS:
             return False
 
         try:
-            if self.is_tombstoned(uri, ctx):
-                return False
             node_path = self._uri_to_agfs_path(uri)
             meta_path = node_path + self.FILE_META
             meta_content = self._read_file(meta_path)
@@ -2721,6 +1561,47 @@ class AGFSContextFS:
             return meta.get("status") == NodeStatus.ACTIVE.value
         except (ValueError, NodeNotFoundError, json.JSONDecodeError):
             return False
+
+    _STRUCTURAL_META_FIELDS = {
+        "uri",
+        "context_type",
+        "category",
+        "level",
+        "owner_space",
+        "expected_version",
+    }
+
+
+    _WRITE_RESERVED_META_FIELDS = _STRUCTURAL_META_FIELDS | {
+        "status", "created_at", "updated_at", "version",
+    }
+
+    @classmethod
+    def _context_metadata(cls, meta: dict, **extra) -> dict:
+        """Round-trip every non-structural .meta.json field to ContextNode."""
+        metadata = {
+            key: value
+            for key, value in meta.items()
+            if key not in cls._STRUCTURAL_META_FIELDS
+        }
+        metadata.update(extra)
+        return metadata
+
+
+    def read_node_metadata_including_inactive(
+        self,
+        uri: str,
+        ctx: RequestContext,
+    ) -> dict:
+        """Read raw committed metadata without applying ACTIVE visibility."""
+        self._ensure_accessible(uri, ctx)
+        meta_path = self._uri_to_agfs_path(uri) + self.FILE_META
+        try:
+            meta = json.loads(self._read_file(meta_path))
+        except NodeNotFoundError:
+            raise NodeNotFoundError(uri)
+        return self._context_metadata(meta)
+
 
     def archived_node_version(self, uri: str, ctx: RequestContext) -> int | None:
         self._ensure_accessible(uri, ctx)
@@ -2776,47 +1657,6 @@ class AGFSContextFS:
 
         return children
 
-    def list_children_including_inactive(
-        self,
-        uri: str,
-        ctx: RequestContext,
-    ) -> list[str]:
-        """List physical child nodes for trusted lifecycle cleanup.
-
-        Unlike ``list_children``, this does not hide legacy nodes whose AGFS
-        node status was historically overwritten with an archive merge state.
-        """
-        self._ensure_accessible(uri, ctx)
-        try:
-            files = self._client.ls(self._uri_to_agfs_path(uri))
-        except AGFSClientError as exc:
-            if "not found" in str(exc).casefold() or "no such" in str(exc).casefold():
-                return []
-            raise
-        children = []
-        for file_info in files:
-            if not file_info.get("isDir", False):
-                continue
-            name = str(file_info.get("name", ""))
-            if not name or name.startswith("."):
-                continue
-            children.append(uri.rstrip("/") + "/" + name)
-        return children
-
-    def read_node_metadata_including_inactive(
-        self,
-        uri: str,
-        ctx: RequestContext,
-    ) -> dict:
-        """Read raw committed metadata without applying ACTIVE visibility."""
-        self._ensure_accessible(uri, ctx)
-        meta_path = self._uri_to_agfs_path(uri) + self.FILE_META
-        try:
-            meta = json.loads(self._read_file(meta_path))
-        except NodeNotFoundError:
-            raise NodeNotFoundError(uri)
-        return self._context_metadata(meta)
-
     def list_node_summaries(self, uri: str, ctx: RequestContext,
                             limit: int = 50) -> list[ContextNode]:
         """List the first stable page of child node summaries."""
@@ -2864,10 +1704,6 @@ class AGFSContextFS:
             if after_uri is not None and child_uri <= after_uri:
                 continue
             try:
-                if _RESOURCE_URI_PATTERN.match(child_uri) and self.is_tombstoned(
-                    child_uri, ctx
-                ):
-                    continue
                 node_path = self._uri_to_agfs_path(child_uri)
                 meta = json.loads(self._read_file(node_path + self.FILE_META))
                 status = meta.get("status")
@@ -2926,7 +1762,7 @@ class AGFSContextFS:
         if meta.get("status") != NodeStatus.ACTIVE.value:
             raise NodeNotFoundError(uri)
 
-        now = datetime.now(UTC).isoformat()
+        now = datetime.now(timezone.utc).isoformat()
         meta["status"] = NodeStatus.ARCHIVED.value
         meta["archived_at"] = now
         meta["updated_at"] = now
@@ -2981,3 +1817,72 @@ class AGFSContextFS:
 
         # Move the directory
         self._client.mv(from_path, to_path)
+
+    def list_children_including_inactive(
+        self,
+        uri: str,
+        ctx: RequestContext,
+    ) -> list[str]:
+        """List physical child nodes for trusted lifecycle cleanup.
+
+        Unlike ``list_children``, this does not hide legacy nodes whose AGFS
+        node status was historically overwritten with an archive merge state.
+        """
+        self._ensure_accessible(uri, ctx)
+        try:
+            files = self._client.ls(self._uri_to_agfs_path(uri))
+        except AGFSClientError as exc:
+            if "not found" in str(exc).casefold() or "no such" in str(exc).casefold():
+                return []
+            raise
+        children = []
+        for file_info in files:
+            if not file_info.get("isDir", False):
+                continue
+            name = str(file_info.get("name", ""))
+            if not name or name.startswith("."):
+                continue
+            children.append(uri.rstrip("/") + "/" + name)
+        return children
+
+    def _build_node_metadata(
+        self,
+        node: ContextNode,
+        expected_version: int | None,
+        *,
+        created_at: object = None,
+        version: object = None,
+    ) -> dict:
+        """Build the committed metadata document for a node write."""
+
+        now = datetime.now(UTC).isoformat()
+        # Determine version: increment for merge, default to 1 for create
+        if expected_version is not None:
+            # Merge operation: increment from expected version
+            new_version = expected_version + 1
+        elif isinstance(version, int) and not isinstance(version, bool):
+            new_version = version
+        else:
+            # Create operation: use existing version or default to 1
+            new_version = node.metadata.get("version", 1)
+
+        meta = {
+            "uri": node.uri,
+            "context_type": node.context_type,
+            "category": node.category,
+            "level": node.level,
+            "owner_space": node.owner_space,
+            "status": NodeStatus.ACTIVE.value,
+            "created_at": created_at or node.metadata.get("created_at", now),
+            "updated_at": now,
+            "version": new_version,
+        }
+
+        # Add any additional metadata (excluding internal _relations)
+        extra_meta = {
+            key: value
+            for key, value in node.metadata.items()
+            if not key.startswith("_") and key not in self._WRITE_RESERVED_META_FIELDS
+        }
+        meta.update(extra_meta)
+        return meta

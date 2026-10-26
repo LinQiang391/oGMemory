@@ -10,8 +10,6 @@ Input  (stdin):  Claude Code hook JSON
 Output (stdout):  none (exit 0); errors logged to stderr only
 """
 
-from __future__ import annotations
-
 import hashlib
 import ipaddress
 import json
@@ -120,12 +118,6 @@ _TRACE_EVENT_TYPES = {
 
 def log(msg: str) -> None:
     print(f"[call_add_session_message] {msg}", file=sys.stderr)
-
-
-def code_memory_only_enabled() -> bool:
-    """Return whether generic trace/session persistence must be skipped."""
-
-    return _env_bool("OGMEM_CODE_MEMORY_ONLY", False)
 
 
 def _truncate(text: str, max_len: int = _MAX_CHUNK) -> str:
@@ -449,8 +441,6 @@ def _watch_spooled_traces(
     watchdog_token: str,
 ) -> int:
     """Wait for the active lease, then take over if its worker disappeared."""
-    if code_memory_only_enabled():
-        return 0
     spool_dir = lock_path.parent
     try:
         while any(spool_dir.glob("*.json")):
@@ -685,7 +675,7 @@ _build_trace_event = claude_hook_to_event
 
 
 def post_session_message(session_id: str, role: str, content: str) -> bool:
-    if code_memory_only_enabled() or not auto_capture_enabled():
+    if not auto_capture_enabled():
         return True
     url = f"{base_api_url()}/api/v1/sessions/{session_id}/messages"
     body = {**base_ctx(session_id), "role": role, "content": content}
@@ -717,8 +707,6 @@ def _send_trace_event(
     event_time: str | None = None,
 ) -> str:
     """Post one trace event. Failures are logged and never block the hook."""
-    if code_memory_only_enabled():
-        return "disabled"
     url = f"{base_api_url()}/api/v1/trace/events"
     ctx = base_ctx(session_id)
     circuit_path = _trace_circuit_path(url, str(ctx["accountId"]))
@@ -803,8 +791,6 @@ def _trace_envelope(
 
 def post_trace_event(session_id: str, event: dict) -> bool:
     """Spool an event and ensure at most one detached drain worker is running."""
-    if code_memory_only_enabled():
-        return True
     spool_path: Path | None = None
     url = f"{base_api_url()}/api/v1/trace/events"
     ctx = base_ctx(session_id)
@@ -885,8 +871,6 @@ def post_trace_event(session_id: str, event: dict) -> bool:
 
 
 def _drain_spooled_traces(lock_path: Path, lock_token: str) -> int:
-    if code_memory_only_enabled():
-        return 0
     spool_dir = lock_path.parent
     try:
         while True:
@@ -941,10 +925,6 @@ def _drain_spooled_traces(lock_path: Path, lock_token: str) -> int:
 
 
 def main() -> None:
-    if code_memory_only_enabled():
-        log("code_memory_only skip")
-        return
-
     raw = sys.stdin.read()
     try:
         data = json.loads(raw) if raw.strip() else {}
@@ -991,9 +971,6 @@ def main() -> None:
 
 
 if __name__ == "__main__":
-    if code_memory_only_enabled():
-        log("code_memory_only skip")
-        sys.exit(0)
     if len(sys.argv) == 4 and sys.argv[1] == "--drain-traces":
         sys.exit(_drain_spooled_traces(Path(sys.argv[2]), sys.argv[3]))
     if len(sys.argv) == 5 and sys.argv[1] == "--watch-traces":

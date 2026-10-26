@@ -79,7 +79,6 @@ class RetrievalPipeline:
         mode: str = RetrieverMode.QUICK,
         fill_content_for_top_k: int = 0,
         context_type: str | None = None,
-        resource_type: str | None = None,
         memory_directories: list[str] | None = None,
     ) -> SearchMemoryResult:
         t0 = time.monotonic()
@@ -91,7 +90,6 @@ class RetrievalPipeline:
             top_k=top_k, categories=categories,
             hints=hints, session_archive=session_archive,
             context_type=context_type,
-            resource_type=resource_type,
         )
 
         # Stage 2
@@ -154,17 +152,7 @@ class RetrievalPipeline:
     # -- Stage runners with degradation ------------------------------------
 
     def _run_planner(
-        self,
-        query,
-        ctx,
-        trace,
-        *,
-        top_k,
-        categories,
-        hints,
-        session_archive,
-        context_type,
-        resource_type,
+        self, query, ctx, trace, *, top_k, categories, hints, session_archive, context_type
     ) -> list[TypedQuery]:
         with TraceTimer("planner") as st:
             st.input_count = 1
@@ -172,11 +160,8 @@ class RetrievalPipeline:
                 queries = self.planner.plan(
                     query, ctx,
                     session_archive=session_archive,
-                    hints=hints,
-                    categories=categories,
-                    top_k=top_k,
+                    hints=hints, categories=categories, top_k=top_k,
                     context_type=context_type,
-                    resource_type=resource_type,
                 )
             except RetrievalError:
                 raise

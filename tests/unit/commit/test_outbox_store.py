@@ -6,7 +6,7 @@ from datetime import datetime, timezone
 
 import pytest
 
-from core.models import ContextNode, IndexRecord, OutboxEvent, RequestContext
+from core.models import RequestContext, ContextNode, OutboxEvent
 from core.enums import EventType
 from commit.outbox_store import OutboxStore
 
@@ -243,11 +243,7 @@ class TestRegisterDelete:
         assert event.event_type == EventType.DELETE_CONTEXT.value
         assert event.uri == uri
         assert event.status == "PENDING"
-        assert event.payload["ids_to_delete"] == [
-            IndexRecord.generate_id(uri, 0),
-            IndexRecord.generate_id(uri, 1),
-            IndexRecord.generate_id(uri + "/content.md", 2),
-        ]
+        assert event.payload == {}
 
 
 class TestRegisterRelation:

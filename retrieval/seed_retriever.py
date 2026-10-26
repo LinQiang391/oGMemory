@@ -185,8 +185,6 @@ class SeedRetriever:
         filters: dict[str, Any] = {"account_id": ctx.account_id}
         if typed_query.context_type:
             filters["context_type"] = typed_query.context_type
-        if typed_query.resource_type:
-            filters["resource_type"] = typed_query.resource_type
         owner_space = allowed_owner_space_filter(
             typed_query,
             ctx,

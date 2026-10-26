@@ -1,7 +1,6 @@
 """Exercise authenticated tenant boundaries through each MCP transport."""
 from __future__ import annotations
 
-import hashlib
 import json
 import subprocess
 import sys
@@ -24,7 +23,6 @@ from server.api_keys import APIKeyManager
 from server.audit import AuditService
 from server.sql_control_plane_store import SQLControlPlaneStore
 from server.tenant_admin import TenantAdminService
-from service.tool_output import ToolOutputRepository
 from tests.integration.test_mcp_streamable_http_protocol import (
     ROOT,
     _clean_subprocess_env,
@@ -64,11 +62,8 @@ def tenant_data():
                 fs.write_node(ContextNode(uri, "MEMORY", "preference", 2, f"user:{user}",
                                           secret, secret, secret), ctx)
                 uris[name] = uri
-            original = ToolOutputRepository(fs).store_original(
-                ctx, slug="shared", content_digest=hashlib.sha256(secret.encode()).hexdigest(),
-                original=secret, filtered="summary", tool_name="Read", strategy="head_tail")
             rows.append({"ctx": ctx, "key": users[user]["key"], "secret": secret,
-                         "uris": uris, "original": original})
+                         "uris": uris})
     try:
         yield {"dsn": dsn, "fs": fs, "rows": rows, "run": run}
     finally:
@@ -166,15 +161,10 @@ async def _exercise_boundaries(data, transport):
                 read = await session.call_tool("ogm_read_memory", {"uri": shared_uri, **agent})
                 assert not read.is_error
                 assert _tool_json(read)["content"] == row["secret"]
-                own_original = await session.call_tool("ogm_read_memory", {
-                    "uri": row["original"], "recover_original": True, **agent})
-                assert not own_original.is_error
-                assert row["secret"] in json.dumps(_tool_json(own_original))
-                for uri, recover in ((other["uris"]["shared"], False), (other["original"], True)):
-                    denied = await session.call_tool("ogm_read_memory", {
-                        "uri": uri, "recover_original": recover, **agent})
-                    assert denied.is_error
-                    assert other["secret"] not in str(denied)
+                denied = await session.call_tool("ogm_read_memory", {
+                    "uri": other["uris"]["shared"], **agent})
+                assert denied.is_error
+                assert other["secret"] not in str(denied)
                 denied = await session.call_tool("ogm_delete_memory", {
                     "uri": other["uris"]["shared"], **agent})
                 assert denied.is_error

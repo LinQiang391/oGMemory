@@ -131,7 +131,6 @@ def test_prepare_compaction_advances_watermark_when_only_assistant_messages(serv
     mgr = service.get_session_manager()
     mgr.add_message("sess-compact", "assistant", "only assistant", ctx)
     buf = mgr.get_or_create("sess-compact")
-    existing_summary = buf.extraction_summary
 
     write_api = Mock()
     service._write_api = write_api
@@ -141,7 +140,7 @@ def test_prepare_compaction_advances_watermark_when_only_assistant_messages(serv
     assert result["messages"] == []
     write_api.commit_session.assert_not_called()
     assert buf.extraction_watermark == 1
-    assert buf.extraction_summary == existing_summary
+    assert buf.extraction_summary == ""
 
 
 def test_after_turn_deduplicates_completed_client_request(service: MemoryService, ctx: RequestContext):

@@ -218,7 +218,6 @@ async def _run_streamable_http_all_tools_check() -> None:
                         "read_only": True,
                         "write": True,
                         "delete": True,
-                        "code_edit": False,
                         "runtime": False,
                         "diagnostic": False,
                     }

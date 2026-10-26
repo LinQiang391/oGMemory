@@ -90,17 +90,6 @@ const resolved = resolveConfig({
 assert.equal(resolved.compactTakeoverEnabled, false);
 assert.equal(resolved.summaryMaxChars, 1234);
 assert.equal(resolved.shortTermIndexMode, "off");
-assert.equal(resolved.toolResultExternalizationEnabled, false);
-assert.equal(resolved.toolResultFirstViewExternalizationEnabled, true);
-assert.equal(resolved.toolResultFirstViewMinChars, 20_000);
-assert.equal(resolved.semanticTurnMode, "user_message");
-
-const externalizationResolved = resolveConfig({
-  toolResultExternalizationEnabled: true,
-  semanticTurnMode: "user_message",
-});
-assert.equal(externalizationResolved.toolResultExternalizationEnabled, true);
-assert.equal(externalizationResolved.semanticTurnMode, "user_message");
 
 const prefetchResolved = resolveConfig({
   prefetchEnabled: true,
@@ -112,20 +101,6 @@ assert.equal(prefetchResolved.prefetchTopK, 7);
 const pluginManifest = JSON.parse(
   readFileSync(new URL("./openclaw.plugin.json", import.meta.url), "utf8"),
 );
-const toolResultSchema = pluginManifest.configSchema.properties;
-assert.deepEqual(toolResultSchema.toolResultExternalizationEnabled, {
-  type: "boolean",
-  description: "Enable optional large tool-result lifecycle transport and retry support. Stable host source identity is attached when available; user_message mode can use the server Turn Ledger when OpenClaw has no message IDs. Keep aligned with the oGMemory server setting.",
-  default: false,
-});
-assert.equal(toolResultSchema.toolResultFirstViewExternalizationEnabled.type, "boolean");
-assert.equal(toolResultSchema.toolResultFirstViewExternalizationEnabled.default, true);
-assert.equal(toolResultSchema.toolResultFirstViewMinChars.type, "integer");
-assert.equal(toolResultSchema.toolResultFirstViewMinChars.minimum, 1);
-assert.equal(toolResultSchema.toolResultFirstViewMinChars.default, 20_000);
-assert.equal(toolResultSchema.toolResultFirstViewStateDir.type, "string");
-assert.deepEqual(toolResultSchema.semanticTurnMode.enum, ["user_message"]);
-assert.equal(toolResultSchema.semanticTurnMode.default, "user_message");
 for (const key of ["llmProvider", "llmModel", "embeddingModel"]) {
   assert.equal(
     Object.hasOwn(pluginManifest.configSchema.properties[key], "default"),
@@ -210,9 +185,6 @@ const spawned = spawnContextEngine(
 assert.ok(spawned);
 assert.equal(spawnedEnv.OGMEM_PREFETCH_ENABLED, "true");
 assert.equal(spawnedEnv.OGMEM_PREFETCH_TOP_K, "7");
-assert.equal(spawnedEnv.OGMEM_TOOL_RESULT_EXTERNALIZATION_ENABLED, "false");
-assert.equal(spawnedEnv.OGMEM_TOOL_RESULT_FIRST_VIEW_ENABLED, "true");
-assert.equal(spawnedEnv.OGMEM_TOOL_RESULT_SEMANTIC_TURN_MODE, "user_message");
 assert.equal(spawnedEnv.OGMEM_API_KEY, "llm-key");
 assert.equal(spawnedEnv.OGMEM_BASE_URL, "https://llm.example/v1");
 assert.equal(spawnedEnv.OGMEM_LLM_MODEL, "llm-model");

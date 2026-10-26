@@ -10,9 +10,9 @@ Usage: called by Claude Code Stop/PreCompact hooks (stdin = hook JSON).
 import json
 import os
 import sys
-import urllib.error
-import urllib.request
 from pathlib import Path
+import urllib.request
+import urllib.error
 
 _SCRIPT_DIR = Path(__file__).resolve().parent
 if str(_SCRIPT_DIR) not in sys.path:
@@ -40,16 +40,10 @@ def log(msg):
     print(f"[call_after_turn] {msg}", file=sys.stderr)
 
 
-def code_memory_only_enabled():
-    """Return whether generic transcript persistence must be skipped."""
-
-    return _env_bool("OGMEM_CODE_MEMORY_ONLY", False)
-
-
 def read_offset(sidecar_path):
     """Read last byte offset from sidecar file. Returns 0 if missing."""
     try:
-        with open(sidecar_path) as f:
+        with open(sidecar_path, "r") as f:
             return int(f.read().strip())
     except (FileNotFoundError, ValueError):
         return 0
@@ -127,7 +121,7 @@ def parse_messages(jsonl_text):
 
 def post_after_turn(session_id, messages, hook_event):
     """POST messages to oG-Memory /api/v1/after_turn."""
-    if code_memory_only_enabled() or not auto_capture_enabled():
+    if not auto_capture_enabled():
         return True
     url = f"{base_api_url()}/api/v1/after_turn"
     body = {**base_ctx(session_id), "messages": messages, "hook_event_name": hook_event}
@@ -160,10 +154,6 @@ def post_after_turn(session_id, messages, hook_event):
 # ---------------------------------------------------------------------------
 
 def main():
-    if code_memory_only_enabled():
-        log("code_memory_only skip")
-        return
-
     if not auto_capture_enabled():
         log("auto_capture disabled, skipping transcript sync")
         return
@@ -198,7 +188,7 @@ def main():
         sys.exit(0)
 
     # 5. Read incremental content
-    with open(transcript_path, encoding="utf-8", errors="replace") as f:
+    with open(transcript_path, "r", encoding="utf-8", errors="replace") as f:
         f.seek(last_offset)
         new_text = f.read()
 

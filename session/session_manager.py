@@ -98,15 +98,6 @@ class SessionBuffer:
     extraction_done_event: object = None  # threading.Event — typed as object to avoid import
     extraction_active_count: int = 0
     extraction_lock: object = field(default_factory=threading.RLock, repr=False)
-    # Serializes adapter-attested semantic-turn checkpoint governance from
-    # high-water claim through persistence/stats completion or rollback.
-    semantic_turn_lock: object = field(default_factory=threading.RLock, repr=False)
-    # Cache-delay state performs durable load/save I/O and must serialize only
-    # callers for this session, never unrelated sessions.
-    tool_result_cache_delay_lock: object = field(
-        default_factory=threading.RLock,
-        repr=False,
-    )
     session_state_save_lock: object = field(
         default_factory=threading.RLock,
         repr=False,
@@ -827,11 +818,7 @@ class SessionManager:
                                 extraction_summary=buf.extraction_summary,
                             )
                         else:
-                            # Tool-result governance needs durable runtime_extensions
-                            # even when ordinary SessionState memory is disabled.
-                            # Persist an intentionally empty bridge projection so
-                            # task/window/commitment state cannot leak into an
-                            # externalization-only session.
+                            # Persist runtime recovery state with the memory bridge disabled.
                             payload = {"task_state": {}, "commitments": []}
                         payload["completed_request_ids"] = list(
                             buf.completed_request_ids

@@ -48,45 +48,8 @@ Values `1`, `true`, and `yes` enable a switch (case-insensitive, whitespace
 trimmed); other explicit values disable it. Restart Claude after changing them.
 
 Trace uploads continue, including message content unless
-`OGMEM_TRACE_CAPTURE_CONTENT=0` selects metadata only. Read/Bash output filters
-keep their own settings. Explicit `/og-add-history`, `/og-compose`, and MCP
-tools remain available. `OGMEM_CODE_MEMORY_ONLY=true` still takes precedence
-over generic Trace and session persistence.
-
-### Optional MCP prerequisite for original-output recovery
-
-Read/Bash filtering uses the oGMemory HTTP API. Recovering a filtered original
-requires Claude to also connect to the oGMemory MCP server. The plugin does not
-start MCP or embed a user-specific URL or credential in the package.
-
-1. Start oGMemory MCP (or use an already running service), for example:
-
-   ```bash
-   ogmem mcp --transport streamable-http --config /absolute/path/ogmem.yaml
-   ```
-
-2. Add `ogmemory` through Claude Code's supported MCP command. Use the actual
-   MCP address and keep `X-Agent-ID` aligned with the plugin's Agent identity:
-
-   ```bash
-   claude mcp add --transport http --scope user ogmemory \
-     http://127.0.0.1:8091/mcp \
-     --header "X-API-Key: <tenant-key>" \
-     --header "X-Account-ID: acct-1" \
-     --header "X-User-ID: user-1" \
-     --header "X-Agent-ID: claude-code"
-   ```
-
-3. Run `claude mcp list` to confirm that `ogmemory` is connected, then use
-   `/mcp` inside a Claude session to confirm that `ogm_read_memory` is available.
-   Set this variable in the same environment that launches Claude:
-
-   ```bash
-   export OGMEM_CLAUDE_MCP_RECOVERY_ENABLED=true
-   ```
-
-Without this opt-in, filtering still works, but the Hook omits the
-`ogm_read_memory(..., recover_original=true)` recovery instruction.
+`OGMEM_TRACE_CAPTURE_CONTENT=0` selects metadata only. Explicit
+`/og-add-history`, `/og-compose`, and MCP tools remain available.
 
 - Unit tests: `pytest tests/unit/claude_plugin/test_plugin_scripts.py -q` (from repo root).
 

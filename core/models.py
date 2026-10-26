@@ -269,7 +269,6 @@ class TypedQuery:
     account_id: str = ""  # Injected by service layer
     owner_space: str | list[str] | None = None  # Further limit to user or agent scope
     intent: str | None = None  # RetrievalIntent value, for Layer 3 intent-aware retrieval
-    resource_type: str | None = None  # RESOURCE subtype pre-filter (for example, "code")
     memory_directories: list[str] | None = None  # URI type directories applied before candidate limits
 
 

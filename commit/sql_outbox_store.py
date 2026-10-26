@@ -15,7 +15,7 @@ from datetime import UTC, datetime
 from core.enums import EventType
 from core.interfaces import ContextFS
 from core.logging_config import get_logger
-from core.models import ContextNode, OutboxEvent, RequestContext
+from core.models import ContextNode, IndexRecord, OutboxEvent, RequestContext
 from fs.sql_adapter.pool import PoolAdapterMixin
 
 try:
@@ -228,14 +228,8 @@ class SQLOutboxStore(PoolAdapterMixin):
             self._return_connection(conn)
 
     def build_write_event(self, node: ContextNode) -> OutboxEvent:
-        """Build an OutboxEvent for a node write without persisting it.
-
-        Used by SQLContextFS.write_node_with_outbox to insert the event
-        in the same transaction as the node write.
-        """
-        from commit.code_resource_events import build_code_resource_write_event
-
-        return build_code_resource_write_event(node)
+        from commit.write_events import build_write_event
+        return build_write_event(node)
 
     def register_write(self, node: ContextNode, ctx: RequestContext) -> OutboxEvent:
         self.bind_context(ctx)
@@ -244,19 +238,28 @@ class SQLOutboxStore(PoolAdapterMixin):
         self._insert_event(event, account_id)
         return event
 
-    def register_delete(self, uri: str, ctx: RequestContext) -> OutboxEvent:
+    def register_delete(
+        self, uri: str, ctx: RequestContext
+    ) -> OutboxEvent:
         self.bind_context(ctx)
-        event = self.build_delete_event(uri)
+        # Pre-compute ids_to_delete so the worker always has correct L2
+        # ids (L2 uses uri/content.md suffix, not bare uri).
+        l2_uri = uri.rstrip("/") + "/content.md"
+        ids_to_delete = [
+            IndexRecord.generate_id(uri, 0),
+            IndexRecord.generate_id(uri, 1),
+            IndexRecord.generate_id(l2_uri, 2),
+        ]
+        event = OutboxEvent(
+            event_id=str(uuid.uuid4()),
+            event_type=EventType.DELETE_CONTEXT.value,
+            uri=uri,
+            payload={"ids_to_delete": ids_to_delete},
+            status="PENDING",
+        )
         account_id = self._extract_account_id(uri)
         self._insert_event(event, account_id)
         return event
-
-    @staticmethod
-    def build_delete_event(uri: str) -> OutboxEvent:
-        """Build a self-contained DELETE event without persisting it."""
-        from commit.code_resource_events import build_code_resource_delete_event
-
-        return build_code_resource_delete_event(uri)
 
     def register_archive(self, uri: str, ctx: RequestContext, *, record_ids: list[str] | None = None) -> OutboxEvent:
         """Register a node archive for index synchronization.
@@ -605,11 +608,7 @@ class SQLOutboxStore(PoolAdapterMixin):
         finally:
             self._return_connection(conn)
 
-    def is_event_current(
-        self,
-        event_id: str,
-        node_uri: str | None = None,
-    ) -> bool:
+    def is_event_current(self, event_id: str, node_uri: str | None = None) -> bool:
         """Check whether an event still exists in the outbox table.
 
         Returns True if the event row exists, False if it was deleted

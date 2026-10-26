@@ -1,4 +1,4 @@
-"""Final-review regressions: real SQL archives and artifact I/O, no models."""
+"""SQL archive and session ownership integration checks."""
 
 import threading
 import time
@@ -10,11 +10,6 @@ import psycopg2
 import pytest
 
 from core.models import Role
-from features.tool_result_externalization.externalizer import (
-    BoundedDaemonIORunner,
-    ExternalizationTimeoutError,
-)
-from features.tool_result_externalization.store_sql import SQLToolResultArtifactStore
 from fs.sql_adapter.session_mutation import SessionMutationLostError, active_session_guard
 from providers.unified_config import OgMemConfig
 from server.memory_service import MemoryService
@@ -22,7 +17,6 @@ from session.session_manager import SessionManager
 from session.session_state import SessionState
 from tests.integration.test_session_mutation_sql import ctx as ctx
 from tests.integration.test_session_mutation_sql import database as database
-from tests.unit.features.test_tool_result_externalization import _foundation_metadata
 
 
 @pytest.mark.parametrize("method", ["commit", "commit_snapshot"])
@@ -77,195 +71,14 @@ def test_guarded_sql_manager_keeps_archive_and_acknowledged_state(database, ctx,
     assert fs.exists(SessionState.state_uri(ctx.account_id, ctx.session_id), ctx)
 
 
-def test_sql_runner_lazy_store_and_all_artifact_io_keep_owner_pid_and_release_slots(database, ctx):
-    _, make = database
-    fs, _, _ = make()
-    runner = BoundedDaemonIORunner(max_inflight=1)
-    text = "A complete artifact source."
-    metadata = replace(_foundation_metadata(text), account_id=ctx.account_id, session_id=ctx.session_id,
-                       owner_user_id=ctx.user_id, owner_agent_id=ctx.agent_id)
-    observed = []
-    with fs.session_mutation_lock(SessionState.state_uri(ctx.account_id, ctx.session_id), ctx) as guard:
-        # Construction is intentionally lazy, inside the actual I/O closure.
-        store = runner.run(lambda: SQLToolResultArtifactStore(pool=fs._shared_pool),
-                           deadline=time.monotonic() + 5, operation_key=ctx.session_id)
-        original = store._get_connection
-
-        def borrow():
-            assert active_session_guard() is guard and threading.get_ident() == guard.thread_id
-            connection = original()
-            with connection.cursor() as cursor:
-                cursor.execute("SELECT pg_backend_pid()")
-                observed.append(cursor.fetchone()[0])
-            return connection
-
-        store._get_connection = borrow
-        operations = [lambda: store.write(metadata, text, ctx),
-                      lambda: store.read_all(metadata.artifact_id, ctx.session_id, ctx),
-                      lambda: store.read_metadata(metadata.artifact_id, ctx.session_id, ctx),
-                      lambda: store.read_range(metadata.artifact_id, ctx.session_id, ctx, 0, 16),
-                      lambda: store.list(ctx.session_id, ctx),
-                      lambda: store.delete_session_artifacts(ctx.session_id, ctx)]
-        for operation in operations:
-            runner.run(operation, deadline=time.monotonic() + 5, operation_key=ctx.session_id)
-            assert not runner.has_inflight(ctx.session_id)
-        assert len(observed) == 6 and len(set(observed)) == 1
-        assert runner._slots.acquire(blocking=False)
-        runner._slots.release()
 
 
-@pytest.mark.parametrize("field", ["account_id", "user_id", "agent_id", "session_id"])
-@pytest.mark.parametrize("method", ["write", "read_all", "read_metadata", "read_range", "list", "delete_session_artifacts"])
-def test_sql_artifact_every_public_method_checks_full_guard_identity(database, ctx, field, method):
-    _, make = database
-    fs, _, _ = make()
-    store = SQLToolResultArtifactStore(pool=fs._shared_pool)
-    foreign = replace(ctx, **{field: "another-identity"})
-    text = "Authorized content."
-    metadata = replace(_foundation_metadata(text), account_id=foreign.account_id,
-                       session_id=foreign.session_id, owner_user_id=foreign.user_id,
-                       owner_agent_id=foreign.agent_id)
-    with pytest.raises(SessionMutationLostError), fs.session_mutation_lock(
-            SessionState.state_uri(ctx.account_id, ctx.session_id), ctx):
-        if method == "write":
-            store.write(metadata, text, foreign)
-        elif method in ("read_all", "read_metadata"):
-            getattr(store, method)(metadata.artifact_id, foreign.session_id, foreign)
-        elif method == "read_range":
-            store.read_range(metadata.artifact_id, foreign.session_id, foreign, 0, 16)
-        else:
-            getattr(store, method)(foreign.session_id, foreign)
 
 
-def test_sql_inline_timeout_and_error_cleanup_keep_slots_and_inflight_balanced(database, ctx):
-    _, make = database
-    fs, _, _ = make()
-    runner = BoundedDaemonIORunner(max_inflight=1)
-    calls = []
-    with fs.session_mutation_lock(SessionState.state_uri(ctx.account_id, ctx.session_id), ctx):
-        def slow():
-            calls.append(threading.get_ident())
-            time.sleep(.04)
-        with pytest.raises(ExternalizationTimeoutError):
-            runner.run(slow, deadline=time.monotonic() + .02, operation_key=ctx.session_id)
-        assert len(calls) == 1 and not runner.has_inflight(ctx.session_id)
-        assert runner.run(lambda: "next", deadline=time.monotonic() + 5, operation_key=ctx.session_id) == "next"
-        with pytest.raises(ValueError, match="ordinary I/O rejection"):
-            runner.run(lambda: (_ for _ in ()).throw(ValueError("ordinary I/O rejection")),
-                       deadline=time.monotonic() + 5, operation_key=ctx.session_id)
-        assert not runner.has_inflight(ctx.session_id) and runner._slots.acquire(blocking=False)
-        runner._slots.release()
 
 
-@pytest.mark.parametrize("entry", ["first_view", "after_turn", "add_message", "compose"])
-def test_public_artifact_after_owner_loss_and_fenced_delete_cannot_publish(database, ctx, entry):
-    dsn, _ = database
-    cfg = OgMemConfig(storage_backend="sql", sql_connection_string=dsn, provider="mock",
-                      tool_result_externalization_enabled=True, tool_result_single_chars=500,
-                      tool_result_write_timeout_ms=5000, after_turn_threshold=100000,
-                      session_state_bridge_enabled=False)
-    service, latest = MemoryService(config=cfg), MemoryService(config=cfg)
-    for instance in (service, latest):
-        instance._flush_session_tool_usage_async = Mock()
-        instance.get_llm = Mock(side_effect=AssertionError("artifact path initialized a model"))
-    entered, release = threading.Event(), threading.Event()
-    observed = {}
-    original = service._tool_result_store.write
-
-    def delayed(metadata, text, request):
-        guard = active_session_guard()
-        assert guard is not None and guard.thread_id == threading.get_ident()
-        with guard.connection.cursor() as cursor:
-            cursor.execute("SELECT pg_backend_pid()")
-            observed["pid"] = cursor.fetchone()[0]
-        guard.connection.rollback()
-        entered.set()
-        assert release.wait(10)
-        return original(metadata, text, request)
-
-    service._tool_result_store.write = delayed
-    request = dict(sessionId=ctx.session_id, adapterId="regression.test", turnId="turn-one",
-                   toolCallId="call-one", toolName="sql_result", _ctx=ctx,
-                   content=[{"type": "text", "text": "Observed test component reading 25 units.\n" * 150}])
-
-    def dispatch():
-        message = {"role": "toolResult", "toolCallId": "call-one", "toolName": "sql_result", "content": request["content"]}
-        if entry == "first_view":
-            return service.govern_first_view_tool_result(request)
-        if entry == "add_message":
-            return service.add_session_message({"sessionId": ctx.session_id, "_ctx": ctx, "message": message})
-        return getattr(service, entry)({"sessionId": ctx.session_id, "_ctx": ctx, "messages": [message]})
-
-    control = psycopg2.connect(dsn)
-    try:
-        with ThreadPoolExecutor(max_workers=1) as threads:
-            pending = threads.submit(dispatch)
-            assert entered.wait(5)
-            with control.cursor() as cursor:
-                cursor.execute("SELECT pg_terminate_backend(%s)", (observed["pid"],))
-                assert cursor.fetchone()[0]
-            control.commit()
-            deleted = latest.delete_session({"sessionId": ctx.session_id, "_ctx": replace(ctx, role=Role.ADMIN)})
-            assert deleted["cleaned"] and deleted["status"] == 200
-            release.set()
-            assert pending.result(timeout=10)["status"] == "needs_confirmation"
-        with control.cursor() as cursor:
-            cursor.execute("SELECT count(*) FROM tool_result_artifacts WHERE account_id=%s AND session_id=%s",
-                           (ctx.account_id, ctx.session_id))
-            assert cursor.fetchone()[0] == 0
-        assert not service._tool_result_io_runner.has_inflight(ctx.session_id)
-    finally:
-        release.set()
-        control.close()
-        for instance in (service, latest):
-            instance.get_llm.assert_not_called()
-            if instance._sql_pool is not None:
-                instance._sql_pool.close_all()
 
 
-@pytest.mark.parametrize("entry", ["first_view", "after_turn", "add_message", "compose"])
-def test_sql_public_governance_paths_run_actual_artifact_io_under_owner(database, ctx, entry):
-    dsn, _ = database
-    service = MemoryService(config=OgMemConfig(
-        storage_backend="sql", sql_connection_string=dsn, provider="mock",
-        tool_result_externalization_enabled=True, tool_result_single_chars=500,
-        after_turn_threshold=100000, session_state_bridge_enabled=False))
-    service._flush_session_tool_usage_async = Mock()
-    service.get_llm = Mock(side_effect=AssertionError("artifact governance initialized a model"))
-    service._get_shared_embedder = Mock(side_effect=AssertionError("artifact governance initialized embeddings"))
-    original = service._tool_result_store.write
-    observed = []
-
-    def owned_write(metadata, text, request):
-        guard = active_session_guard()
-        assert guard is not None and guard.thread_id == threading.get_ident()
-        guard.ensure_owned()
-        observed.append(guard)
-        return original(metadata, text, request)
-
-    service._tool_result_store.write = owned_write
-    content = [{"type": "text", "text": "Observed test component reading 25 units.\n" * 150}]
-    message = {"role": "toolResult", "toolCallId": "governance-call", "toolName": "sql_result", "content": content}
-    request = {"sessionId": ctx.session_id, "_ctx": ctx}
-    try:
-        if entry == "first_view":
-            response = service.govern_first_view_tool_result({**request, "adapterId": "regression.test",
-                "turnId": "turn-one", "toolCallId": "governance-call", "toolName": "sql_result", "content": content})
-        elif entry == "after_turn":
-            response = service.after_turn({**request, "messages": [message]})
-        elif entry == "add_message":
-            response = service.add_session_message({**request, "message": message})
-        else:
-            response = service.compose({**request, "messages": [message]})
-        assert response.get("status") != "needs_confirmation", response
-        assert observed
-        assert len(service._tool_result_store.list(ctx.session_id, ctx)["artifacts"]) == 1
-        assert not service._tool_result_io_runner.has_inflight(ctx.session_id)
-        service.get_llm.assert_not_called()
-        service._get_shared_embedder.assert_not_called()
-    finally:
-        if service._sql_pool is not None:
-            service._sql_pool.close_all()
 
 
 def _seed_archives(fs, archive, ctx):
