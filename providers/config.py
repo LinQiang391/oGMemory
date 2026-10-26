@@ -6,6 +6,7 @@ Now delegates to ``OgMemConfig`` for unified YAML + env loading.
 
 from __future__ import annotations
 
+import os
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Any, Literal
 
@@ -17,7 +18,7 @@ if TYPE_CHECKING:
     from providers.unified_config import OgMemConfig, SecretCommandSpec
 
 
-ProviderType = Literal["mock", "openai", "openai-cached", "st"]
+ProviderType = Literal["mock", "openai", "openai-cached", "st", "volcengine"]
 # Open string type allows names supplied through the vector provider registry.
 VectorDbType = str
 
@@ -178,6 +179,22 @@ class ProviderConfig:
         if ep == "st":
             from providers.embedder.st_embedder import SentenceTransformerEmbedder
             return SentenceTransformerEmbedder(model=self.st_model)
+
+        if ep == "volcengine":
+            from providers.embedder.volcengine_embedder import VolcengineEmbedder
+            api_key = self.effective_embedding_api_key() or os.environ.get("VOLC_API_KEY", "")
+            base_url = (
+                self.openai_embedding_base_url
+                or os.environ.get("VOLC_BASE_URL", "https://ark.cn-beijing.volces.com/api/coding/v3")
+            )
+            model = os.environ.get(
+                "VOLC_EMBEDDING_MODEL",
+                self.openai_embedding_model or "doubao-embedding-vision-250615",
+            )
+            return VolcengineEmbedder(
+                api_key=api_key, model=model, base_url=base_url,
+                dimension=self.opengauss_dimension or 1024,
+            )
 
         if ep in ("openai", "openai-cached"):
             emb_url = self.openai_embedding_base_url or self.openai_base_url

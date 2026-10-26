@@ -427,7 +427,7 @@ OG_ADMIN_API_KEYS="global-admin-key"
 | `llm.model` | `OGMEM_LLM_MODEL` 或模板中的 `LLM_MODEL` | `gpt-4o-mini` | 任意可用模型名，如 `qwen3-max`、`gpt-4o-mini`、`glm-4.5` | 部署模板默认直接引用 `LLM_MODEL` |
 | `llm.temperature` | `LLM_TEMPERATURE` | `0.7` | 通常 `0.0` 到 `2.0` | 数值越低越稳定 |
 | `llm.max_tokens` | `LLM_MAX_TOKENS` | `4096` | 正整数 | 单次生成最大 token 数 |
-| `embedding.provider` | `EMBEDDING_PROVIDER` | 空，回退到 `llm.provider` | `openai` / `st` / `mock` | Embedding 提供商 |
+| `embedding.provider` | `EMBEDDING_PROVIDER` | 空，回退到 `llm.provider` | `openai` / `volcengine` / `st` / `mock` | 文本 Embedding 适配器；`volcengine` 使用原有 Ark 文本请求协议 |
 | `embedding.model` | `OGMEM_EMBEDDING_MODEL` | `text-embedding-ada-002` | 你的 Embedding 模型名，如 `text-embedding-v4` | 需要和向量维度匹配 |
 | `embedding.base_url` | `OGMEM_EMBEDDING_BASE_URL` | 空，回退到 `llm.base_url` | 兼容接口地址 | Embedding API 地址 |
 | `embedding.api_key` | `OGMEM_EMBEDDING_API_KEY` | 空，回退到 `llm.api_key` | API Key 字符串 | Embedding API Key |

@@ -462,7 +462,7 @@ class OgMemConfig:
     llm_extra_body: dict[str, Any] = field(default_factory=dict)
 
     # -- Embedding -------------------------------------------------------------
-    embedding_provider: str | None = None  # Separate embedding provider (st/openai/mock)
+    embedding_provider: str | None = None  # Separate embedding provider (st/openai/volcengine/mock)
     openai_embedding_model: str = "text-embedding-ada-002"
     openai_embedding_base_url: str | None = None
     openai_embedding_api_key: str | None = None

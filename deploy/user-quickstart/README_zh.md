@@ -50,7 +50,7 @@ export LLM_MODEL='your-llm-model'
 export LLM_API_KEY='your-llm-api-key'
 
 # Embedding Base URL 不要包含具体的 /embeddings 接口。
-# 使用 OpenAI 兼容的文本 Embedding 服务，provider 设为 openai。
+# 文本 Embedding：OpenAI 兼容协议用 openai，Ark 文本向量接口用 volcengine。
 export EMBEDDING_PROVIDER='openai'
 export EMBEDDING_BASE_URL='https://embedding.example.com/v1'
 export EMBEDDING_MODEL='your-embedding-model'

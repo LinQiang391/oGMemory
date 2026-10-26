@@ -417,7 +417,7 @@ ogmem onboard --non-interactive --mode docker --provider openai --api-key "$LLM_
 上面的非交互命令会在预检通过后启动容器。如需先生成配置、稍后启动，运行
 `ogmem onboard --mode docker`，并在启动提示处选择否。
 Docker 的 LLM 支持 OpenAI、Volcengine、DashScope 和智谱；文本 Embedding 使用
-OpenAI 兼容适配器及独立配置的地址和密钥。Mock provider 仅支持 local 模式。
+OpenAI 兼容或 Ark 适配器及其配置的地址和密钥。Mock provider 仅支持 local 模式。
 智谱默认的 `embedding-3` 配置使用模型原生的 2048 维。配置中的维度必须与服务
 返回的向量一致；仅修改该数值不会改变模型服务实际输出的维度。
 

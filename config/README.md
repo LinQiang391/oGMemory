@@ -145,8 +145,11 @@ local process record takes precedence over unrelated Docker containers.
 `embedding.provider` selects an implementation/protocol, not necessarily the
 service vendor. For OpenAI-compatible APIs, use `openai`. Local onboarding maps
 `zhipu` and `dashscope` to `openai`, preserving their endpoint, model, key and
-dimension. Other supported adapters are `openai-cached`, `st`,
+dimension. Other supported adapters are `openai-cached`, `volcengine`, `st`,
 and `mock`; unsupported names are rejected before configuration is saved.
+
+The `volcengine` adapter preserves the existing Ark text-embedding protocol.
+Each request submits a text input with the configured model and dimension.
 
 In non-interactive onboarding, a different Embedding vendor uses its own default
 endpoint and requires `--embedding-api-key` (except local `st`/`mock` adapters).
