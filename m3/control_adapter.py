@@ -507,39 +507,48 @@ def Search(
     radius = search_config.include_neighbors
     if limits:
         # Reserve boundary/main evidence before planning or reading neighbors.
-        # Bound both the scan radius and the number of backend clip parameters.
+        # Final evidence slots are separate from the candidate-clip read budget:
+        # an indexed clip may have no usable evidence.
         boundary = boundary[:1]
         hits = hits[:limits.max_result_nodes - len(boundary)]
         context_k = min(context_k, limits.max_result_nodes - len(boundary) - len(hits))
-        radius = min(radius, limits.max_result_nodes)
     contexts = []
     if context_k and hits:
         from service.graph_service import ClipScope
         plan = neighbor_plan(
             [(h.video_id, h.clip_id, h.node.node_id) for h in hits],
             radius=radius, before_clip=search_config.before_clip,
-            max_clips=context_k if limits else None,
+            max_clips=limits.max_neighbor_clips if limits else None,
         )
         if plan:
-            raw_context = graph.get_evidence_by_clips(
-                [clip for video, clip in plan if video == search_config.video_id], ctx,
-                scope=ClipScope(search_config.video_id, search_config.before_clip, search_config.before_sec),
-                extractor_types=search_config.extractor_types,
-            )
-            ranked_context = []
+            candidates = [clip for video, clip in plan if video == search_config.video_id]
+            requested = []
             seen = {h.node.node_id for h in hits}
-            for h in raw_context:
-                key = (h.video_id, h.clip_id)
-                if key not in plan:
-                    continue
-                distance, rank, parent = plan[key]
-                ranked_context.append(((distance, rank, h.clip_id, h.node.node_id), h, parent, distance))
-            for _, h, parent, distance in sorted(ranked_context, key=lambda item: item[0]):
-                if h.node.node_id not in seen:
-                    seen.add(h.node.node_id)
-                    contexts.append((h, parent, distance))
-            contexts = contexts[:context_k]
-            retrieval_branches.append({"kind": "exact_neighbor", "clip_ids": [clip for _, clip in plan]})
+            while len(requested) < len(candidates) and len(contexts) < context_k:
+                # Keep SQL parameter counts and round trips bounded. With no
+                # budget retain the historical single-read behavior.
+                batch_size = min(8, context_k - len(contexts)) if limits else len(candidates)
+                batch = candidates[len(requested):len(requested) + batch_size]
+                requested.extend(batch)
+                raw_context = graph.get_evidence_by_clips(
+                    batch, ctx,
+                    scope=ClipScope(search_config.video_id, search_config.before_clip, search_config.before_sec),
+                    extractor_types=search_config.extractor_types,
+                )
+                batch_keys = {(search_config.video_id, clip) for clip in batch}
+                ranked_context = []
+                for h in raw_context:
+                    key = (h.video_id, h.clip_id)
+                    if key not in batch_keys:
+                        continue
+                    distance, rank, parent = plan[key]
+                    ranked_context.append(((distance, rank, h.clip_id, h.node.node_id), h, parent, distance))
+                for _, h, parent, distance in sorted(ranked_context, key=lambda item: item[0]):
+                    if h.node.node_id not in seen:
+                        seen.add(h.node.node_id)
+                        contexts.append((h, parent, distance))
+                contexts = contexts[:context_k]
+            retrieval_branches.append({"kind": "exact_neighbor", "clip_ids": requested})
 
     def serialize(h):
         from core.temporal import temporal_metadata

@@ -32,6 +32,7 @@ class ContextBudget:
     max_top_k: int = 16
     max_candidates: int = 32
     max_result_nodes: int = 24
+    max_neighbor_clips: int = 64
     max_search_calls: int = 8
     max_query_bytes: int = 2048
     max_selected_nodes: int = 32

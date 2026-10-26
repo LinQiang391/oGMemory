@@ -24,6 +24,7 @@ m3:
     max_top_k: 16
     max_candidates: 32
     max_result_nodes: 24
+    max_neighbor_clips: 64
     max_search_calls: 8
     max_selected_nodes: 32
     max_passages_per_node: 32
@@ -51,6 +52,11 @@ min(max_input_tokens, context_window - max_output_tokens - safety_tokens)
   模型不能再通过增大 top_k 无限扩大候选数。
 - `max_result_nodes` 包含主结果、邻近片段和时间边界片段，不是三个独立预算。
   保留边界证据槽位，再分配主结果和邻居。
+- `max_neighbor_clips` 独立限制每次 Search 实际请求的邻居 clip 总数（默认 64），
+  不与最终 `context_k` 混用。按距离、主命中排名顺序分批读取，每批最多 8 个 clip，
+  且不超过尚缺的邻居证据数。空 clip 不消耗结果槽位；获得足够有效证据、
+  用完读取预算或遍历完 `include_neighbors` 范围后停止。
+  `max_result_nodes` 不再缩短邻居半径；读取预算耗尽时仍可能返回少于 `context_k` 条。
 - 每题至多 `max_search_calls` 次可执行的 Search 请求；缓存/无效请求也消耗
   该调用额度。超过额度只返回拒绝信息，不继续检索，并切换为 Answer-only。
 - 查询大小受 `max_query_bytes` 限制，超长查询拒绝，不偷偷改写为另一条查询。

@@ -140,7 +140,8 @@ def test_budget_reserves_output_and_safety():
                            max_output_tokens=3000, safety_tokens=1000)
     assert budget.input_limit == 6000
     for settings in ({"max_search_calls": 0}, {"max_top_k": True},
-                     {"context_window": 1000}, {"max_candidates": 1}):
+                     {"context_window": 1000}, {"max_candidates": 1},
+                     {"max_neighbor_clips": 0}, {"max_neighbor_clips": True}):
         with pytest.raises(ValueError):
             ContextBudget(**settings)
     for settings in ({"tokenizer_multiplier": .5}, {"tokenizer_multiplier": float("nan")},
@@ -186,6 +187,8 @@ def test_loader_opt_in_and_output_reservation(tmp_path):
     assert load_context_budget(str(path)) is None
     path.write_text("m3:\n  qa_llm:\n    max_tokens: 2048\n  qa_context:\n    enabled: true\n")
     assert load_context_budget(str(path)).max_output_tokens == 2048
+    path.write_text("m3:\n  qa_context:\n    enabled: true\n    max_neighbor_clips: 7\n")
+    assert load_context_budget(str(path)).max_neighbor_clips == 7
     path.write_text("m3:\n  qa_context:\n    enabled: 'false'\n")
     with pytest.raises(ValueError):
         load_context_budget(str(path))
@@ -244,7 +247,7 @@ def test_total_result_cap_includes_boundary_and_neighbors(monkeypatch):
     assert result["retrieved_before_result_limit"] == 10
 
 
-@pytest.mark.parametrize("context_k,cap,expected", [(1, 2, 1), (2000, 3, 2), (2000, 1, 0)])
+@pytest.mark.parametrize("context_k,cap,expected", [(1, 2, 5), (2000, 3, 5), (2000, 1, 0)])
 def test_neighbor_requests_are_bounded_before_graph_read(monkeypatch, context_k, cap, expected):
     from types import SimpleNamespace
     from m3.context_retrieval import neighbor_plan
@@ -264,16 +267,85 @@ def test_neighbor_requests_are_bounded_before_graph_read(monkeypatch, context_k,
     Search("scissors", graph=graph, embedder=embedder, ctx=context(),
            search_config=SearchConfig(
                video_id="v1", include_neighbors=2000, context_k=context_k,
-               context_budget=ContextBudget(max_result_nodes=cap)))
+               context_budget=ContextBudget(max_result_nodes=cap, max_neighbor_clips=5)))
     if expected:
-        assert planner.call_args.kwargs["radius"] <= cap
+        assert planner.call_args.kwargs["radius"] == 2000
         assert planner.call_args.kwargs["max_clips"] == expected
-        clips = graph.get_evidence_by_clips.call_args.args[0]
+        batches = [call.args[0] for call in graph.get_evidence_by_clips.call_args_list]
+        clips = [clip for batch in batches for clip in batch]
         assert len(clips) == len(set(clips)) == expected
-        assert all(abs(clip - 5000) <= cap for clip in clips)
+        assert all(len(batch) <= min(8, context_k, cap - 1) for batch in batches)
     else:
         planner.assert_not_called()
         graph.get_evidence_by_clips.assert_not_called()
+
+
+@pytest.mark.parametrize("radius,available,read_cap,expected_requests,expected_hits", [
+    (1, [11], 64, [9, 11], [11]),  # review repro: previous clip has no index entry
+    (4, [14], 64, [9, 11, 8, 12, 7, 13, 6, 14], [14]),  # beyond result cap
+    (2000, [], 5, [9, 11, 8, 12, 7], []),  # read budget, not radius, stops empty reads
+    (4, [14], 5, [9, 11, 8, 12, 7], []),  # explicit read-budget exhaustion
+    (4, [9, 11, 14], 64, [9], [9]),  # stop as soon as result quota is satisfied
+])
+def test_sparse_neighbors_continue_until_evidence_or_read_budget(
+    monkeypatch, radius, available, read_cap, expected_requests, expected_hits,
+):
+    from types import SimpleNamespace
+
+    def entry(clip):
+        return SimpleNamespace(
+            node=SimpleNamespace(node_id=f"n{clip}", extracted_content={"description": "scissors"}),
+            score=1., video_id="v1", clip_id=clip,
+        )
+
+    graph = Mock()
+    graph.search_by_embedding.return_value = [entry(10)]
+    graph.get_evidence_by_clips.side_effect = lambda clips, *args, **kwargs: [
+        entry(clip) for clip in clips if clip in available
+    ]
+    embedder = Mock()
+    embedder.embed_texts.return_value = [[1.]]
+    monkeypatch.setattr("m3.transcript_rerank.rerank_with_transcript_bm25",
+                        lambda query, hits, **kwargs: hits)
+    result = Search("scissors", graph=graph, embedder=embedder, ctx=context(),
+                    search_config=SearchConfig(
+                        video_id="v1", include_neighbors=radius, context_k=1,
+                        context_budget=ContextBudget(max_result_nodes=3, max_neighbor_clips=read_cap)))
+    requests = [clip for call in graph.get_evidence_by_clips.call_args_list for clip in call.args[0]]
+    assert requests == expected_requests
+    assert len(requests) <= read_cap
+    assert [h["clip_id"] for h in result["context_hits"]] == expected_hits
+    assert all(h["context_for"] == "n10" and h["context_distance"] == abs(h["clip_id"] - 10)
+               for h in result["context_hits"])
+    assert result["retrieval_branches"][-1] == {"kind": "exact_neighbor", "clip_ids": requests}
+
+
+def test_neighbor_batches_count_only_unique_in_scope_evidence(monkeypatch):
+    from types import SimpleNamespace
+
+    def entry(clip, node=None, video="v1"):
+        return SimpleNamespace(
+            node=SimpleNamespace(node_id=node or f"n{clip}", extracted_content={"description": "scissors"}),
+            score=1., video_id=video, clip_id=clip,
+        )
+
+    graph = Mock()
+    graph.search_by_embedding.return_value = [entry(10), entry(20)]
+    graph.get_evidence_by_clips.side_effect = [
+        [entry(9, video="other"), entry(9, node="n10"), entry(19), entry(11), entry(11)],
+        [entry(19), entry(19)],
+    ]
+    embedder = Mock()
+    embedder.embed_texts.return_value = [[1.]]
+    monkeypatch.setattr("m3.transcript_rerank.rerank_with_transcript_bm25",
+                        lambda query, hits, **kwargs: hits)
+    result = Search("scissors", graph=graph, embedder=embedder, ctx=context(),
+                    search_config=SearchConfig(
+                        video_id="v1", include_neighbors=1, context_k=2,
+                        context_budget=ContextBudget(max_result_nodes=4, max_neighbor_clips=4)))
+    assert [call.args[0] for call in graph.get_evidence_by_clips.call_args_list] == [[9, 11], [19]]
+    assert [(h["clip_id"], h["context_for"], h["context_distance"]) for h in result["context_hits"]] == [
+        (11, "n10", 1), (19, "n20", 1)]
 
 
 def test_shared_neighbors_keep_each_parent_relation_without_new_content_versions():
@@ -308,6 +380,15 @@ def test_bounded_neighbor_plan_preserves_priority_and_shared_neighbor_parent():
         bounded = neighbor_plan(seeds, radius=5, before_clip=13, max_clips=count)
         assert list(bounded.items()) == list(full.items())[:count]
     assert full[("v1", 11)] == (1, 0, "parent1")
+
+
+def test_bounded_neighbor_plan_skips_huge_invalid_ranges():
+    from m3.context_retrieval import neighbor_plan
+
+    assert neighbor_plan([("v1", "bad", "n")], radius=10**12, max_clips=5) == {}
+    plan = neighbor_plan([("v1", 10**12, "n")], radius=10**12,
+                         before_clip=2, max_clips=2)
+    assert list(plan) == [("v1", 2), ("v1", 1)]
 
 
 def test_oversized_query_is_rejected_before_retrieval(monkeypatch):
