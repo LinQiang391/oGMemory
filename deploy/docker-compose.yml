@@ -24,24 +24,8 @@
 #   docker compose --profile with-og up -d              # openGauss + ogmem (external storage DB)
 #   docker compose --profile with-db up -d              # openGauss + postgres + ogmem
 #   docker compose --profile with-db --profile with-openclaw up -d   # + openclaw gateway
-#   docker compose --profile with-db --profile with-cv up -d --build  # + CPU face detection
-#   docker compose -f docker-compose.cv.yml up -d --build --wait      # CV only, no DB/LLM credentials
 #   docker compose --profile with-db down               # stop (keeps volumes)
 #   docker compose --profile with-db down -v            # stop and drop volumes
-#
-#   # M3-Bench SQL Graph Store integration tests — explicitly target Postgres:
-#   #   docker compose --profile with-m3 up -d postgres
-#   # brings JUST Postgres with pgvector. Without the explicit service target,
-#   # `with-m3` also starts ogmem, just like `with-pg`.
-#   # This is the "single-DB" convenience path: instead of running an
-#   # openGauss cluster for the vector index, M3 points at the same
-#   # Postgres container the graph store uses. The M3 OpenGaussVectorIndex
-#   # code path runs unmodified against PG+pgvector because the SQL
-#   # (CREATE EXTENSION vector, vector(N), hnsw, MERGE INTO) is portable.
-#   # The test then connects via `OGMEM_TEST_DSN` and the schema lazy-loads
-#   # on first connect (`SQLGraphStore._ensure_schema`).
-#   # See tests/integration/test_sql_graph_search_by_embedding.py and
-#   # tests/integration/m3/test_vector_index_path.py for the env vars.
 #
 # Env-var naming: the deploy surface has exactly two DB connection
 # families — STORAGE_DB_* (the SQL storage Postgres) and VECTOR_DB_*
@@ -63,12 +47,6 @@
 #                    When running both databases, assign distinct host ports
 #                    via VECTOR_DB_HOST_PORT and STORAGE_DB_HOST_PORT.
 #   with-openclaw  opt-in  OpenClaw gateway (web UI on $GATEWAY_PORT)
-#   with-m3    opt-in  Alias for with-pg — `graph_schema.sql` is loaded lazily
-#                    by the first SQLGraphStore connection. Use when running
-#                    the M3-Bench SQL integration tests in isolation; the
-#                    same Postgres container is shared with `with-db` if both
-#                    profiles are enabled.
-#
 # Notes:
 #   * Both `ogmem` and `openclaw` use `network_mode: host`, so they bind
 #     directly to the host's loopback (127.0.0.1). `OGMEM_URL` therefore
@@ -86,18 +64,6 @@
 name: ogmem
 
 services:
-
-  # Optional CV sidecar. Separate entry point avoids interpolation of
-  # unrelated required DB/LLM variables for CV-only benchmark users.
-  cv:
-    extends:
-      file: docker-compose.cv.yml
-      service: cv
-    profiles: ["with-cv"]
-    # Reuse the stack bridge rather than implicitly allocating another
-    # default network (which can fail on hosts with exhausted address pools).
-    networks:
-      - ant-trail-net
 
   # --------------------------------------------------------------
   # openGauss — vector DB only (when storage.backend=sql, context store
@@ -139,45 +105,13 @@ services:
       - ant-trail-net
 
   # --------------------------------------------------------------
-  # postgres — SQL storage backend (context files, grants, outbox,
-  # subscriptions, etc.). The image is `pgvector/pgvector:pg16` (NOT
-  # plain `postgres:16`) so the same container can ALSO act as the M3
-  # vector index backend via the pgvector extension — eliminating
-  # the need to run a separate openGauss cluster for dev / single-DB
-  # deployments.
-  #
-  # Production should still target an openGauss cluster for the
-  # vector index (see the `opengauss` service above); this container
-  # is the "single-DB convenience" alternative. Switch by pointing
-  # ``vector_db.connection_string`` in `deploy/ogmemory.yaml`
-  # at whichever instance you want — the M3 vector index inherits
-  # that same DSN (no separate key), and the underlying
-  # `OpenGaussVectorIndex` code path runs unmodified against both
-  # (the `_ensure_table` migration issues `CREATE EXTENSION IF NOT
-  # EXISTS vector`, which is a no-op on this image and a graceful
-  # ignored syntax error on openGauss, which ships `vector(N)`
-  # natively).
-  #
-  # Started under `with-db`, `with-pg`, or the legacy `with-m3` profile.
-  # For DB-only integration tests, explicitly target `up -d postgres`;
-  # otherwise ogmem is always included. Skip if you have an external
-  # Postgres and set STORAGE_DB_HOST.
-  #
-  # The POSTGRES_PASSWORD / POSTGRES_USER / POSTGRES_DB container vars
-  # are dictated by the official postgres image entrypoint and cannot
-  # be renamed — but the .env source vars feeding them are
-  # STORAGE_DB_PASSWORD / STORAGE_DB_USER / STORAGE_DB_NAME so the
-  # deploy surface stays two-named: STORAGE_DB_* (storage DB) and
-  # VECTOR_DB_* (vector DB).
-  #
-  # `graph_schema.sql` is loaded lazily the first time SQLGraphStore
-  # connects (see SQLGraphStore._ensure_schema), so the integration
-  # tests do not need a separate init job.
+  # postgres — SQL storage for context files, grants, outbox, and subscriptions.
+  # The pgvector image also supports single-database vector deployments.
   # --------------------------------------------------------------
   postgres:
     image: pgvector/pgvector:pg16
     container_name: ${STORAGE_DB_CONTAINER_NAME:-ogmem-postgres}
-    profiles: ["with-db", "with-pg", "with-m3"]
+    profiles: ["with-db", "with-pg"]
     restart: unless-stopped
     environment:
       POSTGRES_PASSWORD: ${STORAGE_DB_PASSWORD:?STORAGE_DB_PASSWORD is required — set it in deploy/.env}
@@ -399,7 +333,6 @@ services:
       start_period: 30s
 
 volumes:
-  cv-models:
   ogdb:
   postgres-data:
   openclaw-home:

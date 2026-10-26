@@ -1,8 +1,0 @@
-# This image needs neither benchmark data nor local configuration/secrets.
-# BuildKit uses this tighter allowlist instead of the root .dockerignore.
-**
-!docker/
-!docker/Dockerfile.cv
-!docker/requirements-cv.txt
-!scripts/
-!scripts/cv_service.py

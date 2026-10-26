@@ -44,10 +44,6 @@ docker compose -p my-project --profile with-db --profile with-openclaw build ogm
 docker compose -p my-project --profile with-db --profile with-openclaw up -d --no-deps --no-build ogmem openclaw
 ```
 
-M3-Bench 的独立人脸检测服务也支持 Compose 管理（可选 `with-cv`
-profile，或不需要 DB/LLM 配置的 CV-only 启动入口），见
-[CV 服务部署说明](README.cv.md)。
-
 本目录同时提供两种部署方式：
 
 | 方式 | 入口 | 状态 |
@@ -101,7 +97,7 @@ docker compose --profile with-db down -v       # 停止并删除 volumes
 
 | 变量族 | 指向 | 说明 |
 |--------|------|------|
-| `STORAGE_DB_*` | SQL 存储库（Postgres） | context files / events / grants / outbox / M3 graph store |
+| `STORAGE_DB_*` | SQL 存储库（Postgres） | context files / events / grants / outbox |
 | `VECTOR_DB_*` | 向量库 | 生产推荐 openGauss；dev / 单库部署可指向同一个 pgvector Postgres |
 
 两套变量默认指向两个独立数据库；单库部署时把 `VECTOR_DB_HOST/PORT/NAME/USER`
@@ -370,7 +366,7 @@ OG_ADMIN_API_KEYS="global-admin-key"
 
 > 向量库默认是 openGauss 容器（生产推荐目标）；单库部署时把
 > `VECTOR_DB_HOST` 改为 `postgres` 即可让向量索引落在 pgvector Postgres
-> 里，M3 的 `OpenGaussVectorIndex` 代码路径无需改动。
+> 里。
 
 | 变量名 | 说明 | 默认值 | 适用服务 |
 |--------|------|--------|---------|

@@ -15,10 +15,8 @@ tests/e2e/result
 # ============================================================
 # .dockerignore for the ogmem standalone image
 # ============================================================
-# Excludes large/non-essential directories from the build context
-# so `docker build` doesn't try to send 300+ GB of M3 video data
-# to the Docker daemon. Python source, scripts, entrypoint, and
-# the bundled AGFS source/config are needed.
+# Excludes data, caches, and local artifacts from the build context.
+# Python source, scripts, entrypoint, and AGFS compatibility sources are included.
 
 # ---- Build output / caches ----
 .git/
@@ -41,7 +39,7 @@ tests/
 coverage.json
 .perf/
 
-# ---- M3 bench data (huge: 300+ GB) ----
+# ---- Runtime data ----
 data/
 .ogmem_data/
 .ogmem*/
@@ -93,8 +91,6 @@ draft/
 team/
 examples/
 parse/
-# cv_service.py is needed by docker/Dockerfile.cv, including legacy builders
-# that do not support Dockerfile-specific ignore files.
 scripts/litellm_proxy.sh
 
 # ---- Old / unrelated configs ----
@@ -103,8 +99,6 @@ config/.env
 config/ogmem.reference.yaml
 config/env.example
 config/deploy.env.reference
-config/operators.yaml
-config/operators.reference.yaml
 # config/openclaw/ogmem.template.json is intentionally NOT excluded — the
 # openclaw Dockerfile copies it as the bundled config template.
 config/litellm_config.yaml

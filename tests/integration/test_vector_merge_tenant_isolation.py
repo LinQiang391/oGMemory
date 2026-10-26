@@ -4,14 +4,12 @@ A schema-local text domain stands in for the vector type: these tests check
 the DML/tenant boundary, not ANN behavior or openGauss-specific execution.
 """
 
-import argparse
 import os
 from dataclasses import replace
 from uuid import uuid4
 
 import pytest
 
-from m3.index_episodic import _upsert_to_vector_index
 from providers.vector_index import opengauss_index
 
 DSN = os.environ.get("OGMEM_TEST_DSN") or os.environ.get("GRAPH_DSN")
@@ -41,8 +39,8 @@ def index(monkeypatch):
                 id text PRIMARY KEY, uri text, level integer, text text,
                 embedding vector, filters jsonb, metadata jsonb,
                 account_id text, owner_space text, node_uri text, node_id text,
-                record_kind text, node_status text, space_id text, video_id text,
-                extractor_type text, before_clip integer, updated_at timestamptz
+                record_kind text, node_status text, space_id text,
+                updated_at timestamptz
             )
         """)
     conn.commit()
@@ -60,37 +58,12 @@ def index(monkeypatch):
         conn.close()
 
 
-def test_same_clip_across_accounts_and_reindexing_preserve_both_records(index):
-    vi, conn = index
-    record = {
-        "video_id": "same", "clip_id": 1, "source_extracted_node_id": "ext-a",
-        "text": "original a", "embedding": [1.0, 0.0],
-    }
-    _upsert_to_vector_index([record], vi, argparse.Namespace(account_id="a"))
-    _upsert_to_vector_index(
-        [{**record, "text": "private b", "embedding": [0.0, 1.0],
-          "source_extracted_node_id": "ext-b"}],
-        vi, argparse.Namespace(account_id="b"),
-    )
-    _upsert_to_vector_index(
-        [{**record, "text": "updated a"}], vi, argparse.Namespace(account_id="a"),
-    )
-    with conn.cursor() as cur:
-        cur.execute("SELECT id, account_id, text, metadata->>'extracted_node_id', embedding "
-                    "FROM test_vectors ORDER BY account_id")
-        rows = cur.fetchall()
-    assert len(rows) == 2
-    assert rows[0][0] != rows[1][0]
-    assert rows[0][1:] == ("a", "updated a", "ext-a", "[1.00000000,0.00000000]")
-    assert rows[1][1:] == ("b", "private b", "ext-b", "[0.00000000,1.00000000]")
-
-
 def test_global_id_collision_cannot_transfer_owner_or_content(index):
     from core.models import IndexRecord
 
     vi, conn = index
     record = IndexRecord(
-        id="legacy-global-id", uri="m3://old", level=2, text="private a",
+        id="legacy-global-id", uri="ctx://a/users/u/memories/events/legacy", level=2, text="private a",
         filters={"account_id": "a"}, metadata={"_embedding": [1.0, 0.0]},
     )
     vi.upsert([record])

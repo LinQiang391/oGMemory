@@ -58,7 +58,7 @@ def fake_openai_ctor(monkeypatch: pytest.MonkeyPatch, fake_client: Mock) -> Mock
 
 class TestOpenAILLM:
     @pytest.mark.parametrize("mode", [
-        "structured", "text", "tools", "messages", "multimodal", "multimodal_text",
+        "structured", "text", "tools", "messages",
     ])
     @pytest.mark.parametrize("failure", ["timeout", "connection", 429, 500, 503])
     def test_transient_provider_failure_retains_retry_type_and_then_completes(self, fake_client, mode, failure):
@@ -75,16 +75,12 @@ class TestOpenAILLM:
         calls = [SimpleNamespace(function=SimpleNamespace(name="extract", arguments=payload))]
         fake_client.chat.completions.create.side_effect = [error, _chat_response(content=payload, tool_calls=calls)]
         llm = openai_llm_module.OpenAILLM(
-            api_key="test-key", json_mode=mode in {"structured", "multimodal"},
+            api_key="test-key", json_mode=mode == "structured",
         )
         schema = {"type": "object", "required": ["value"]}
         tool = {"name": "extract", "description": "Extract", "input_schema": schema}
 
         def complete():
-            if mode.startswith("multimodal"):
-                return llm.complete_multimodal(
-                    [{"role": "user", "content": "Extract"}], schema,
-                )
             if mode in {"structured", "text"}:
                 return llm.complete_json("Extract", schema)
             if mode == "tools":
@@ -895,176 +891,6 @@ class TestCachedOpenAILLM:
         assert llm.cache_stats == {"size": 0, "hits": 0, "misses": 0, "hit_rate": 0}
 
 
-# ---------------------------------------------------------------------------
-# complete_multimodal
-# ---------------------------------------------------------------------------
-
-class TestOpenAILLMCompleteMultimodal:
-    def test_complete_multimodal_with_json_mode(self, fake_client, fake_openai_ctor):
-        llm = openai_llm_module.OpenAILLM(
-            api_key="test-key", model="gpt-4o", json_mode=True,
-        )
-        fake_client.chat.completions.create.return_value = _chat_response(
-            content='{"description": "robot picks cup", "characters": [{"name": "robot_arm"}]}',
-        )
-
-        messages = [{
-            "role": "user",
-            "content": [
-                {"type": "text", "text": "describe"},
-                {"type": "image_url", "image_url": {"url": "data:image/jpeg;base64,AAA"}},
-                {"type": "input_audio", "input_audio": {"data": "BBB", "format": "wav"}},
-            ],
-        }]
-        schema = {
-            "type": "object",
-            "properties": {
-                "description": {"type": "string"},
-                "characters": {"type": "array"},
-            },
-        }
-        result = llm.complete_multimodal(messages, schema)
-
-        assert result["description"] == "robot picks cup"
-        # The OpenAI client received the multimodal messages + json_object.
-        call = fake_client.chat.completions.create.call_args
-        sent_messages = call.kwargs["messages"]
-        # System message is schema-driven; user message is verbatim.
-        assert sent_messages[0]["role"] == "system"
-        assert "description" in sent_messages[0]["content"]  # schema embedded
-        assert sent_messages[1] == messages[0]  # user multimodal content forwarded
-        assert call.kwargs["response_format"] == {"type": "json_object"}
-
-    def test_complete_multimodal_preserves_task_instructions(self, fake_client, fake_openai_ctor):
-        """Schema formatting must not remove the memory extraction policy."""
-        llm = openai_llm_module.OpenAILLM(
-            api_key="test-key", model="gpt-4o", json_mode=True,
-        )
-        fake_client.chat.completions.create.return_value = _chat_response(
-            content='{"description": "ok"}',
-        )
-        messages = [
-            {"role": "system", "content": "Preserve specific objects and locations from speech."},
-            {"role": "system", "content": [{"type": "text", "text": "Do not replace facts with generic room descriptions."}]},
-            {"role": "user", "content": "describe"},
-        ]
-        llm.complete_multimodal(messages, {"type": "object"})
-        sent = fake_client.chat.completions.create.call_args.kwargs["messages"]
-        assert len(sent) == 2 and sent[0]["role"] == "system"
-        assert "Preserve specific objects and locations from speech." in sent[0]["content"]
-        assert "Do not replace facts with generic room descriptions." in sent[0]["content"]
-        assert "Respond ONLY with valid JSON" in sent[0]["content"]
-        assert sent[1] == messages[2]
-        assert messages[0]["content"] == "Preserve specific objects and locations from speech."
-
-    @pytest.mark.parametrize("json_mode", [True, False])
-    def test_truncated_multimodal_output_is_not_repaired_into_success(self, fake_client, json_mode):
-        llm = openai_llm_module.OpenAILLM(api_key="test-key", json_mode=json_mode)
-        response = _chat_response(
-            content='{"description":"unfinished', finish_reason="length",
-        )
-        response.usage = SimpleNamespace(
-            prompt_tokens=100, completion_tokens=4096,
-            completion_tokens_details=SimpleNamespace(reasoning_tokens=4000),
-        )
-        fake_client.chat.completions.create.return_value = response
-        with pytest.raises(LLMOutputTruncatedError, match="multimodal output truncated") as caught:
-            llm.complete_multimodal([{"role": "user", "content": "describe"}], {"type": "object"})
-        assert "completion_tokens=4096" in str(caught.value)
-        assert "reasoning_tokens=4000" in str(caught.value)
-        assert fake_client.chat.completions.create.call_count == 1
-
-    @pytest.mark.parametrize("json_mode", [True, False])
-    def test_multimodal_keeps_deadline_error_after_response(self, fake_client, monkeypatch, json_mode):
-        from core.errors import OperationDeadlineExceededError
-
-        llm = openai_llm_module.OpenAILLM(api_key="test-key", json_mode=json_mode)
-        deadline = OperationDeadlineExceededError("response arrived after deadline")
-        response = _chat_response(content='{"description":"complete"}')
-
-        def complete(**kwargs):
-            def expired():
-                raise deadline
-            monkeypatch.setattr(openai_llm_module, "check_deadline", expired)
-            return response
-
-        fake_client.chat.completions.create.side_effect = complete
-        with pytest.raises(OperationDeadlineExceededError) as caught:
-            llm.complete_multimodal([{"role": "user", "content": "describe"}], {"type": "object"})
-        assert caught.value is deadline
-        assert fake_client.chat.completions.create.call_count == 1
-
-    def test_complete_multimodal_text_fallback_on_bad_request(
-        self, fake_client, fake_openai_ctor,
-    ):
-        from openai import BadRequestError
-        llm = openai_llm_module.OpenAILLM(
-            api_key="test-key", model="gpt-4o", json_mode=True,
-        )
-        # First call: json_object rejected. Second call (text fallback):
-        # JSON-extracted from free text. BadRequestError.__init__ accesses
-        # several httpx-style attributes on response; using Mock() with
-        # spec avoids the SimpleNamespace attribute tax.
-        from unittest.mock import Mock
-        fake_response = Mock(status_code=400)
-        fake_client.chat.completions.create.side_effect = [
-            BadRequestError(
-                message="json_object not supported",
-                response=fake_response,
-                body={"error": {"message": "no json"}},
-            ),
-            _chat_response(content='{"description": "fallback ok"}'),
-        ]
-        result = llm.complete_multimodal(
-            [{"role": "system", "content": "Keep speech facts."},
-             {"role": "user", "content": "describe"}],
-            {"type": "object", "properties": {"description": {"type": "string"}}},
-        )
-        assert result["description"] == "fallback ok"
-        # Two calls: structured + text fallback.
-        assert fake_client.chat.completions.create.call_count == 2
-        # Second call has no response_format (text mode).
-        second_kwargs = fake_client.chat.completions.create.call_args_list[1].kwargs
-        assert "response_format" not in second_kwargs
-        assert "Keep speech facts." in second_kwargs["messages"][0]["content"]
-
-
-@pytest.mark.parametrize('json_mode', [False, True])
-@pytest.mark.parametrize('model,reasoning', [('gpt-4o-mini', False), ('o3', True)])
-def test_multimodal_uses_shared_completion_parameters(fake_client, json_mode, model, reasoning):
-    fake_client.chat.completions.create.return_value = _chat_response(content='{"value":"blue"}')
-    llm = openai_llm_module.OpenAILLM(
-        api_key='test', model=model, json_mode=json_mode, max_tokens=4321,
-        reasoning_effort='high', extra_body={'custom': True},
-    )
-    assert llm.complete_multimodal(
-        [{'role': 'user', 'content': [{'type': 'image_url', 'image_url': {'url': 'data:image/png;base64,AA=='}}]}],
-        {'type': 'object'},
-    ) == {'value': 'blue'}
-    kwargs = fake_client.chat.completions.create.call_args.kwargs
-    assert kwargs['extra_body'] == {'custom': True}
-    if reasoning:
-        assert kwargs['max_completion_tokens'] == 4321
-        assert kwargs['reasoning_effort'] == 'high'
-        assert 'temperature' not in kwargs and 'max_tokens' not in kwargs
-    else:
-        assert kwargs['max_tokens'] == 4321
-        assert kwargs['temperature'] == 0.7
-
-
-def test_multimodal_format_rejection_keeps_reasoning_parameters(fake_client):
-    fake_client.chat.completions.create.side_effect = [
-        _bad_request('unsupported json_object'), _chat_response(content='{"value":"ok"}'),
-    ]
-    llm = openai_llm_module.OpenAILLM(api_key='test', model='o3', json_mode=True,
-                                    reasoning_effort='low', extra_body={'custom': 1})
-    assert llm.complete_multimodal([], {'type': 'object'}) == {'value': 'ok'}
-    for call in fake_client.chat.completions.create.call_args_list:
-        assert call.kwargs['reasoning_effort'] == 'low'
-        assert call.kwargs['extra_body'] == {'custom': 1}
-        assert 'temperature' not in call.kwargs and 'max_tokens' not in call.kwargs
-
-
 @pytest.mark.parametrize('value', ['blue', '<think>blue</think>', '<think>blue',
                                   '</think>blue', '&quot;blue&quot;', 'escaped "<think>blue</think>"'])
 @pytest.mark.parametrize('wrapper', ['{}', '```json\n{}\n```', '<think>private</think>\n{}', 'Answer: {}'])
@@ -1075,37 +901,3 @@ def test_json_values_preserve_literal_content(value, wrapper):
     assert openai_llm_module.OpenAILLM._extract_json_from_text(
         wrapper.format(json.dumps(payload)),
     ) == payload
-
-@pytest.mark.parametrize("with_ids", [True, False])
-def test_search_compaction_uses_unambiguous_provider_call_ids(fake_client, monkeypatch, with_ids):
-    from core.models import RequestContext
-    from core.react_loop import ReactLoop
-    from m3.control_adapter import M3TaskContext, OGMemoryControlAdapter
-
-    raw_calls = [SimpleNamespace(
-        **({"id": f"search_{i}"} if with_ids else {}),
-        function=SimpleNamespace(name="Search", arguments=json.dumps({"query": query})),
-    ) for i, query in enumerate(("scissors", "glue", "scissors"))]
-    fake_client.chat.completions.create.return_value = _chat_response(tool_calls=raw_calls)
-    llm = openai_llm_module.OpenAILLM(api_key="test-key")
-    calls, _ = llm.complete_with_tools_messages(
-        [{"role": "user", "content": "Where?"}],
-        [{"name": "Search", "description": "Search", "input_schema": {"type": "object"}}],
-    )
-    if with_ids:
-        assert [call["id"] for call in calls] == ["search_0", "search_1", "search_2"]
-    adapter = OGMemoryControlAdapter(llm=llm, graph=Mock(), embedder=Mock())
-    ctx = RequestContext(account_id="a", user_id="u", agent_id="g", session_id="s", trace_id="t")
-    messages = adapter._build_messages(ctx, M3TaskContext(question="Where?"))
-    monkeypatch.setattr(ReactLoop, "_execute_tool", lambda self, name, args, ctx: {
-        "hits": [{"node_id": args["query"], "description": "Full original evidence"}],
-        "context_hits": [], "boundary_hits": [],
-    })
-    adapter._execute_and_append_tool_calls(messages, calls, [], set(), ctx)
-    results = [m for m in messages if m["role"] == "tool"]
-    ids = [m["tool_call_id"] for m in results]
-    assert len(set(ids)) == 3
-    assert "unknown" not in ids
-    assert [m["tool_calls"][0]["id"] for m in messages if m.get("tool_calls")] == ids
-    assert json.loads(results[2]["content"])["evidence_reference_tool_call_id"] == ids[0]
-    assert all(not json.loads(m["content"]).get("evidence_payload_omitted") for m in results[:2])

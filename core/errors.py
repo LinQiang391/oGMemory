@@ -195,10 +195,6 @@ class LLMCallError(ContextEngineError):
     outright, so continuing to burn the iteration budget is exactly the
     silent-garbage behaviour this exception exists to surface.
 
-    Drivers like :func:`m3.qa.run_react_qa` should catch this and set
-    ``error="..."`` on the per-question JSONL record instead of letting
-    the loop fall back to "no tools, continue, emit garbage".
-
     Attributes:
         status_code: HTTP status code if the failure came from the
             upstream API (e.g. 400 for ``openai.BadRequestError``,

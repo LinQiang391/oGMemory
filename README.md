@@ -544,7 +544,7 @@ result = write_api.commit_session([
 # Configure .env, then follow deploy/compose/README_zh.md.
 bash deploy/compose/deploy.sh start
 
-# Multimodal stack: see deploy/README.md.
+# Build and run from source: see deploy/README.md.
 cd deploy
 docker compose --profile with-db up
 ```

@@ -189,57 +189,6 @@ class MockLLM(LLM):
 
         return [], ""
 
-    def complete_multimodal(self, messages: list[dict], schema: dict) -> dict:
-        """Mock implementation of multimodal completion.
-
-        Returns either an explicit ``_mock_multimodal_response`` if the
-        test set it (preferred for assertions), or a deterministic
-        canned response derived from the schema so ad-hoc tests still
-        get something useful. Tracks the multimodal message list on
-        ``_last_multimodal_messages`` so tests can verify what was sent.
-        """
-        self._call_count += 1
-        self._last_messages = messages
-        self._last_multimodal_messages = messages
-        self._last_multimodal_schema = schema
-
-        canned = getattr(self, "_mock_multimodal_response", None)
-        if canned is not None:
-            return canned
-
-        # Build a deterministic stub from the schema so callers always
-        # get a structurally valid response. Production-style smoke runs
-        # can rely on this when they don't want to wire fixtures.
-        result: dict = {}
-        for prop, spec in (schema.get("properties") or {}).items():
-            ptype = spec.get("type") if isinstance(spec, dict) else None
-            if ptype == "string":
-                # Pull the first text content part's text for a
-                # recognisable canned value when available.
-                text_hint = ""
-                for m in messages:
-                    content = m.get("content")
-                    if isinstance(content, list):
-                        for part in content:
-                            if isinstance(part, dict) and part.get("type") == "text":
-                                text_hint = part.get("text", "")
-                                break
-                    if text_hint:
-                        break
-                result[prop] = (text_hint[:80] if text_hint else f"mock_{prop}")
-            elif ptype == "array":
-                result[prop] = []
-            elif ptype == "object":
-                result[prop] = {}
-            elif ptype == "number":
-                result[prop] = 0
-            elif ptype == "integer":
-                result[prop] = 0
-            elif ptype == "boolean":
-                result[prop] = True
-            else:
-                result[prop] = None
-        return result
 
     @property
     def call_count(self) -> int:

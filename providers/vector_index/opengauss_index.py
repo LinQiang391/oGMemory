@@ -7,11 +7,8 @@ import logging
 import re
 from typing import Any
 
-from core.clip_lookup import validate_clip_lookup
 from core.interfaces import VectorIndex
 from core.models import IndexRecord, SeedHit, TypedQuery
-from core.temporal import contains_time, seconds
-from core.transcript_lexical import SEARCH_FIELD, indexed_metadata, validate_transcript_request
 from fs.sql_adapter.pool import PoolAdapterMixin
 
 try:
@@ -78,43 +75,10 @@ def _ensure_dict(val: Any) -> dict:
 
 
 class OpenGaussVectorIndex(PoolAdapterMixin, VectorIndex):
-    """Vector-index implementation that targets openGauss (primary)
-    and PostgreSQL+pgvector (single-DB convenience alias).
+    """Vector index for openGauss and PostgreSQL with pgvector.
 
-    The class is named ``OpenGaussVectorIndex`` because **openGauss
-    is the recommended production target** — M3's benchmarks were
-    validated against openGauss and deployments that already
-    operate an openGauss cluster should keep using it without any
-    code changes.
-
-    As a convenience for deployments that prefer not to run a
-    separate openGauss cluster, the same code path also runs
-    against vanilla PostgreSQL 15+ with the pgvector extension.
-    The ``m3.vector_index.backend`` config accepts both
-    ``opengauss`` and ``pgvector`` (alias) and routes to this
-    class either way; pick whichever backend you operate.
-
-    The two backends diverge only on the extension bootstrap
-    (in ``_ensure_table``):
-
-    - **openGauss** (1.x / 2.x / 3.x): the ``vector(N)`` type and
-      the HNSW ``vector_cosine_ops`` opclass are built in. The
-      ``CREATE EXTENSION`` statement is a syntax error on openGauss;
-      we catch and ignore it so the CREATE TABLE proceeds.
-    - **PostgreSQL 15+ with pgvector**: requires the
-      ``pgvector/pgvector:pg16`` Docker image (or the
-      ``pgvector`` package installed server-side). The CREATE
-      EXTENSION call activates the extension; everything else is
-      pgvector's standard SQL.
-
-    ``psycopg2`` speaks the same wire protocol to both, so the rest
-    of the class is backend-agnostic.
-
-    Features:
-        - HNSW indexing for fast approximate nearest neighbor search
-        - Multi-tenant isolation via account_id filtering
-        - Idempotent upsert with MERGE INTO (PG 15+ / openGauss)
-        - Cosine similarity search
+    Supports HNSW cosine search, shared connection pools, tenant isolation,
+    idempotent MERGE upserts and explicit legacy-row migration.
     """
 
     def __init__(
@@ -151,41 +115,9 @@ class OpenGaussVectorIndex(PoolAdapterMixin, VectorIndex):
         self._ensure_table()
 
     def _ensure_table(self) -> None:
-        """Create the vector_index table and indexes if they don't exist.
+        """Create the table, security columns and search indexes.
 
-        Also adds missing columns. Legacy data backfills are an explicit
-        one-time migration (scripts/migrate_vector_index.py).
-
-        The ``video_id`` / ``extractor_type`` / ``before_clip`` columns
-        are M3-specific scope columns: they let the index push the QA
-        evaluation boundary (``ClipScope``) down to SQL instead of
-        loading every candidate into Python and filtering post-hoc.
-        Records written before this migration land with NULL on these
-        columns; bounded searches exclude unknown provenance. Re-index
-        legacy records before using clip or second-level boundaries.
-
-        This class is named ``OpenGaussVectorIndex`` for historical
-        reasons (the M3 pipeline was originally written against an
-        openGauss deployment) but the same code runs against vanilla
-        PostgreSQL 15+ with the pgvector extension. The ``CREATE
-        EXTENSION vector`` statement below is the only piece that
-        differs:
-
-        - **PostgreSQL + pgvector**: required. The extension ships the
-          ``vector(N)`` type and the HNSW ``vector_cosine_ops`` opclass
-          referenced below. We try to create it idempotently and rely
-          on the fact that ``CREATE EXTENSION IF NOT EXISTS`` is a
-          no-op when the extension is already installed (e.g. via the
-          ``pgvector/pgvector:pg16`` Docker image, where the bits are
-          preloaded into ``shared_preload_libraries``).
-        - **openGauss**: openGauss has the ``vector(N)`` type and the
-          HNSW opclass built in (no extension to load). The
-          ``CREATE EXTENSION`` statement raises a syntax error which
-          we catch and ignore so the migration proceeds to the
-          regular CREATE TABLE step.
-
-        ``psycopg2`` talks the same wire protocol to both servers, so
-        nothing else in this class needs to special-case the backend.
+        Legacy data backfills use scripts/migrate_vector_index.py.
         """
         tbl = self._table_name
         dim = self._dimension
@@ -225,9 +157,6 @@ class OpenGaussVectorIndex(PoolAdapterMixin, VectorIndex):
                         record_kind   VARCHAR(32) DEFAULT 'node_content',
                         node_status   VARCHAR(16) DEFAULT 'active',
                         space_id      UUID,
-                        video_id      VARCHAR(128),
-                        extractor_type VARCHAR(64),
-                        before_clip   INTEGER,
                         created_at    TIMESTAMPTZ DEFAULT NOW(),
                         updated_at    TIMESTAMPTZ DEFAULT NOW()
                     )
@@ -242,9 +171,6 @@ class OpenGaussVectorIndex(PoolAdapterMixin, VectorIndex):
                     ("record_kind", "VARCHAR(32) DEFAULT 'node_content'"),
                     ("node_status", "VARCHAR(16) DEFAULT 'active'"),
                     ("space_id",    "UUID"),
-                    ("video_id",    "VARCHAR(128)"),
-                    ("extractor_type", "VARCHAR(64)"),
-                    ("before_clip", "INTEGER"),
                 ]:
                     cur.execute(
                         f"ALTER TABLE {tbl} ADD COLUMN IF NOT EXISTS {col} {col_type}"
@@ -278,24 +204,6 @@ class OpenGaussVectorIndex(PoolAdapterMixin, VectorIndex):
                     CREATE INDEX IF NOT EXISTS idx_{tbl}_node_id
                         ON {tbl} (node_id)
                         WHERE node_id IS NOT NULL
-                """)
-                # M3 scope columns. Composite indexes keyed on account_id
-                # first so the planner can use them in tandem with the
-                # tenant filter without an extra sort.
-                cur.execute(f"""
-                    CREATE INDEX IF NOT EXISTS idx_{tbl}_video_id
-                        ON {tbl} (account_id, video_id)
-                        WHERE video_id IS NOT NULL
-                """)
-                cur.execute(f"""
-                    CREATE INDEX IF NOT EXISTS idx_{tbl}_extractor_type
-                        ON {tbl} (account_id, extractor_type)
-                        WHERE extractor_type IS NOT NULL
-                """)
-                cur.execute(f"""
-                    CREATE INDEX IF NOT EXISTS idx_{tbl}_before_clip
-                        ON {tbl} (account_id, video_id, before_clip)
-                        WHERE before_clip IS NOT NULL
                 """)
                 conn.commit()
             logger.info("Table '%s' ensured (dim=%d)", tbl, dim)
@@ -409,7 +317,7 @@ class OpenGaussVectorIndex(PoolAdapterMixin, VectorIndex):
 
                 embedding_str = _vec_literal(embedding)
                 filters_json = Json(record.filters)
-                metadata_json = Json(indexed_metadata(record.metadata))
+                metadata_json = Json(record.metadata)
 
                 # Extract explicit security columns from filters
                 acct = record.filters.get("account_id")
@@ -417,18 +325,6 @@ class OpenGaussVectorIndex(PoolAdapterMixin, VectorIndex):
                 kind = record.metadata.get("record_kind", "node_content")
                 space_id = record.filters.get("space_id")
                 node_id = record.metadata.get("node_id")
-                # M3 scope columns. Prefer the record's scope filters,
-                # with metadata as a fallback for older writers.
-                # Mirror them to dedicated SQL columns so
-                # the WHERE clause can index-scan instead of doing
-                # ``metadata @> '{"video_id": ...}'::jsonb`` for every
-                # call. None is preserved (NOT coerced to empty string)
-                # so partial indexes still cover the populated rows.
-                video_id = record.filters.get("video_id", record.metadata.get("video_id"))
-                extractor_type = record.filters.get(
-                    "extractor_type", record.metadata.get("extractor_type")
-                )
-                before_clip = record.metadata.get("before_clip")
 
                 try:
                     with conn.cursor() as cur:
@@ -453,28 +349,21 @@ class OpenGaussVectorIndex(PoolAdapterMixin, VectorIndex):
                                 record_kind = %s,
                                 node_status = 'active',
                                 space_id = %s,
-                                video_id = %s,
-                                extractor_type = %s,
-                                before_clip = %s,
                                 updated_at = NOW()
                             WHEN NOT MATCHED THEN INSERT
                                 (id, uri, level, text, embedding, filters, metadata,
                                  account_id, owner_space, node_uri, node_id, record_kind,
-                                 node_status, space_id, video_id, extractor_type,
-                                 before_clip)
+                                 node_status, space_id)
                             VALUES (%s, %s, %s, %s, %s::vector, %s, %s,
-                                    %s, %s, %s, %s, %s, 'active', %s,
-                                    %s, %s, %s)
+                                    %s, %s, %s, %s, %s, 'active', %s)
                         """, (
                             record.id, acct,
                             record.uri, record.level, record.text,
                             embedding_str, filters_json, metadata_json,
                             owner, record.uri, node_id, kind, space_id,
-                            video_id, extractor_type, before_clip,
                             record.id, record.uri, record.level, record.text,
                             embedding_str, filters_json, metadata_json,
                             acct, owner, record.uri, node_id, kind, space_id,
-                            video_id, extractor_type, before_clip,
                         ))
                     conn.commit()
                 except Exception as exc:
@@ -486,133 +375,6 @@ class OpenGaussVectorIndex(PoolAdapterMixin, VectorIndex):
         finally:
             self._return_connection(conn)
 
-    def get_records_by_clips(self, filters: dict[str, Any], clip_ids: list[int]) -> list[IndexRecord]:
-        clips = validate_clip_lookup(filters, clip_ids)
-        if not clips:
-            return []
-        where, params = self._build_where(filters)
-        params["clip_ids"] = clips
-        conn = self._get_connection()
-        try:
-            with conn.cursor(cursor_factory=RealDictCursor) as cur:
-                cur.execute(f"""
-                    SELECT id, uri, level, text, filters, metadata
-                    FROM {self._table_name}
-                    WHERE {where} AND before_clip = ANY(%(clip_ids)s)
-                    ORDER BY before_clip ASC, uri ASC
-                """, params)
-                rows = cur.fetchall()
-        finally:
-            conn.rollback()
-            self._return_connection(conn)
-        return [IndexRecord(
-            id=str(row["id"]), uri=str(row["uri"]), level=int(row["level"]),
-            text=row.get("text") or "", filters=_ensure_dict(row.get("filters")),
-            metadata=_ensure_dict(row.get("metadata")),
-        ) for row in rows]
-
-    def get_records_at_time(self, filters: dict[str, Any], timestamp: float) -> list[IndexRecord]:
-        """Find crossing intervals using guarded numeric SQL, not vector top-k."""
-        validate_clip_lookup(filters, [])
-        timestamp = seconds(timestamp)
-        where, params = self._build_where(filters)
-        params["at_sec"] = timestamp
-
-        def numeric(key):
-            expr = f"metadata->>'{key}'"
-            return (
-                f"(CASE WHEN length({expr}) <= 64 AND "
-                f"{expr} ~ '^[0-9]+([.][0-9]+)?([eE][+-]?[0-9]{{1,3}})?$' "
-                f"THEN ({expr})::numeric ELSE NULL END)"
-            )
-
-        start = numeric("source_start_sec")
-        duration = numeric("source_duration_sec")
-        conn = self._get_connection()
-        try:
-            with conn.cursor(cursor_factory=RealDictCursor) as cur:
-                cur.execute(f"""
-                    SELECT id, uri, level, text, filters, metadata
-                    FROM {self._table_name}
-                    WHERE {where}
-                      AND {start} <= %(at_sec)s
-                      AND {start} + {duration} > %(at_sec)s
-                    ORDER BY uri ASC
-                """, params)
-                rows = cur.fetchall()
-        finally:
-            conn.rollback()
-            self._return_connection(conn)
-        records = [IndexRecord(
-            id=str(row["id"]), uri=str(row["uri"]), level=int(row["level"]),
-            text=row.get("text") or "", filters=_ensure_dict(row.get("filters")),
-            metadata=_ensure_dict(row.get("metadata")),
-        ) for row in rows]
-        # Reject inconsistent source_end_sec and invalid legacy provenance too.
-        return [record for record in records if contains_time(record.metadata, timestamp)]
-
-    def get_record(self, record_id: str) -> IndexRecord | None:
-        """Fetch one :class:`IndexRecord` by id.
-
-        Returns ``None`` when no row matches. Used by
-        :class:`m3.search.EpisodicSearcher` to recover the full
-        ``text`` field of an index hit — ``search_by_vector`` only
-        surfaces a 200-char abstract to keep the SeedHit payload
-        small, but the QA evidence renderer needs the entire text.
-
-        One round-trip per top-k hit, expected small (top_k typically
-        ≤ 16). Avoids forcing the EpisodicSearcher to maintain a
-        local mirror of the index.
-        """
-        if not record_id:
-            return None
-        conn = self._get_connection()
-        try:
-            with conn.cursor(cursor_factory=RealDictCursor) as cur:
-                cur.execute(
-                    f"""
-                    SELECT id, uri, level, text, filters, metadata, embedding
-                    FROM   {self._table_name}
-                    WHERE  id = %(rid)s
-                    """,
-                    {"rid": record_id},
-                )
-                row = cur.fetchone()
-        finally:
-            conn.rollback()
-            self._return_connection(conn)
-        if row is None:
-            return None
-        meta = _ensure_dict(row.get("metadata"))
-        filt = _ensure_dict(row.get("filters"))
-        embedding = row.get("embedding")
-        # ``embedding`` comes back as a pgvector string like
-        # ``[0.1,0.2,...]``; round-trip through the literal parser so
-        # callers get a plain list[float]. The OpenGaussVectorIndex
-        # stores it via ``_vec_literal`` which produces the same
-        # format.
-        emb_list: list[float] | None = None
-        if isinstance(embedding, str):
-            try:
-                emb_list = [float(x) for x in embedding.strip("[]").split(",") if x.strip()]
-            except ValueError:
-                emb_list = None
-        elif isinstance(embedding, (list, tuple)):
-            emb_list = [float(x) for x in embedding]
-        # Embedding lives in ``metadata["_embedding"]`` from the writer
-        # — surface it there so callers see what they upserted. The
-        # top-level ``embedding`` field on IndexRecord is reserved
-        # for whatever the VectorIndex Protocol adds later.
-        if emb_list is not None and "_embedding" not in meta:
-            meta["_embedding"] = emb_list
-        return IndexRecord(
-            id=str(row["id"]),
-            uri=str(row["uri"]),
-            level=int(row["level"]),
-            text=str(row["text"]),
-            filters=filt,
-            metadata=meta,
-        )
 
     def delete(self, ids: list[str]) -> None:
         """Remove records from the index."""
@@ -660,43 +422,6 @@ class OpenGaussVectorIndex(PoolAdapterMixin, VectorIndex):
 
         return [self._row_to_hit(r) for r in rows]
 
-    def search_by_transcript(self, query: str, filters: dict[str, Any], top_k: int) -> list[SeedHit]:
-        """Scoped token-coverage baseline over ASR, independent of vector top-k.
-
-        Uses a derived JSONB field populated on upsert. Old rows must be
-        re-upserted; no fallback to descriptions or unscoped Python scanning.
-        This is a per-video SQL scan, not an inverted full-text index.
-        """
-        terms = validate_transcript_request(query, filters, top_k)
-        if not terms:
-            return []
-        where, params = self._build_where(filters)
-        params["topk"] = top_k
-        parts = []
-        for i, term in enumerate(terms):
-            # Both SQL and Python match complete normalized word tokens.
-            params[f"lex_{i}"] = f" {term} "
-            parts.append(
-                f"CASE WHEN POSITION(%(lex_{i})s IN "
-                f"COALESCE(metadata->>'{SEARCH_FIELD}', '')) > 0 THEN 1.0 ELSE 0.0 END"
-            )
-        score = "(" + " + ".join(parts) + f") / {len(terms)}"
-        sql = f"""
-            SELECT id, uri, level, text, filters, metadata, node_id, {score} AS score
-            FROM {self._table_name}
-            WHERE {where} AND ({score}) > 0
-            ORDER BY score DESC, uri ASC
-            LIMIT %(topk)s
-        """
-        conn = self._get_connection()
-        try:
-            with conn.cursor(cursor_factory=RealDictCursor) as cur:
-                cur.execute(sql, params)
-                rows = cur.fetchall()
-        finally:
-            conn.rollback()
-            self._return_connection(conn)
-        return [self._row_to_hit(row) for row in rows]
 
     def get_embeddings(
         self,
@@ -767,7 +492,7 @@ class OpenGaussVectorIndex(PoolAdapterMixin, VectorIndex):
         Older index writers populate JSON filters but not the denormalized
         tenant columns. Fall back only when a column is NULL: an explicit
         owner always takes precedence. Missing ownership remains excluded,
-        and space/video/temporal grants still require their explicit columns.
+        and space grants still require their explicit columns.
 
         Pure function of ``f`` — reads no instance state, so it can be
         exercised directly (``OpenGaussVectorIndex._build_where(...)``)
@@ -832,44 +557,6 @@ class OpenGaussVectorIndex(PoolAdapterMixin, VectorIndex):
             else:
                 clauses.append("space_id = %(f_space_id)s")
             params["f_space_id"] = sid
-        # --- M3 scope columns ---------------------------------------------
-        # ``video_id`` is exact-match: M3-Bench evaluates one video at a
-        # time, so cross-video bleed is a correctness bug, not a perf
-        # issue.
-        if "video_id" in f:
-            clauses.append("video_id = %(f_video_id)s")
-            params["f_video_id"] = f["video_id"]
-        # ``extractor_type`` follows the same scalar/list convention as
-        # ``space_id``: M3 currently passes a single string, but the
-        # adapter may pass a tuple via ``extractor_types`` and we want
-        # ONE-clause to do it.
-        if "extractor_type" in f:
-            et = f["extractor_type"]
-            if isinstance(et, list):
-                clauses.append("extractor_type = ANY(%(f_extractor_type)s)")
-                params["f_extractor_type"] = et
-            else:
-                clauses.append("extractor_type = %(f_extractor_type)s")
-                params["f_extractor_type"] = et
-        # Unknown clip provenance is not safe under a clip bound.
-        if "before_clip" in f:
-            clauses.append(
-                "before_clip <= %(f_before_clip)s"
-            )
-            params["f_before_clip"] = f["before_clip"]
-
-        if "before_sec" in f:
-            params["f_before_sec"] = seconds(f["before_sec"])
-            # Canonical finite numbers written by the indexer. CASE guards
-            # casts, so malformed legacy JSON cannot abort a whole search.
-            for key in ("source_start_sec", "source_duration_sec", "source_end_sec"):
-                expr = f"metadata->>'{key}'"
-                clauses.append(
-                    f"(CASE WHEN length({expr}) <= 64 AND "
-                    f"{expr} ~ '^[0-9]+([.][0-9]+)?([eE][+-]?[0-9]{{1,3}})?$' "
-                    f"THEN ({expr})::numeric ELSE NULL END) <= %(f_before_sec)s"
-                )
-
         return (" AND ".join(clauses) or "TRUE"), params
 
     @staticmethod
@@ -884,19 +571,6 @@ class OpenGaussVectorIndex(PoolAdapterMixin, VectorIndex):
         hit_metadata: dict[str, Any] = dict(meta)
         if node_id is not None:
             hit_metadata["node_id"] = str(node_id)
-        # M3 forward-channel: the M3 driver stamps
-        # ``extracted_node_id`` / ``video_id`` / ``clip_id`` /
-        # ``before_clip`` into the metadata JSONB so the
-        # ``GraphService`` VectorIndex routing path can recover the
-        # originating graph node without an extra lookup. Surface
-        # them here so consumers (the GraphService adapter, the
-        # legacy JSONL ``EpisodicSearcher``) see them on
-        # ``SeedHit.metadata`` without re-querying.
-        for key in ("extracted_node_id", "video_id", "clip_id", "before_clip",
-                    "source_start_sec", "source_duration_sec", "source_end_sec",
-                    "speech_transcript"):
-            if key in meta and meta[key] is not None:
-                hit_metadata[key] = meta[key]
         return SeedHit(
             uri=row["uri"],
             score=float(row.get("score", 0)),
