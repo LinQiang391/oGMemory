@@ -51,7 +51,7 @@ async def _check(node, port):
            "OGMEM_MCP_USER_ID": "alice", "OGMEM_MCP_AGENT_ID": "test-agent"}
     # Avoid a developer's explicitly selected config affecting this test.
     env.pop("OGMEM_AGENT_PLUGIN_CONFIG", None)
-    server = StdioServerParameters(command=node, args=[str(ROOT / "agent-plugins/servers/mcp-proxy.mjs")], env=env)
+    server = StdioServerParameters(command=node, args=[str(ROOT / "plugins/agent-plugins/servers/mcp-proxy.mjs")], env=env)
     async with stdio_client(server) as (read, write):
         async with ClientSession(read, write) as client:
             await client.initialize()

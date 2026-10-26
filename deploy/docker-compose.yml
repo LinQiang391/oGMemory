@@ -1,0 +1,345 @@
+# ============================================================
+# docker-compose for oGMemory dev deployment
+# ============================================================
+#
+# Always starts ogmem; local databases and OpenClaw are opt-in.
+# Reads env vars from `deploy/.env` (created from `deploy/.env.example`).
+# The ogmem service config lives in `deploy/ogmemory.yaml` (copy from
+# `deploy/ogmemory.example.yaml`).
+#
+# By default, ogmem and openclaw are built from local source via the
+# Dockerfiles in `../docker/`. To use a prebuilt image instead, set
+# `OGMEM_IMAGE=...` or `OPENCLAW_IMAGE=...` in `.env`, explicitly pull it,
+# then use up --no-build. Image tags alone do not disable builds.
+#
+# Usage:
+#   cd deploy
+#   cp .env.example .env           # one-time
+#   cp ogmemory.example.yaml ogmemory.yaml
+#   edit .env                      # set VECTOR_DB_PASSWORD, STORAGE_DB_PASSWORD, LLM_*, etc.
+#   edit ogmemory.yaml             # set model names, etc. (DB DSNs come from env)
+#   docker compose build ogmem                          # build ogmem from source
+#   docker compose up -d                               # ogmem (external databases)
+#   docker compose --profile with-pg up -d              # postgres + ogmem
+#   docker compose --profile with-og up -d              # openGauss + ogmem (external storage DB)
+#   docker compose --profile with-db up -d              # openGauss + postgres + ogmem
+#   docker compose --profile with-db --profile with-openclaw up -d   # + openclaw gateway
+#   docker compose --profile with-db down               # stop (keeps volumes)
+#   docker compose --profile with-db down -v            # stop and drop volumes
+#
+# Env-var naming: the deploy surface has exactly two DB connection
+# families — STORAGE_DB_* (the SQL storage Postgres) and VECTOR_DB_*
+# (the vector DB: openGauss in production, or the same pgvector Postgres
+# in single-DB deployments). The old POSTGRES_* / OPENGAUSS_* / OG_*
+# .env spellings are gone; only the in-container vars dictated by the
+# official images (POSTGRES_PASSWORD etc. for postgres, GS_* for
+# openGauss) keep their upstream names.
+#
+# Profiles:
+#   (none)            ogmem only; configure external database connections.
+#   with-db   opt-in  openGauss + Postgres (same as with-og + with-pg).
+#   with-og   opt-in  openGauss; configure external storage if needed.
+#   with-pg   opt-in  Postgres with pgvector for storage and/or vector search.
+#                    For a single-DB deployment, set VECTOR_DB_HOST,
+#                    VECTOR_DB_HOST_PORT, VECTOR_DB_NAME, VECTOR_DB_USER and
+#                    VECTOR_DB_PASSWORD to the matching STORAGE_DB_* values
+#                    in .env. Profiles select containers, not connection settings.
+#                    When running both databases, assign distinct host ports
+#                    via VECTOR_DB_HOST_PORT and STORAGE_DB_HOST_PORT.
+#   with-openclaw  opt-in  OpenClaw gateway (web UI on $GATEWAY_PORT)
+# Notes:
+#   * Both `ogmem` and `openclaw` use `network_mode: host`, so they bind
+#     directly to the host's loopback (127.0.0.1). `OGMEM_URL` therefore
+#     defaults to `http://127.0.0.1:${OGMEM_HTTP_PORT}` — the bridge-network
+#     `ogmem` DNS name does NOT resolve from inside a host-networked
+#     container.
+#   * Data is held in named volumes (ogmem_ogdb, ogmem_postgres-data,
+#     ogmem_openclaw-home). Use `docker compose down -v` to drop them.
+#   * Required vars (no default, must be set in .env): VECTOR_DB_PASSWORD,
+#     STORAGE_DB_PASSWORD, LLM_PROVIDER, LLM_API_KEY, LLM_BASE_URL, LLM_MODEL.
+#     Compose interpolates required vars even for inactive services, so these
+#     must be supplied even when explicitly targeting only postgres.
+# ============================================================
+
+name: ogmem
+
+services:
+
+  # --------------------------------------------------------------
+  # openGauss — vector DB only (when storage.backend=sql, context store
+  # lives in the postgres service below).
+  # Always pulled from registry; we don't build openGauss from source.
+  #
+  # The GS_* container vars are dictated by the openGauss image entrypoint;
+  # the .env source vars feeding them are VECTOR_DB_* so the deploy surface
+  # stays two-named: STORAGE_DB_* (storage DB) and VECTOR_DB_* (vector DB).
+  # --------------------------------------------------------------
+  opengauss:
+    # Accept the full ref (OG_IMAGE) or the split form (OG_IMAGE_REPO + OG_IMAGE_TAG)
+    # used by the legacy deploy.env. Falls back to the in-compose default.
+    image: ${OG_IMAGE:-${OG_IMAGE_REPO:-swr.cn-north-4.myhuaweicloud.com/kunpeng-ai/opengauss-distributed}:${OG_IMAGE_TAG:-0328}}
+    container_name: ${VECTOR_DB_CONTAINER_NAME:-opengauss}
+    profiles: ["with-db", "with-og"]
+    privileged: true
+    restart: unless-stopped
+    environment:
+      GS_PASSWORD: ${VECTOR_DB_PASSWORD:?VECTOR_DB_PASSWORD is required — set it in deploy/.env}
+      GS_USER_PASSWORD: ${VECTOR_DB_PASSWORD}
+      GS_NODENAME: ${VECTOR_DB_NODE_NAME:-gaussdb}
+      GS_USERNAME: ${VECTOR_DB_USER:-gaussdb}
+      GS_PORT: ${VECTOR_DB_PORT:-5432}
+      GS_DB: ${VECTOR_DB_NAME:-postgres}
+    ports:
+      - "${VECTOR_DB_HOST_PORT:-5432}:${VECTOR_DB_PORT:-5432}"
+    volumes:
+      - ogdb:/var/lib/opengauss
+    healthcheck:
+      test:
+        - CMD-SHELL
+        - su - omm -c "gsql -d ${VECTOR_DB_NAME:-postgres} -p ${VECTOR_DB_PORT:-5432} -c 'SELECT 1;'" >/dev/null 2>&1
+      interval: 10s
+      timeout: 5s
+      retries: 12
+      start_period: 30s
+    networks:
+      - ant-trail-net
+
+  # --------------------------------------------------------------
+  # postgres — SQL storage for context files, grants, outbox, and subscriptions.
+  # The pgvector image also supports single-database vector deployments.
+  # --------------------------------------------------------------
+  postgres:
+    image: pgvector/pgvector:pg16
+    container_name: ${STORAGE_DB_CONTAINER_NAME:-ogmem-postgres}
+    profiles: ["with-db", "with-pg"]
+    restart: unless-stopped
+    environment:
+      POSTGRES_PASSWORD: ${STORAGE_DB_PASSWORD:?STORAGE_DB_PASSWORD is required — set it in deploy/.env}
+      POSTGRES_USER: ${STORAGE_DB_USER:-ogmem}
+      POSTGRES_DB: ${STORAGE_DB_NAME:-ogmem}
+    ports:
+      - "${STORAGE_DB_HOST_PORT:-5432}:5432"
+    volumes:
+      - postgres-data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${STORAGE_DB_USER:-ogmem} -d ${STORAGE_DB_NAME:-ogmem}"]
+      interval: 10s
+      timeout: 5s
+      retries: 12
+      start_period: 30s
+    networks:
+      - ant-trail-net
+  # --------------------------------------------------------------
+  # ogmem — the memory HTTP API
+  # Built from local source by default (`docker/Dockerfile.standalone`).
+  # Override with `OGMEM_IMAGE=...` in .env to pull a prebuilt image instead.
+  # --------------------------------------------------------------
+  ogmem:
+    build:
+      context: ..
+      dockerfile: docker/Dockerfile.standalone
+      target: ${OGMEM_BUILD_TARGET:-standalone-no-agfs}
+    image: ${OGMEM_IMAGE:-ogmemory:${COMPOSE_PROJECT_NAME:-ogmem}-local}
+    container_name: ${OGMEM_CONTAINER_NAME:-ogmem}
+    restart: unless-stopped
+    # Use the host's network namespace so the container can reach services
+    # running on the host (e.g. the embedding server on host port 8345) via
+    # 127.0.0.1. Same pattern as the openclaw service. The ogmem listens on
+    # ${OGMEM_HTTP_PORT} on the host directly; the `ports:` mapping below is
+    # therefore omitted (compose ignores it under network_mode: host).
+    network_mode: host
+    # Wait for local databases when selected, but allow external databases
+    # (or Postgres-only deployments) when their profiles are disabled.
+    depends_on:
+      opengauss:
+        condition: service_healthy
+        required: false
+      postgres:
+        condition: service_healthy
+        required: false
+    environment:
+      OGMEM_MCP_PORT: ${OGMEM_MCP_PORT:-8091}
+      # ---- Vector DB connection (consumed by entrypoint for vector_db).
+      # Named VECTOR_DB_* because the backend may be openGauss OR
+      # PostgreSQL+pgvector — same DSN shape either way. ----
+      # Host defaults to 127.0.0.1 because the ogmem container runs with
+      # network_mode: host, so the only address that reaches the bridge-
+      # networked opengauss / postgres siblings is the host loopback (the
+      # compose service names opengauss / postgres do NOT resolve from
+      # the host network namespace). Override to the DB's real IP for
+      # external / managed databases.
+      VECTOR_DB_HOST: ${VECTOR_DB_HOST:-127.0.0.1}
+      # *_HOST_PORT is the host port — the port the ogmem process dials
+      # via loopback to reach the bridge-networked DB (compose forwards
+      # this to the container-internal port, which for openGauss is
+      # VECTOR_DB_PORT and for postgres is hardcoded 5432). The name
+      # matches what ogmemory.yaml and the entrypoint read directly —
+      # we do NOT alias it through VECTOR_DB_PORT because that name
+      # means something different at the compose layer (openGauss
+      # container-internal port / GS_PORT).
+      VECTOR_DB_HOST_PORT: ${VECTOR_DB_HOST_PORT:-5432}
+      VECTOR_DB_NAME: ${VECTOR_DB_NAME:-postgres}
+      VECTOR_DB_USER: ${VECTOR_DB_USER:-gaussdb}
+      VECTOR_DB_PASSWORD: ${VECTOR_DB_PASSWORD:?VECTOR_DB_PASSWORD is required — set it in deploy/.env}
+      # ---- Storage DB connection (consumed by entrypoint for
+      # storage.connection_string). Mirrors the VECTOR_DB_* layout above
+      # so the deploy surface stays two-named: STORAGE_DB_* (storage DB)
+      # and VECTOR_DB_* (vector DB). ----
+      STORAGE_DB_HOST: ${STORAGE_DB_HOST:-127.0.0.1}
+      STORAGE_DB_HOST_PORT: ${STORAGE_DB_HOST_PORT:-5432}
+      STORAGE_DB_NAME: ${STORAGE_DB_NAME:-ogmem}
+      STORAGE_DB_USER: ${STORAGE_DB_USER:-ogmem}
+      STORAGE_DB_PASSWORD: ${STORAGE_DB_PASSWORD:?STORAGE_DB_PASSWORD is required — set it in deploy/.env}
+      # ---- Storage backend ----
+      OGMEM_FS_BACKEND: ${OGMEM_FS_BACKEND:-sql}
+      # ---- LLM ----
+      LLM_PROVIDER: ${LLM_PROVIDER:?LLM_PROVIDER is required — set it in deploy/.env}
+      LLM_API_KEY: ${LLM_API_KEY:?LLM_API_KEY is required — set it in deploy/.env}
+      LLM_BASE_URL: ${LLM_BASE_URL:?LLM_BASE_URL is required — set it in deploy/.env}
+      LLM_MODEL: ${LLM_MODEL:?LLM_MODEL is required — set it in deploy/.env}
+      # ---- HTTP ----
+      OGMEM_HTTP_PORT: ${OGMEM_HTTP_PORT:-8090}
+      OGMEM_WORKERS: ${OGMEM_WORKERS:-2}
+      OGMEM_GUNICORN_TIMEOUT: ${OGMEM_GUNICORN_TIMEOUT:-900}
+      # ---- Identity / auth ----
+      OG_ACCOUNT_ID: ${OG_ACCOUNT_ID:-acct-demo}
+      OG_USER_ID: ${OG_USER_ID:-u-alice}
+      OG_AGENT_ID: ${OG_AGENT_ID:-main}
+      OG_ROLE_CONTROL_ENABLED: ${OG_ROLE_CONTROL_ENABLED:-false}
+      OG_ROOT_API_KEY: ${OG_ROOT_API_KEY:-}
+      OG_ADMIN_API_KEYS: ${OG_ADMIN_API_KEYS:-}
+      OG_AGENT_SHARED_MODE: ${OG_AGENT_SHARED_MODE:-off}
+      OG_AGENT_SHARED_LIST: ${OG_AGENT_SHARED_LIST:-}
+      OG_HTTP_IP_ALLOWLIST: ${OG_HTTP_IP_ALLOWLIST:-}
+      OG_HTTP_IP_ALLOWLIST_TRUST_PROXY: ${OG_HTTP_IP_ALLOWLIST_TRUST_PROXY:-false}
+      OG_HTTP_TRUSTED_PROXIES: ${OG_HTTP_TRUSTED_PROXIES:-}
+      # ---- Index ----
+      INDEX_INTERVAL: ${INDEX_INTERVAL:-15}
+      INDEX_WORKERS: ${INDEX_WORKERS:-1}
+      # ---- Perf ----
+      OGMEM_PERF_ENABLED: ${OGMEM_PERF_ENABLED:-}
+      OGMEM_PERF_OUT: ${OGMEM_PERF_OUT:-}
+      OGMEM_PERF_HTTP_URL: ${OGMEM_PERF_HTTP_URL:-}
+      OGMEM_PERF_RUN_ID: ${OGMEM_PERF_RUN_ID:-}
+      # ---- Proxy ----
+      no_proxy: "*"
+      NO_PROXY: "*"
+    # No `ports:` — with network_mode: host, the container binds directly
+    # to the host's port ${OGMEM_HTTP_PORT} (default 8090, see .env).
+    volumes:
+      - ./ogmemory.yaml:/etc/ogmem/config.yaml:ro
+      # Perf logs: drop a host dir into PERF_LOGS_HOST_DIR or accept the default
+      # (./_artifacts/perf inside the deploy/ directory).
+      - ${PERF_LOGS_HOST_DIR:-./_artifacts/perf}:/opt/ogmem/perf_logs
+    healthcheck:
+      test:
+        - CMD
+        - python3
+        - -c
+        - "import urllib.request; urllib.request.urlopen('http://127.0.0.1:${OGMEM_HTTP_PORT:-8090}/api/v1/health', timeout=2).read()"
+      interval: 10s
+      timeout: 5s
+      retries: 12
+      start_period: 30s
+
+  # --------------------------------------------------------------
+  # openclaw — web gateway (opt-in)
+  # Built from local source by default (`docker/Dockerfile.openclaw`).
+  # Override with `OPENCLAW_IMAGE=...` in .env to pull a prebuilt image instead.
+  #
+  # Uses `network_mode: host` because the openclaw image (2026.3.24) binds
+  # its gateway to 127.0.0.1, which is unreachable via Docker's bridge port
+  # mapping. With host networking, the in-container 127.0.0.1 IS the host's
+  # 127.0.0.1 and the gateway becomes reachable. The `ports:` mapping is
+  # therefore omitted — set GATEWAY_PORT to the port you want to expose on
+  # the host (and on which openclaw listens inside the container).
+  # --------------------------------------------------------------
+  openclaw:
+    build:
+      context: ..
+      dockerfile: docker/Dockerfile.openclaw
+    image: ${OPENCLAW_IMAGE:-openclaw-ogmemory:${COMPOSE_PROJECT_NAME:-ogmem}-local}
+    container_name: ${OPENCLAW_CONTAINER_NAME:-openclaw_ogmem}
+    profiles: ["with-openclaw"]
+    network_mode: host
+    restart: unless-stopped
+    depends_on:
+      ogmem:
+        condition: service_healthy
+    environment:
+      LLM_PROVIDER: ${LLM_PROVIDER}
+      LLM_API_KEY: ${LLM_API_KEY}
+      LLM_BASE_URL: ${LLM_BASE_URL}
+      LLM_MODEL: ${LLM_MODEL}
+      # With network_mode: host, the in-container port and the host port are
+      # the same. Pass GATEWAY_PORT through so the gateway listens on the
+      # host port the user chose.
+      GATEWAY_PORT: ${GATEWAY_PORT:-18789}
+      # Disable the openclaw Bonjour / mDNS advertiser. With
+      # network_mode: host the container sees every interface on the host
+      # (eth0, wlan0, docker0, ...); the ciao probe packet that the
+      # responder fires at startup then includes an A/AAAA record per
+      # interface and blows past the 1440-byte UDP MTU
+      # (`AssertionError: Probe query packet exceeds the mtu size
+      # (2115>1440)`), which crashes the gateway. mDNS over a host-network
+      # container also serves no real purpose — the broadcast stays on the
+      # host loopback and isn't discoverable from other devices anyway.
+      # Override with OPENCLAW_DISABLE_BONJOUR=0 only if the user is
+      # explicitly opting into LAN discovery.
+      OPENCLAW_DISABLE_BONJOUR: ${OPENCLAW_DISABLE_BONJOUR:-1}
+      # Both services run on the host network namespace, so 127.0.0.1 inside
+      # this container IS the host's 127.0.0.1. The `ogmem` DNS name from
+      # compose bridge networking does NOT resolve here. If you bring ogmem
+      # up on a different host (or switch it to bridge networking), override
+      # this via OGMEM_URL in .env.
+      OGMEM_URL: ${OGMEM_URL:-http://127.0.0.1:${OGMEM_HTTP_PORT:-8090}}
+      # The plugin reads OGMEM_API_URL (not OGMEM_URL). Mirror it here so the
+      # plugin picks up the same .env value rather than falling back to a
+      # hardcoded default. (Dockerfile.openclaw intentionally does not set
+      # OGMEM_API_URL, so this compose env wins.)
+      OGMEM_API_URL: ${OGMEM_URL:-http://127.0.0.1:${OGMEM_HTTP_PORT:-8090}}
+      # Explicit fallback identity when the host lifecycle omits userId.
+      # For isolated experiments use a new identity AND a fresh gateway state dir.
+      OGMEM_ACCOUNT_ID: ${OGMEM_ACCOUNT_ID:-}
+      OGMEM_USER_ID: ${OGMEM_USER_ID:-}
+      OGMEM_AGENT_ID: ${OGMEM_AGENT_ID:-}
+      # Agent IDs accepted by X-OpenClaw-Agent-ID; distinct from memory identity.
+      OPENCLAW_AGENT_IDS: ${OPENCLAW_AGENT_IDS:-}
+      OG_AUTH_API_KEY: ${OG_AUTH_API_KEY:-${OG_ROOT_API_KEY:-}}
+      OG_AUTH_ACCOUNT_ID: ${OG_AUTH_ACCOUNT_ID:-${OG_ACCOUNT_ID:-}}
+      OPENCLAW_GATEWAY_TOKEN: ${OPENCLAW_GATEWAY_TOKEN:-ogmem-default-token}
+      OPENCLAW_BIND_MODE: ${OPENCLAW_BIND_MODE:-lan}
+      # Applied to persisted plugin config at startup. Recreate the container
+      # after changing these; a restart does not update container environment.
+      OGMEM_AUTO_CAPTURE: "${OGMEM_AUTO_CAPTURE:-false}"
+      OGMEM_AUTO_RECALL: "${OGMEM_AUTO_RECALL:-false}"
+      no_proxy: "*"
+      NO_PROXY: "*"
+    # No `ports:` — with network_mode: host, the container listens directly
+    # on GATEWAY_PORT of the host. See the comment block above.
+    volumes:
+      # Persist OpenClaw state (auth pairing, agents, sessions) across
+      # container restarts. If OPENCLAW_HOME_DIR is set, bind-mount it so
+      # the user has direct host-side access; otherwise use the named volume
+      # declared at the bottom of this file.
+      - ${OPENCLAW_HOME_DIR:-openclaw-home}:/home/node/.openclaw
+    healthcheck:
+      test:
+        - CMD-SHELL
+        - "curl -fsS http://127.0.0.1:${GATEWAY_PORT:-18789}/ >/dev/null 2>&1 || exit 1"
+      interval: 10s
+      timeout: 5s
+      retries: 6
+      start_period: 30s
+
+volumes:
+  ogdb:
+  postgres-data:
+  openclaw-home:
+
+networks:
+  ant-trail-net:
+    driver: bridge
+    ipam:
+      config:
+        - subnet: ${NETWORK_SUBNET:-172.80.0.0/16}

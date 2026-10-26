@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import re
+from collections.abc import Iterator
 from dataclasses import dataclass
 from typing import Any
 from urllib.parse import quote, unquote, urlparse
@@ -174,8 +176,12 @@ def external_to_internal_uri_candidates(uri: str, ctx: RequestContext) -> list[s
     parsed = parse_ogmemory_uri(uri)
     candidates = [primary]
     encoded_id = quote(parsed.memory_id, safe="") if parsed.memory_id else ""
+    encoded_ids = dict.fromkeys([
+        encoded_id,
+        re.sub(r"%[0-9A-F]{2}", lambda match: match.group().lower(), encoded_id),
+    ])
     if parsed.memory_type != "skill" and encoded_id != parsed.memory_id:
-        candidates.append(f"{primary.rsplit('/', 1)[0]}/{encoded_id}")
+        candidates.extend(f"{primary.rsplit('/', 1)[0]}/{name}" for name in encoded_ids)
     if (
         parsed.kind == "item"
         and parsed.memory_type == "pattern"
@@ -187,8 +193,38 @@ def external_to_internal_uri_candidates(uri: str, ctx: RequestContext) -> list[s
         if legacy_agent_uri not in candidates:
             candidates.append(legacy_agent_uri)
         if encoded_id != parsed.memory_id:
-            candidates.append(f"{legacy_agent_uri.rsplit('/', 1)[0]}/{encoded_id}")
+            candidates.extend(f"{legacy_agent_uri.rsplit('/', 1)[0]}/{name}" for name in encoded_ids)
     return candidates
+
+
+def iter_internal_uri_candidates(
+    uri: str, ctx: RequestContext, context_fs: Any = None,
+) -> Iterator[str]:
+    candidates = external_to_internal_uri_candidates(uri, ctx)
+    parsed = parse_ogmemory_uri(uri)
+    if parsed.memory_type in {"skill", "profile"} or not hasattr(context_fs, "list_children"):
+        yield from candidates
+        return
+    by_owner: dict[str, list[str]] = {}
+    for candidate in candidates:
+        by_owner.setdefault(candidate.rsplit("/", 1)[0], []).append(candidate)
+    for base_uri, owner_candidates in by_owner.items():
+        yield from owner_candidates
+        try:
+            children = context_fs.list_children(base_uri, ctx)
+        except Exception as exc:
+            if is_not_found_or_not_visible_error(exc):
+                continue
+            raise
+        matches = {
+            child for child in children
+            if child.rsplit("/", 1)[0] == base_uri
+            and child not in owner_candidates
+            and unquote(child.rsplit("/", 1)[1]) == parsed.memory_id
+        }
+        if len(matches) > 1:
+            raise ValueError("Ambiguous historical memory id")
+        yield from matches
 
 
 def internal_to_external_uri(uri: str, *, category: str = "") -> str:
@@ -340,6 +376,7 @@ def render_collection_resource(
         else:
             collection_truncated = False
             next_cursor = None
+            fetch_limit = limit + 1
             context_fs = service._get_context_fs()
             if memory_type == "profile":
                 internal_uri = f"ctx://{ctx.account_id}/users/{ctx.user_id}/memories/profile"
@@ -347,18 +384,20 @@ def render_collection_resource(
                     memories.append(_node_summary(context_fs.read_node(internal_uri, ctx)))
             elif memory_type == "pattern":
                 user_base = f"ctx://{ctx.account_id}/users/{ctx.user_id}/memories/patterns"
-                memories.extend(_list_node_summaries(context_fs, user_base, ctx, limit))
-                if ctx.agent_id and len(memories) < limit:
+                memories.extend(_list_node_summaries(context_fs, user_base, ctx, fetch_limit))
+                if ctx.agent_id and len(memories) < fetch_limit:
                     agent_base = f"ctx://{ctx.account_id}/agents/{ctx.agent_id}/memories/patterns"
                     memories.extend(
-                        _list_node_summaries(context_fs, agent_base, ctx, limit - len(memories))
+                        _list_node_summaries(context_fs, agent_base, ctx, fetch_limit - len(memories))
                     )
             else:
                 owner_path = "agents" if spec.owner == "agent" else "users"
                 owner_id = ctx.agent_id if spec.owner == "agent" else ctx.user_id
                 if owner_id:
                     base_uri = f"ctx://{ctx.account_id}/{owner_path}/{owner_id}/memories/{spec.directory}"
-                    memories.extend(_list_node_summaries(context_fs, base_uri, ctx, limit))
+                    memories.extend(_list_node_summaries(context_fs, base_uri, ctx, fetch_limit))
+            collection_truncated = len(memories) > limit
+            memories = memories[:limit]
     except Exception as exc:
         raise_not_found_or_not_visible(exc)
 
@@ -391,7 +430,7 @@ def render_item_resource(service: Any, uri: str, ctx: RequestContext) -> dict[st
     last_exc: Exception | None = None
     try:
         context_fs = service._get_context_fs()
-        for internal_uri in external_to_internal_uri_candidates(uri, ctx):
+        for internal_uri in iter_internal_uri_candidates(uri, ctx, context_fs):
             try:
                 node = context_fs.read_node(internal_uri, ctx)
                 return _truncate_payload(
@@ -460,6 +499,15 @@ def _validate_public_uri_text(uri: str) -> None:
         raise ValueError("URI must be a non-empty string")
     if uri.startswith("ctx://"):
         raise ValueError("Internal ctx:// URIs are not accepted")
+    if any(char.isspace() for char in uri) or "?" in uri or "#" in uri:
+        raise ValueError("Invalid URI")
+    if re.search(r"%(?![0-9a-fA-F]{2})", uri):
+        raise ValueError("Invalid percent escape in URI")
+    decoded = unquote(uri, errors="strict")
+    if any(ord(char) < 32 or ord(char) == 127 for char in decoded):
+        raise ValueError("Control characters are not accepted in URIs")
+    if "//" in urlparse(uri).path or urlparse(uri).path.endswith("/"):
+        raise ValueError("Empty URI path segments are not accepted")
     if "\\" in uri or any(
         unquote(part) in {".", ".."} for part in urlparse(uri).path.split("/")
     ):

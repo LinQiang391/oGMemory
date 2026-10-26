@@ -264,7 +264,7 @@ def test_concurrent_threads_do_not_share_turn_state():
     assert all(body["messages"][0]["content"] == body["sessionId"] for body in writes)
 
 
-def test_multimodal_and_system_messages_are_filtered():
+def test_text_content_is_serialized_from_host_messages():
     assert _serialize(
         [
             SystemMessage(content="system secret"),

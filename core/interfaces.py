@@ -5,20 +5,19 @@ All protocols use typing.Protocol for structural subtyping.
 """
 
 from datetime import datetime
-from typing import Protocol
+from typing import Any, Protocol
 from typing_extensions import runtime_checkable
 
-from typing import Any
 
 from core.models import (
-    RequestContext,
-    ContextNode,
-    RelationEdge,
     CandidateMemory,
-    WritePlan,
+    ContextNode,
     IndexRecord,
     OutboxEvent,
+    RelationEdge,
+    RequestContext,
     SeedHit,
+    WritePlan,
 )
 
 
@@ -98,6 +97,13 @@ class ContextFS(Protocol):
         PENDING nodes are not visible to upper layers.
         """
         ...
+
+
+@runtime_checkable
+class ArchiveLocator(Protocol):
+    """Optional canonical archive lookup scoped to the caller's account and owner."""
+
+    def find_archive_uri(self, archive_id: str, ctx: RequestContext) -> str | None: ...
 
 
 class RelationStore(Protocol):
@@ -183,8 +189,9 @@ class VectorIndex(Protocol):
         uris: list[str],
         filters: dict[str, Any],
         level: int = 0,
+        *, expected_texts: dict[str, str] | None = None,
     ) -> dict[str, list[float]]:
-        """Read already-indexed vectors for offline derived projections."""
+        """Read scoped vectors, matching expected source text in the same index read."""
         ...
 
     def upsert(self, records: list[IndexRecord]) -> None:
@@ -240,6 +247,7 @@ class VectorIndex(Protocol):
         """
         ...
 
+
     def delete_by_owner_space(
         self, account_id: str, owner_space: str
     ) -> int:
@@ -282,6 +290,7 @@ class LLM(Protocol):
         Returns parsed JSON dict.
         """
         ...
+
 
     def complete_with_tools(
         self,
@@ -414,6 +423,10 @@ class OutboxStore(Protocol):
         Returns:
             List of (node_uri, OutboxEvent) tuples
         """
+        ...
+
+    def count_unfinished(self, account_id: str | None = None) -> dict[str, int]:
+        """Count live pending and processing events without claiming them."""
         ...
 
     def mark_processing(self, event: OutboxEvent, node_uri: str) -> None:

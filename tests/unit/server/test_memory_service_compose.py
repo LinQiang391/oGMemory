@@ -1,14 +1,23 @@
 from __future__ import annotations
-from types import SimpleNamespace
-from core.models import RetrievedBlock, SearchMemoryResult
 
 import logging
+from types import SimpleNamespace
 from unittest.mock import Mock
 
 import pytest
 
-from core.models import ArchiveRef, ContextNode, RequestContext, Role, SeedHit
+from core.errors import AccessDeniedError, ValidationError
+from core.models import (
+    ArchiveRef,
+    ContextNode,
+    RequestContext,
+    RetrievedBlock,
+    Role,
+    SearchMemoryResult,
+    SeedHit,
+)
 from providers.unified_config import OgMemConfig
+from server.auth import AuthenticationError, AuthorizationError, ControlPlaneDisabledError
 from server.memory_service import MemoryService
 from session.models import SessionWindowState
 from session.session_state import Commitment, TaskState

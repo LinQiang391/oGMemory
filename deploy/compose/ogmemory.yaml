@@ -29,8 +29,8 @@ mcp:
   host: 0.0.0.0
   port: 8091
   path: /mcp
-  default_toolset: read-only
-  enable_write_tools: false
+  default_toolset: read-write
+  enable_write_tools: true
   enable_delete_tools: false
   allowed_hosts: "${OGMEM_MCP_ALLOWED_HOSTS}"
 index:

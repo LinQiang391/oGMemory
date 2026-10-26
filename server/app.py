@@ -25,13 +25,14 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from flask import Flask, jsonify, request
 from werkzeug.exceptions import RequestEntityTooLarge
 
-from core.errors import AccessDeniedError, NodeNotFoundError
+from core.errors import AccessDeniedError, NodeNotFoundError, ValidationError
 from core.logging_config import configure_third_party_loggers
 from perf.recorder import SpanEvent, clocks, get_recorder
 from providers.unified_config import get_config
 from server.auth import AuthenticationError, AuthorizationError, ControlPlaneDisabledError
 from server.memory_service import MemoryService
 from server.memory_viewer import create_memory_viewer_blueprint
+from server.scene_api import create_scene_blueprint
 from session.session_manager import SessionOperationInProgress
 
 logging.basicConfig(
@@ -116,6 +117,7 @@ def _build_authenticated_context(params: dict):
 
 def _error_response(exc: Exception):
     from core.errors import ConcurrentModificationError
+    from scene.config import ConfigRevisionError
 
     if isinstance(exc, RequestEntityTooLarge):
         return jsonify({"error": exc.description}), 413
@@ -123,21 +125,32 @@ def _error_response(exc: Exception):
         return jsonify({"error": str(exc)}), 401
     if isinstance(exc, ControlPlaneDisabledError):
         return jsonify({"error": str(exc)}), 503
-    if isinstance(exc, FileNotFoundError):
+    if isinstance(exc, (FileNotFoundError, NodeNotFoundError)):
         return jsonify({"error": str(exc)}), 404
     if isinstance(exc, FileExistsError):
         return jsonify({"error": str(exc)}), 409
-    if isinstance(exc, ConcurrentModificationError):
+    if isinstance(exc, (ConcurrentModificationError, ConfigRevisionError)):
         return jsonify({"error": str(exc)}), 409
-    if isinstance(exc, ValueError):
+    if isinstance(exc, SessionOperationInProgress):
+        return jsonify({
+            "ok": False,
+            "status": 409,
+            "error_code": "session_operation_in_progress",
+            "conflict_type": exc.conflict_type,
+            "retryable": exc.retryable,
+        }), 409
+    if isinstance(exc, (ValueError, ValidationError)):
         return jsonify({"error": str(exc)}), 400
-    if isinstance(exc, AuthorizationError | PermissionError):
+    if isinstance(exc, (AuthorizationError, PermissionError, AccessDeniedError)):
         return jsonify({"error": str(exc)}), 403
     return jsonify({"error": str(exc)}), 500
 
 
 app.register_blueprint(
     create_memory_viewer_blueprint(_get_service, _build_authenticated_context, _error_response)
+)
+app.register_blueprint(
+    create_scene_blueprint(_get_service, _build_authenticated_context, _error_response)
 )
 
 
@@ -360,8 +373,8 @@ def handle_compose():
         if rec.enabled:
             after = rec.snapshot_tokens()
             tokens, cost, source = rec.finalize_tokens(after, before)
-            _emit_perf_stage("compose", params, before, started_at, wall_start, cpu_start, True, None, tokens, cost, source)
-        return jsonify(result)
+            _emit_perf_stage("compose", params, before, started_at, wall_start, cpu_start, _lifecycle_result_ok(result), None, tokens, cost, source)
+        return _lifecycle_result_response(result)
     except Exception as exc:
         logger.error("compose failed: %s", exc, exc_info=True)
         if rec.enabled:

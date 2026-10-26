@@ -177,6 +177,14 @@ def test_compose_optional_extra_body_loads_configuration(tmp_path, monkeypatch, 
     environment = json.loads(result.stdout)['services']['ogmemory']['environment']
     for key, value in environment.items():
         monkeypatch.setenv(key, str(value))
+    # Image deployment stores model configuration in a generated YAML, not service env.
+    # Keep testing the source runtime's optional JSON override independently.
+    for key in re.findall(r'\$\{(\w+)\}', (ROOT / 'deploy/compose/ogmemory.yaml').read_text()):
+        if key not in environment:
+            monkeypatch.setenv(key, '1024' if key == 'EMBEDDING_DIMENSION' else
+                               '1' if key == 'OGMEM_AFTER_TURN_THRESHOLD' else 'test-only')
+    if extra_body is not None:
+        monkeypatch.setenv('LLM_EXTRA_BODY', extra_body or '{}')
     resolved = tmp_path / 'resolved.yaml'
     runtime().resolve_config(ROOT / 'deploy/compose/ogmemory.yaml', resolved)
     assert OgMemConfig.load(str(resolved)).llm_extra_body == expected

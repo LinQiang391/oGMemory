@@ -23,7 +23,7 @@ Marketplace：
 源码开发：
 
 ```bash
-claude --plugin-dir ./claude-plugin --debug
+claude --plugin-dir ./plugins/claude-code --debug
 ```
 
 ## 3. 配置
@@ -78,8 +78,7 @@ export OGMEM_AUTO_RECALL=true
 不会创建或推进 `.ingest-offset`，也不会启动后台 after-turn 写入或重试。
 重新开启后会从旧偏移继续，可能补录关闭期间的对话。
 Trace 继续上传；如需仅保留 Trace 元数据，可同时设置 `OGMEM_TRACE_CAPTURE_CONTENT=0`。
-Read/Bash 输出过滤、手动 `/og-add-history` / `/og-compose` 和 MCP 工具保持各自行为。
-`OGMEM_CODE_MEMORY_ONLY=true` 仍优先禁用通用 Trace 和会话持久化。
+手动 `/og-add-history` / `/og-compose` 和 MCP 工具保持各自行为。
 
 | Claude Code Hook | 脚本 | oGMemory 调用 | 超时 |
 | --- | --- | --- | --- |
@@ -95,7 +94,7 @@ Read/Bash 输出过滤、手动 `/og-add-history` / `/og-compose` 和 MCP 工具
 | `PreCompact` | 两个脚本 | Trace `pre_compact` + 同步 `/after_turn` | 5s + 600s |
 | `SessionEnd` | `call_add_session_message.py` | Trace `session_end` | 5s |
 
-Hook 定义：[`../../claude-plugin/hooks/hooks.json`](../../claude-plugin/hooks/hooks.json)。
+Hook 定义：[`../../plugins/claude-code/hooks/hooks.json`](../../plugins/claude-code/hooks/hooks.json)。
 
 ## 5. Prompt 前自动召回
 

@@ -16,7 +16,7 @@ from server.mcp_tools import write_memory
 from server.memory_service import MemoryService
 from tests.unit.fs.test_agfs_trace_store import _MemoryAGFS
 
-_PII_CASES = json.loads((Path(__file__).parents[3] / "deepseek-harness-plugin/tests/fixtures/pii_cases.json").read_text())
+_PII_CASES = json.loads((Path(__file__).parents[3] / "plugins/deepseek-harness/tests/fixtures/pii_cases.json").read_text())
 
 
 class _FakeAuth:
@@ -184,14 +184,37 @@ def test_write_memory_requires_exactly_one_material_source():
         )
 
 
-@pytest.mark.parametrize("field", ["type", "memory_id", "abstract", "overview", "uri"])
+@pytest.mark.parametrize("field", [
+    "type", "memory_type", "memory_id", "category", "context_type", "owner_space",
+    "level", "metadata", "abstract", "overview", "uri",
+])
 def test_write_memory_rejects_atomic_memory_fields(field):
+    service = _FakeService()
     with pytest.raises(ValueError, match="cannot set atomic memory fields"):
         write_memory(
-            _FakeService(),
+            service,
             messages=[{"role": "user", "content": "hello", field: "forbidden"}],
             session_id="s1",
         )
+    assert service.after_turn_params is None
+
+
+@pytest.mark.parametrize("source", ["text", "messages"])
+def test_write_memory_preserves_json_facts_as_user_content(source):
+    service = _FakeService()
+    text = json.dumps({"uri": "catalog://item/42", "category": "book", "abstract": "A book", "content": "facts"})
+    material = {"text": text} if source == "text" else {"messages": [{"role": "user", "content": text}]}
+
+    write_memory(service, session_id="s1", **material)
+
+    assert service.after_turn_params["messages"] == [{"role": "user", "content": text}]
+
+
+def test_write_memory_rejects_both_text_and_empty_messages():
+    service = _FakeService()
+    with pytest.raises(ValueError, match="either text or messages"):
+        write_memory(service, text="Remember this", messages=[], session_id="s1")
+    assert service.after_turn_params is None
 
 
 def test_write_trace_preserves_order_identity_and_retry_event_ids():
@@ -568,7 +591,7 @@ def test_write_trace_persists_shared_pii_redaction_cases(case, wrapper):
 def test_trace_rule_bundles_match():
     root = Path(__file__).parents[3]
     assert json.loads((root / "skills/trace_redaction_rules.json").read_text()) == json.loads(
-        (root / "deepseek-harness-plugin/lib/trace_redaction_rules.json").read_text()
+        (root / "plugins/deepseek-harness/lib/trace_redaction_rules.json").read_text()
     )
 
 @pytest.mark.parametrize("text, expected", [
@@ -613,7 +636,7 @@ def test_write_trace_redacts_complete_quoted_credentials(text, as_json):
 
 
 @pytest.mark.parametrize("text", json.loads(
-    (Path(__file__).parents[3] / "deepseek-harness-plugin/tests/fixtures/yaml_secret_cases.json").read_text()
+    (Path(__file__).parents[3] / "plugins/deepseek-harness/tests/fixtures/yaml_secret_cases.json").read_text()
 ))
 @pytest.mark.parametrize("as_json", [False, True])
 def test_write_trace_redacts_yaml_multiline_secrets(text, as_json):

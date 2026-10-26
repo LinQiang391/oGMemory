@@ -4,12 +4,11 @@ Uses mock database connection for isolated testing.
 For integration tests with real database, see scripts/test_opengauss_index.py
 """
 
-import math
-import pytest
-from unittest.mock import Mock, MagicMock, patch
-from typing import Any
+from unittest.mock import patch
 
-from core.models import IndexRecord, TypedQuery, SeedHit
+import pytest
+
+from core.models import IndexRecord, SeedHit, TypedQuery
 
 
 # Mock Json to just pass through the input value
@@ -24,8 +23,10 @@ class MockJson:
         return self.obj == other
 
 
-# Apply the mock at module level
-patch('providers.vector_index.opengauss_index.Json', MockJson).start()
+@pytest.fixture(autouse=True)
+def mock_json_adapter():
+    with patch("providers.vector_index.opengauss_index.Json", MockJson):
+        yield
 
 
 class MockCursor:
@@ -160,6 +161,10 @@ class TestUpsert:
         assert len(mock_cursor.executed_sql) == 1
         # Implementation changed to MERGE INTO (openGauss compatible)
         assert "MERGE INTO" in mock_cursor.executed_sql[0]
+        assert "t.account_id = s.account_id" in mock_cursor.executed_sql[0]
+        assert mock_cursor.executed_params[0][:2] == (record.id, "test")
+        update_clause = mock_cursor.executed_sql[0].split("WHEN MATCHED")[1].split("WHEN NOT MATCHED")[0]
+        assert "account_id =" not in update_clause
         assert mock_conn.committed
 
     @patch('providers.vector_index.opengauss_index.psycopg2')
@@ -483,7 +488,7 @@ class TestSearch:
         index.search(query)
 
         sql = mock_cursor.executed_sql[0]
-        assert "filters->>'owner_space'" in sql
+        assert "COALESCE(owner_space, filters->>'owner_space') = %(f_owner_space)s" in sql
 
 
 class TestCount:
@@ -674,6 +679,35 @@ class TestContextManager:
             index._return_connection(conn)
 
         assert len(index._pool) == 0
+
+
+@pytest.mark.parametrize(
+    ("dialect", "first_statement"),
+    [
+        ("opengauss", "CREATE TABLE IF NOT EXISTS vector_index"),
+        ("postgresql", "CREATE EXTENSION IF NOT EXISTS vector"),
+    ],
+)
+def test_shared_pool_dialect_selects_vector_bootstrap(monkeypatch, dialect, first_statement):
+    from fs.sql_adapter.pool import SharedConnectionPool
+    from providers.vector_index.opengauss_index import OpenGaussVectorIndex
+
+    cursor = MockCursor()
+    connection = MockConnection(cursor)
+    pool = SharedConnectionPool("host=storage dbname=memory", dialect=dialect)
+    monkeypatch.setattr(pool, "get_connection", lambda: connection)
+    returned = []
+    monkeypatch.setattr(pool, "return_connection", returned.append)
+
+    index = OpenGaussVectorIndex(pool=pool, dimension=3)
+
+    assert index.sql_dialect.name == dialect
+    assert index._shared_pool is pool
+    assert cursor.executed_sql[0].strip().startswith(first_statement)
+    assert any("embedding     vector(3)" in sql for sql in cursor.executed_sql)
+    assert any("USING hnsw (embedding vector_cosine_ops)" in sql for sql in cursor.executed_sql)
+    assert connection.committed
+    assert returned == [connection]
 
 
 @pytest.mark.skip(reason="Auto-initialization feature not implemented yet")

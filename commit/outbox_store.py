@@ -556,6 +556,136 @@ class OutboxStore:
             pass
         return results
 
+    @staticmethod
+    def _load_event_json(raw) -> dict:
+        if isinstance(raw, (bytes, bytearray)):
+            raw = raw.decode("utf-8")
+        if not isinstance(raw, str):
+            raise TypeError("Outbox event content must be bytes or text")
+        data = json.loads(raw)
+        if not isinstance(data, dict):
+            raise ValueError("Outbox event content must be a JSON object")
+        return data
+
+    def count_unfinished(self, account_id: str | None = None) -> dict[str, int]:
+        """Count every live account Outbox event without claiming it.
+
+        This deliberately differs from :meth:`list_pending`: active processing
+        locks and retry-delayed events are unfinished index work even though a
+        worker must not claim them again.  The counter is used only for
+        freshness reporting, so an incomplete AGFS scan raises rather than
+        reporting a false idle state.
+        """
+
+        if (
+            not isinstance(account_id, str)
+            or not account_id.strip()
+            or ".." in account_id
+            or "/" in account_id
+            or "\\" in account_id
+        ):
+            raise ValueError("account_id is invalid")
+        counts = {"pending": 0, "processing": 0}
+        prefix = self._mount_prefix + f"/accounts/{account_id}/"
+        try:
+            entries = self._client.ls(prefix)
+        except Exception as exc:
+            if self._is_not_found_error(exc):
+                return {"pending": 0, "processing": 0, "total": 0}
+            raise
+        self._count_unfinished_entries(prefix, entries, counts)
+        counts["total"] = counts["pending"] + counts["processing"]
+        return counts
+
+    def _count_unfinished_recursive(self, path: str, counts: dict[str, int]) -> None:
+        try:
+            entries = self._client.ls(path)
+        except Exception as exc:
+            name = path.rstrip("/").rsplit("/", 1)[-1]
+            if self._is_resource_lock_directory(name) and (
+                self._is_not_found_error(exc) or "no such directory" in str(exc).lower()
+            ):
+                return
+            raise
+        self._count_unfinished_entries(path, entries, counts)
+
+    @staticmethod
+    def _is_resource_lock_directory(name: str) -> bool:
+        """Identify mutation lease names whose directory can disappear mid-scan."""
+
+        if not name.startswith("."):
+            return False
+        for suffix in (".resource-mutation-lock", ".update-lock"):
+            if name.endswith(suffix) and len(name) > len(suffix) + 1:
+                return True
+        for marker in (".resource-mutation-lock-", ".update-lock-"):
+            prefix, separator, token = name.rpartition(marker)
+            if (
+                separator
+                and len(prefix) > 1
+                and len(token) == 32
+                and all(char in "0123456789abcdef" for char in token)
+            ):
+                return True
+        return False
+
+    def _count_unfinished_entries(
+        self,
+        path: str,
+        entries: list[dict],
+        counts: dict[str, int],
+    ) -> None:
+        """Walk an account tree and count live Outbox records exactly once."""
+
+        if ".." in path:
+            raise ValueError("invalid Outbox scan path")
+        for entry in entries:
+            name = str(entry.get("name", "")).rsplit("/", 1)[-1]
+            if not name or name in {".", ".."}:
+                continue
+            is_dir = bool(entry.get("is_dir", entry.get("isDir", False)))
+            child_path = path.rstrip("/") + "/" + name
+            if is_dir and name == ".outbox":
+                self._count_unfinished_outbox(child_path, counts)
+            elif (
+                is_dir
+                and name != ".outbox"
+            ):
+                self._count_unfinished_recursive(child_path + "/", counts)
+
+    def _count_unfinished_outbox(self, outbox_path: str, counts: dict[str, int]) -> None:
+        """Count pending and processing files, including locks and retries."""
+
+        entries = self._client.ls(outbox_path + "/")
+        processing_ids = {
+            str(entry.get("name", "")).rsplit("/", 1)[-1][:-11]
+            for entry in entries
+            if not bool(entry.get("is_dir", entry.get("isDir", False)))
+            and str(entry.get("name", "")).rsplit("/", 1)[-1].endswith(".processing")
+        }
+        for entry in entries:
+            name = str(entry.get("name", "")).rsplit("/", 1)[-1]
+            is_dir = bool(entry.get("is_dir", entry.get("isDir", False)))
+            if is_dir or not name.endswith(".json") or name.startswith("."):
+                continue
+            event_id = name[:-5]
+            try:
+                raw = self._client.read(outbox_path.rstrip("/") + "/" + name)
+            except Exception as exc:
+                if self._is_not_found_error(exc):
+                    continue
+                raise
+            data = self._load_event_json(raw)
+            if data.get("event_id") != event_id:
+                raise ValueError("Outbox event id does not match its file name")
+            status = data.get("status", "PENDING")
+            if status == "PROCESSING" or event_id in processing_ids:
+                counts["processing"] += 1
+            elif status == "PENDING":
+                counts["pending"] += 1
+            else:
+                raise ValueError("Outbox event has an invalid live status")
+
     def _scan_outbox_recursive(self, path: str, results: list) -> None:
         """Recursively scan directory for .outbox/ event files.
 

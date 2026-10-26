@@ -39,7 +39,7 @@ def main() -> None:
     plugin_dir = Path(
         os.getenv(
             "OGMEM_OPENCODE_PLUGIN_DIR",
-            str(Path(__file__).resolve().parents[1] / "opencode-plugin"),
+            str(Path(__file__).resolve().parents[1] / "plugins/opencode"),
         )
     ).resolve()
     binary = os.getenv("OPENCODE_BIN", "opencode")

@@ -1,0 +1,163 @@
+{
+  "id": "og-memory-context-engine",
+  "name": "oGMemory Context Engine",
+  "description": "oGMemory integration plugin for OpenClaw. Implements long-term memory with semantic search and knowledge extraction. Automatically starts AGFS + ContextEngine services on gateway startup.",
+  "version": "1.0.0",
+  "kind": "context-engine",
+  "configSchema": {
+    "type": "object",
+    "additionalProperties": false,
+    "properties": {
+      "mode": {
+        "type": "string",
+        "enum": ["local", "remote"],
+        "description": "local = auto-start AGFS + ContextEngine on gateway startup; remote = connect to already-running services",
+        "default": "remote"
+      },
+      "agfsServerDir": {
+        "type": "string",
+        "description": "Path to AGFS server Go source directory (local mode). Env: AGFS_SERVER_DIR"
+      },
+      "agfsPort": {
+        "type": "integer",
+        "description": "AGFS server port (default: 1833). Env: AGFS_PORT",
+        "default": 1833
+      },
+      "agfsDataDir": {
+        "type": "string",
+        "description": "AGFS data directory (local mode). Env: AGFS_DATA_DIR"
+      },
+      "contextEnginePort": {
+        "type": "integer",
+        "description": "ContextEngine server port (default: 8090). Env: CONTEXTENGINE_PORT",
+        "default": 8090
+      },
+      "projectRoot": {
+        "type": "string",
+        "description": "ContextEngine project root directory. Env: CONTEXTENGINE_PROJECT_ROOT"
+      },
+      "memoryApiBaseUrl": {
+        "type": "string",
+        "description": "ContextEngine HTTP API base URL (remote mode). Env: OGMEM_API_URL"
+      },
+      "authApiKey": {
+        "type": "string",
+        "description": "API Key for oGMemory multi-tenant authentication. Env: OG_AUTH_API_KEY"
+      },
+      "authAccountId": {
+        "type": "string",
+        "description": "Account ID for multi-tenant authentication. Env: OG_AUTH_ACCOUNT_ID"
+      },
+      "startupTimeoutMs": {
+        "type": "integer",
+        "description": "Max ms to wait for each service to become healthy (default: 60000)",
+        "default": 60000
+      },
+      "traceTimeoutMs": {
+        "type": "integer",
+        "description": "Max ms for each trace event HTTP attempt (default: 3000)",
+        "default": 3000
+      },
+      "traceCaptureContent": {
+        "type": "boolean",
+        "description": "Whether trace events include redacted prompt/tool/assistant content in addition to size metadata (default: true)",
+        "default": true
+      },
+      "commitTokenThreshold": {
+        "type": "integer",
+        "description": "Pending token threshold to trigger async session commit (default: 20000)",
+        "default": 20000
+      },
+      "autoCapture": {
+        "type": "boolean",
+        "description": "Controls automatic ingest/afterTurn capture. Explicit compaction, cleanup and trace uploads retain their own controls. Env: OGMEM_AUTO_CAPTURE"
+      },
+      "autoRecall": {
+        "type": "boolean",
+        "description": "Inject memory through assemble (prefetch/compose). When false, pass through current messages. Env: OGMEM_AUTO_RECALL"
+      },
+      "prefetchEnabled": {
+        "type": "boolean",
+        "description": "Whether to call oG-Memory prefetch before compose.",
+        "default": false
+      },
+      "prefetchTopK": {
+        "type": "integer",
+        "description": "Maximum prefetch hits to stage in the session topic buffer.",
+        "default": 5
+      },
+      "compactTakeoverEnabled": {
+        "type": "boolean",
+        "description": "Whether oGMemory owns final compact result generation. Pre-compaction extraction still runs when disabled.",
+        "default": true
+      },
+      "summaryMaxChars": {
+        "type": "integer",
+        "description": "Maximum compact summary length in characters.",
+        "default": 4000
+      },
+      "shortTermIndexMode": {
+        "type": "string",
+        "enum": ["sync", "async", "off"],
+        "description": "Short-term index update strategy during compact takeover.",
+        "default": "sync"
+      },
+      "accountId": {
+        "type": "string",
+        "description": "Default account ID for multi-tenant isolation"
+      },
+      "userId": {
+        "type": "string",
+        "description": "Default user ID"
+      },
+      "agentId": {
+        "type": "string",
+        "description": "Default agent ID"
+      },
+      "llmProvider": {
+        "type": "string",
+        "description": "LLM provider: openai, mock. Default: mock. Env: CONTEXTENGINE_PROVIDER"
+      },
+      "llmApiKey": {
+        "type": "string",
+        "description": "LLM API key. Env: OGMEM_API_KEY"
+      },
+      "llmBaseUrl": {
+        "type": "string",
+        "description": "LLM API base URL (OpenAI-compatible). Env: OGMEM_BASE_URL"
+      },
+      "llmModel": {
+        "type": "string",
+        "description": "LLM model name (default: gpt-4o-mini). Env: OGMEM_LLM_MODEL"
+      },
+      "llmReasoningEffort": {
+        "type": "string",
+        "description": "Optional model reasoning effort, such as medium, xhigh, or max. Env: LLM_REASONING_EFFORT"
+      },
+      "llmIsReasoningModel": {
+        "type": "boolean",
+        "description": "Optional reasoning-model override. Omit to auto-detect. Env: LLM_IS_REASONING_MODEL"
+      },
+      "llmExtraBody": {
+        "type": "object",
+        "description": "Additional OpenAI-compatible request body fields. Env: LLM_EXTRA_BODY"
+      },
+      "embeddingProvider": {
+        "type": "string",
+        "description": "Embedding provider. Defaults to llmProvider. Env: EMBEDDING_PROVIDER"
+      },
+      "embeddingApiKey": {
+        "type": "string",
+        "description": "Embedding API key. Defaults to llmApiKey. Env: OGMEM_EMBEDDING_API_KEY"
+      },
+      "embeddingBaseUrl": {
+        "type": "string",
+        "description": "Embedding API base URL. Defaults to llmBaseUrl. Env: OGMEM_EMBEDDING_BASE_URL"
+      },
+      "embeddingModel": {
+        "type": "string",
+        "description": "Embedding model name (default: text-embedding-ada-002). Env: OGMEM_EMBEDDING_MODEL"
+      }
+    }
+  }
+}

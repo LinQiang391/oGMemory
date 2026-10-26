@@ -297,6 +297,27 @@ class SQLContextFS(PoolAdapterMixin):
             conn.rollback()
             self._return_connection(conn)
 
+    def find_archive_uri(self, archive_id: str, ctx: RequestContext) -> str | None:
+        """Resolve a unique canonical archive under the caller's account and owner."""
+        if not (ctx.user_id or ctx.agent_id):
+            return None
+        conn = self._get_connection()
+        try:
+            self.bind_tenant(conn, ctx.account_id)
+            with conn.cursor() as cur:
+                cur.execute(
+                    "SELECT uri FROM context_nodes WHERE account_id = %s AND category = 'history' "
+                    "AND status = 'ACTIVE' AND metadata->>'archive_id' = %s "
+                    "AND metadata->>'owner_user_id' = %s "
+                    "AND (%s = '' OR metadata->>'owner_agent_id' = %s) LIMIT 2",
+                    (ctx.account_id, archive_id, ctx.user_id, ctx.agent_id, ctx.agent_id),
+                )
+                rows = cur.fetchall()
+            return rows[0][0] if len(rows) == 1 else None
+        finally:
+            conn.rollback()
+            self._return_connection(conn)
+
     def scan_session_recovery(self, account_id, *, cursor=None, limit=32):
         """Page through canonical session metadata for the service recovery worker."""
         limit = max(1, min(int(limit), 50))
@@ -324,7 +345,8 @@ class SQLContextFS(PoolAdapterMixin):
     # Access control (reuses parse_uri from agfs_adapter)
     # ------------------------------------------------------------------
 
-    def _is_accessible(self, uri: str, ctx: RequestContext) -> bool:
+    @staticmethod
+    def _is_accessible(uri: str, ctx: RequestContext) -> bool:
         """Check URI accessibility with visible_owner_spaces support (SQL mode)."""
         try:
             components = parse_uri(uri)
@@ -332,12 +354,13 @@ class SQLContextFS(PoolAdapterMixin):
         except ValueError:
             return False
 
-    def _ensure_accessible(self, uri: str, ctx: RequestContext) -> None:
+    @classmethod
+    def _ensure_accessible(cls, uri: str, ctx: RequestContext) -> None:
         from fs.sql_adapter.session_mutation import active_session_guard
         guard = active_session_guard()
         if guard is not None:
             guard.check_context(ctx)
-        if not self._is_accessible(uri, ctx):
+        if not cls._is_accessible(uri, ctx):
             try:
                 components = parse_uri(uri)
                 owner_id = components.get("owner_id", "")
@@ -771,21 +794,23 @@ class SQLContextFS(PoolAdapterMixin):
         try:
             self.bind_tenant(conn, ctx.account_id)
             with conn.cursor() as cur:
-                cur.execute(
-                    """
-                    SELECT uri, context_type, category, level, owner_space,
-                           abstract, overview, content, relations, metadata,
-                           status, created_at, updated_at, version
-                    FROM context_nodes
-                    WHERE uri = %s
-                    """,
-                    (uri,),
-                )
-                row = cur.fetchone()
+                return self.read_node_with_cursor(cur, uri, ctx)
         finally:
             conn.rollback()  # Reset SET LOCAL for RLS
             self._return_connection(conn)
 
+    @classmethod
+    def read_node_with_cursor(cls, cursor, uri: str, ctx: RequestContext) -> ContextNode:
+        """Read canonical evidence inside the caller's tenant-bound transaction."""
+        cls._ensure_accessible(uri, ctx)
+        cursor.execute(
+            "SELECT uri, context_type, category, level, owner_space, "
+            "abstract, overview, content, relations, metadata, "
+            "status, created_at, updated_at, version "
+            "FROM context_nodes WHERE account_id=%s AND uri=%s",
+            (ctx.account_id, uri),
+        )
+        row = cursor.fetchone()
         if row is None:
             raise NodeNotFoundError(uri)
 

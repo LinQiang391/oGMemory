@@ -81,7 +81,7 @@ def _produce(dsn, account, owner, index, dialect="postgresql"):
                     prompt_tokens_details=SimpleNamespace(cached_tokens=2),
                 ),
                 model="test-llm",
-                choices=[SimpleNamespace(message=SimpleNamespace(content="{}"))],
+                choices=[SimpleNamespace(message=SimpleNamespace(content="{}"), finish_reason="stop")],
             )
             provider._client = SimpleNamespace(
                 chat=SimpleNamespace(completions=SimpleNamespace(create=lambda **kw: response))
@@ -362,7 +362,7 @@ def test_success_without_usage_and_failed_provider_calls(ledger):
     response = SimpleNamespace(
         usage=None,
         model="test-llm",
-        choices=[SimpleNamespace(message=SimpleNamespace(content="{}"))],
+        choices=[SimpleNamespace(message=SimpleNamespace(content="{}"), finish_reason="stop")],
     )
     client = SimpleNamespace(create=lambda **kw: response)
     provider._client = SimpleNamespace(chat=SimpleNamespace(completions=client))
@@ -491,7 +491,7 @@ def test_llm_concurrent_initialization_publishes_bound_tracker(ledger, monkeypat
                     create=lambda **kw: SimpleNamespace(
                         usage=SimpleNamespace(prompt_tokens=10, completion_tokens=3),
                         model="test",
-                        choices=[SimpleNamespace(message=SimpleNamespace(content="{}"))],
+                        choices=[SimpleNamespace(message=SimpleNamespace(content="{}"), finish_reason="stop")],
                     )
                 )
             )
@@ -547,61 +547,6 @@ def test_index_cached_batch_attributes_each_input(ledger):
         0,
         {"calls": 1, "total_tokens": 8},
     )
-
-
-@pytest.mark.parametrize("kind", ["multimodal", "volcengine"])
-@pytest.mark.parametrize(
-    "usage,expected,missing",
-    [
-        ({}, 0, 1),
-        ({"total_tokens": None}, 0, 1),
-        ({"total_tokens": 0}, 0, 0),
-        ({"prompt_tokens": 7}, 7, 0),
-        ({"total_tokens": None, "prompt_tokens": 7}, 7, 0),
-    ],
-)
-def test_embedding_usage_fields_and_per_input_owners(
-    ledger, monkeypatch, kind, usage, expected, missing
-):
-    import httpx
-
-    from providers.embedder.openai_embedder import OpenAIEmbedder
-    from providers.embedder.volcengine_embedder import VolcengineEmbedder
-    from providers.token_tracker import TokenTracker, distributed_usage_scope
-
-    _, store, account = ledger
-    if kind == "multimodal":
-        provider = OpenAIEmbedder(
-            api_key="test", base_url="http://test/v1", model="test", dimension=2, multimodal=True
-        )
-        client = httpx.Client(
-            transport=httpx.MockTransport(
-                lambda req: httpx.Response(
-                    200, json={"usage": usage, "data": {"embedding": [1.0, 2.0]}}
-                )
-            )
-        )
-        monkeypatch.setattr(httpx, "Client", lambda **kwargs: client)
-    else:
-        provider = object.__new__(VolcengineEmbedder)
-        provider._model_name = "test"
-        provider._dimension = 2
-        provider.token_tracker = TokenTracker("test")
-        provider._client = SimpleNamespace(
-            multimodal_embeddings=SimpleNamespace(
-                create=lambda **kw: SimpleNamespace(
-                    usage=usage, data=SimpleNamespace(embedding=[1.0, 2.0])
-                )
-            )
-        )
-    provider.token_tracker.set_usage_store(store)
-    inputs = [((tenant, "user:alice"), 1) for tenant in (account, account + "-other")]
-    with distributed_usage_scope(dict(inputs), inputs=inputs):
-        assert provider.embed_texts(["a", "b"]) == [[1.0, 2.0], [1.0, 2.0]]
-    for tenant in (account, account + "-other"):
-        totals = store.metrics(1, tenant)["cumulative"]
-        assert totals["embedding"] == {"calls": 1, "total_tokens": expected}
-        assert totals["missing_usage_calls"] == missing
 
 
 def test_database_handshake_deadline_releases_connection_capacity(ledger):
@@ -701,7 +646,7 @@ def test_cache_hit_survives_eviction_during_persistence(ledger, kind):
                     create=lambda **kw: SimpleNamespace(
                         usage=SimpleNamespace(prompt_tokens=2, completion_tokens=1),
                         model="test",
-                        choices=[SimpleNamespace(message=SimpleNamespace(content='{"ok":true}'))],
+                        choices=[SimpleNamespace(message=SimpleNamespace(content='{"ok":true}'), finish_reason="stop")],
                     )
                 )
             )

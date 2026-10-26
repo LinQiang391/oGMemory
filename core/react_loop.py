@@ -24,6 +24,7 @@ from core.errors import ExtractionIncompleteError
 from core.interfaces import LLM
 from core.models import RequestContext
 from core.operation_deadline import check_deadline
+from core.errors import LLMCallError
 
 logger = getLogger(__name__)
 
@@ -68,7 +69,9 @@ class ReactLoopResult:
     read_uris: set[str] = field(default_factory=set)
     trace: ReactTrace | None = None
     completed: bool = False
-    finish_reason: str = ""  # "done" | "timeout" | "max_iterations"
+    finish_reason: str = ""  # "done" | "timeout" | "max_iterations" | "no_valid_output" | "llm_error"
+    # Original error for callers to surface the upstream status and message.
+    llm_error: Exception | None = None
 
 
 class ReactLoop(ABC):
@@ -112,6 +115,7 @@ class ReactLoop(ABC):
     ) -> ReactLoopResult:
         """Execute the ReAct loop."""
         self._disable_tools_for_iteration = False
+        self._read_uris = set()
 
         messages = self._build_messages(ctx, task_ctx)
 
@@ -124,6 +128,7 @@ class ReactLoop(ABC):
         tools_used: list[dict] = []
         read_uris: set[str] = set()
         finish_reason = "max_iterations"
+        last_llm_error: Exception | None = None
 
         while iteration < max_iterations:
             check_deadline()
@@ -148,7 +153,25 @@ class ReactLoop(ABC):
                     "content": self._build_final_instruction(),
                 })
 
-            tool_calls, content = self._call_llm(messages)
+            try:
+                tool_calls, content = self._call_llm(messages)
+            except LLMCallError as e:
+                # Preserve the original transport failure for the caller.
+                iter_latency = time.monotonic() - iter_start
+                logger.error(
+                    f"LLM call failed (iteration {iteration}/{max_iterations}): {e}"
+                )
+                iter_trace = self._create_iter_trace(
+                    iteration=iteration,
+                    latency_seconds=iter_latency,
+                    tool_calls_count=0,
+                    tool_call_names=[],
+                    content_length=0,
+                )
+                trace.iterations.append(iter_trace)
+                finish_reason = "llm_error"
+                last_llm_error = e
+                break
             check_deadline()
             iter_latency = time.monotonic() - iter_start
 
@@ -226,6 +249,7 @@ class ReactLoop(ABC):
             trace=trace,
             completed=finish_reason == "done",
             finish_reason=finish_reason,
+            llm_error=last_llm_error,
         )
 
     @abstractmethod
@@ -301,7 +325,7 @@ class ReactLoop(ABC):
         iteration: int,
         max_iterations: int,
     ) -> bool:
-        """Handle an invalid LLM response (unparseable content or no output).
+        """Handle an invalid LLM response (unparsable content or no output).
 
         Default behavior: disable tools and continue iterating.
         Subclasses can override to end the loop early instead.
@@ -375,11 +399,13 @@ class ReactLoop(ABC):
 
             return None, None
 
-        except ExtractionIncompleteError:
+        except (ExtractionIncompleteError, LLMCallError):
             raise
         except Exception as e:
-            logger.error(f"LLM call failed: {e}")
-            return None, None
+            # Unknown transport failure (e.g. socket error, JSON decode
+            # in a response shape we didn't anticipate). Wrap so the
+            # driver has a typed signal to surface as error="...".
+            raise LLMCallError(f"LLM call failed: {e}", cause=e) from e
 
     def _execute_and_append_tool_calls(
         self,
@@ -398,7 +424,7 @@ class ReactLoop(ABC):
             # Support both formats: {"tool": ...} from OpenAILLM and {"name": ...} from other sources
             tool_name = tool_call.get("name", "") or tool_call.get("tool", "")
             tool_input = tool_call.get("input", {})
-            call_id = tool_call.get("id", "unknown")
+            call_id = tool_call.get("id") or f"call_{uuid4().hex}"
 
             # Skip empty tool names to avoid API errors
             if not tool_name or not tool_name.strip():

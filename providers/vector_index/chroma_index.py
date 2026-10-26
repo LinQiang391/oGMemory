@@ -214,6 +214,7 @@ class ChromaVectorIndex(VectorIndex):
         uris: list[str],
         filters: dict[str, Any],
         level: int = 0,
+        *, expected_texts: dict[str, str] | None = None,
     ) -> dict[str, list[float]]:
         if not uris:
             return {}
@@ -221,7 +222,7 @@ class ChromaVectorIndex(VectorIndex):
         with self._locked():
             result = self._collection.get(
                 where=where if where else None,
-                include=["embeddings", "metadatas"],
+                include=["embeddings", "metadatas"] + (["documents"] if expected_texts is not None else []),
             )
         output: dict[str, list[float]] = {}
         embeddings = result.get("embeddings")
@@ -231,8 +232,12 @@ class ChromaVectorIndex(VectorIndex):
         if metadatas is None:
             metadatas = []
         wanted = set(uris)
-        for embedding, metadata in zip(embeddings, metadatas):
+        documents = result.get("documents")
+        for position, (embedding, metadata) in enumerate(zip(embeddings, metadatas)):
             uri = str((metadata or {}).get("uri", ""))
+            if expected_texts is not None and (documents is None or position >= len(documents)
+                                               or documents[position] != expected_texts.get(uri)):
+                continue
             if uri in wanted:
                 output[uri] = [float(value) for value in embedding]
         return output
@@ -315,8 +320,6 @@ class ChromaVectorIndex(VectorIndex):
                 sanitized[k] = v
             elif isinstance(v, (int, float, str)):
                 sanitized[k] = v
-            elif v is not None:
-                sanitized[k] = str(v)
         return sanitized
 
     @staticmethod

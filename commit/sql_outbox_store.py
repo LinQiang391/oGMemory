@@ -493,10 +493,10 @@ class SQLOutboxStore(PoolAdapterMixin):
         return [self._row_to_event(row) for row in rows]
 
     def count_unfinished(self, account_id: str | None = None) -> dict[str, int]:
-        """Count pending/processing events without claiming them."""
+        """Count pending/processing and dead-lettered events without claiming them."""
         conn = self._get_connection()
         params: list[str] = []
-        where = "WHERE status IN ('PENDING', 'PROCESSING')"
+        where = "WHERE status IN ('PENDING', 'PROCESSING', 'FAILED')"
         if account_id:
             where += " AND account_id = %s"
             params.append(account_id)
@@ -506,13 +506,14 @@ class SQLOutboxStore(PoolAdapterMixin):
                     f"""
                     SELECT
                         COUNT(*) FILTER (WHERE status = 'PENDING') AS pending,
-                        COUNT(*) FILTER (WHERE status = 'PROCESSING') AS processing
+                        COUNT(*) FILTER (WHERE status = 'PROCESSING') AS processing,
+                        COUNT(*) FILTER (WHERE status = 'FAILED') AS failed
                     FROM outbox_events
                     {where}
                     """,
                     tuple(params),
                 )
-                row = cur.fetchone() or (0, 0)
+                row = cur.fetchone() or (0, 0, 0)
             conn.commit()
         except Exception:
             conn.rollback()
@@ -522,7 +523,9 @@ class SQLOutboxStore(PoolAdapterMixin):
 
         pending = int(row[0] or 0)
         processing = int(row[1] or 0)
-        return {"pending": pending, "processing": processing, "total": pending + processing}
+        failed = int(row[2] or 0)
+        return {"pending": pending, "processing": processing,
+                "failed": failed, "total": pending + processing}
 
     def open_listener_connection(self):
         """Create a dedicated autocommit connection for LISTEN/NOTIFY."""

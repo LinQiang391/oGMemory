@@ -11,18 +11,18 @@ from __future__ import annotations
 
 import heapq
 import logging
-from datetime import datetime, timezone
+from datetime import datetime
 from typing import Any
 
 from core.interfaces import VectorIndex
 from core.models import (
     LeafHit,
-    RetrievalConfig,
     RequestContext,
+    RetrievalConfig,
     RetrieverMode,
+    SeedHit,
     SeedResult,
     TypedQuery,
-    SeedHit,
 )
 from retrieval.hotness import hotness_score
 from retrieval.identity import memory_identity

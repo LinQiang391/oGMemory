@@ -148,6 +148,58 @@ def test_service_threads_supports_new_config_and_workers_fallback(monkeypatch):
     assert OgMemConfig.load("ignored.yaml").threads == 5
 
 
+def test_embedding_max_input_chars_loads_yaml_then_env(monkeypatch):
+    from providers import unified_config as uc
+
+    monkeypatch.setenv("OGMEM_EMBEDDING_MAX_INPUT_CHARS", "7000")
+    monkeypatch.setattr(
+        uc,
+        "_load_yaml",
+        lambda _path: {"embedding": {"max_input_chars": 8_000}},
+    )
+    assert OgMemConfig.load("ignored.yaml").embedding_max_input_chars == 8_000
+
+    monkeypatch.setattr(uc, "_load_yaml", lambda _path: {"embedding": {}})
+    assert OgMemConfig.load("ignored.yaml").embedding_max_input_chars == 7_000
+
+
+def test_embedding_max_input_chars_defaults_to_legacy_limit():
+    assert OgMemConfig().embedding_max_input_chars == 30_000
+
+
+def test_embedding_batch_size_loads_yaml_then_env(monkeypatch):
+    from providers import unified_config as uc
+
+    monkeypatch.setenv("OGMEM_EMBEDDING_BATCH_SIZE", "4")
+    monkeypatch.setattr(uc, "_load_yaml", lambda _: {"embedding": {"batch_size": 8}})
+    assert OgMemConfig.load("ignored.yaml").embedding_batch_size == 8
+    monkeypatch.setattr(uc, "_load_yaml", lambda _: {})
+    assert OgMemConfig.load("ignored.yaml").embedding_batch_size == 4
+
+
+@pytest.mark.parametrize("value", [0, -1, True, 1.5, 2049])
+def test_embedding_batch_size_rejects_invalid_values(value):
+    with pytest.raises(ValueError, match="embedding_batch_size"):
+        OgMemConfig(embedding_batch_size=value)
+
+
+def test_embedding_max_input_chars_rejects_non_positive_values():
+    with pytest.raises(ValueError, match="embedding_max_input_chars must be positive"):
+        OgMemConfig(embedding_max_input_chars=0)
+
+
+@pytest.mark.parametrize("value", [True, False, 1.5])
+def test_embedding_max_input_chars_rejects_non_integer_values(value):
+    with pytest.raises(ValueError, match="embedding_max_input_chars must be a positive integer"):
+        OgMemConfig(embedding_max_input_chars=value)
+
+
+def test_embedding_max_input_chars_accepts_positive_integer():
+    config = OgMemConfig(embedding_max_input_chars=4_096)
+
+    assert config.embedding_max_input_chars == 4_096
+
+
 def test_trace_turn_limit_reads_storage_yaml_and_env(monkeypatch):
     from providers import unified_config as uc
 
@@ -540,3 +592,117 @@ def test_hybrid_retrieval_accepts_custom_lexical_provider():
 def test_hybrid_retrieval_rejects_unbounded_or_non_finite_tuning(override):
     with pytest.raises(ValueError):
         OgMemConfig(**override)
+
+
+def _clear_db_env(monkeypatch):
+    """Clear both the current and legacy DB env names so tests are hermetic."""
+    for name in (
+        "SQL_CONNECTION_STRING",
+        "STORAGE_DB_CONNECTION_STRING",
+        "STORAGE_DB_POOL_SIZE",
+        "OPENGAUSS_CONNECTION_STRING",
+        "OPENGAUSS_DIMENSION",
+        "OPENGAUSS_TABLE_NAME",
+        "OPENGAUSS_POOL_SIZE",
+        "VECTOR_DB_CONNECTION_STRING",
+        "VECTOR_DB_DIMENSION",
+        "VECTOR_DB_TABLE_NAME",
+        "VECTOR_DB_POOL_SIZE",
+    ):
+        monkeypatch.delenv(name, raising=False)
+
+
+@pytest.mark.parametrize("vector_source", ["yaml", "VECTOR_DB_CONNECTION_STRING", "OPENGAUSS_CONNECTION_STRING"])
+def test_sql_storage_dsn_falls_back_to_vector_dsn(monkeypatch, vector_source):
+    from providers import unified_config
+
+    _clear_db_env(monkeypatch)
+    dsn = "host=vector dbname=og"
+    data = {"vector_db": {"connection_string": dsn}} if vector_source == "yaml" else {}
+    if vector_source != "yaml":
+        monkeypatch.setenv(vector_source, dsn)
+    monkeypatch.setattr(unified_config, "_load_yaml", lambda _path: data)
+    cfg = OgMemConfig.load("unused.yaml")
+    assert cfg.opengauss_connection_string == dsn
+    assert cfg.sql_connection_string == dsn
+
+
+def test_sql_storage_dsn_env_takes_precedence_over_vector_fallback(monkeypatch):
+    """STORAGE_DB_CONNECTION_STRING env wins over the vector DSN fallback."""
+    from providers import unified_config
+
+    _clear_db_env(monkeypatch)
+    monkeypatch.setenv("STORAGE_DB_CONNECTION_STRING", "host=env dbname=og")
+    monkeypatch.setattr(
+        unified_config,
+        "_load_yaml",
+        lambda _path: {"vector_db": {"connection_string": "host=vector dbname=og"}},
+    )
+
+    cfg = OgMemConfig.load("unused.yaml")
+
+    assert cfg.sql_connection_string == "host=env dbname=og"
+
+
+def test_explicit_sql_storage_yaml_dsn_is_not_replaced_by_vector_fallback(monkeypatch):
+    from providers import unified_config
+
+    _clear_db_env(monkeypatch)
+    monkeypatch.setattr(
+        unified_config,
+        "_load_yaml",
+        lambda _path: {
+            "storage": {"backend": "sql", "connection_string": "host=storage dbname=og"},
+            "vector_db": {"connection_string": "host=vector dbname=og"},
+        },
+    )
+
+    assert OgMemConfig.load("unused.yaml").sql_connection_string == "host=storage dbname=og"
+
+
+def test_sql_storage_dsn_legacy_env_alias_still_works(monkeypatch):
+    """SQL_CONNECTION_STRING (legacy alias) still resolves when the new
+    STORAGE_DB_CONNECTION_STRING is unset."""
+    from providers import unified_config
+
+    _clear_db_env(monkeypatch)
+    monkeypatch.setenv("SQL_CONNECTION_STRING", "host=legacy dbname=og")
+    monkeypatch.setattr(
+        unified_config,
+        "_load_yaml",
+        lambda _path: {"vector_db": {"connection_string": "host=vector dbname=og"}},
+    )
+
+    cfg = OgMemConfig.load("unused.yaml")
+
+    assert cfg.sql_connection_string == "host=legacy dbname=og"
+
+
+def test_vector_db_env_vars_renamed_with_legacy_alias(monkeypatch):
+    """VECTOR_DB_* is the canonical env surface; OPENGAUSS_* remains a
+    legacy alias, and the new name wins when both are set."""
+    from providers import unified_config
+
+    _clear_db_env(monkeypatch)
+    monkeypatch.setattr(
+        unified_config,
+        "_load_yaml",
+        lambda _path: {},
+    )
+
+    # Legacy alias alone still works.
+    monkeypatch.setenv("OPENGAUSS_CONNECTION_STRING", "host=legacy dbname=vec")
+    monkeypatch.setenv("OPENGAUSS_DIMENSION", "768")
+    cfg = OgMemConfig.load("unused.yaml")
+    assert cfg.opengauss_connection_string == "host=legacy dbname=vec"
+    assert cfg.opengauss_dimension == 768
+
+    # The new name wins over the legacy alias.
+    monkeypatch.setenv("VECTOR_DB_CONNECTION_STRING", "host=new dbname=vec")
+    monkeypatch.setenv("VECTOR_DB_TABLE_NAME", "text_vectors")
+    cfg = OgMemConfig.load("unused.yaml")
+    assert cfg.opengauss_connection_string == "host=new dbname=vec"
+    assert cfg.opengauss_table_name == "text_vectors"
+    # Untouched legacy value still applies for fields without a new-name
+    # counterpart set.
+    assert cfg.opengauss_dimension == 768

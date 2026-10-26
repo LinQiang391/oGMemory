@@ -5,8 +5,8 @@ readonly ENV_FILE="${OGMEMORY_ENV_FILE:-$HOME/ogmemory.env}"
 readonly STACK_ROOT="${OGMEMORY_STACK_ROOT:-$HOME}"
 readonly PUBLISH_IP="127.0.0.1"
 readonly OPENGAUSS_IMAGE="swr.cn-north-4.myhuaweicloud.com/kunpeng-ai/opengauss-distributed:0328"
-readonly OGMEM_IMAGE="swr.cn-north-4.myhuaweicloud.com/kunpeng-ai/ogmemory:poc_0807"
-readonly OPENCLAW_IMAGE="swr.cn-north-4.myhuaweicloud.com/kunpeng-ai/openclaw-ogmem:poc_0807"
+readonly OGMEM_IMAGE="swr.cn-north-4.myhuaweicloud.com/kunpeng-ai/ogmemory:1013"
+readonly OPENCLAW_IMAGE="swr.cn-north-4.myhuaweicloud.com/kunpeng-ai/openclaw-ogmem:poc_0903"
 
 fail() {
   echo "错误: $*" >&2
@@ -110,14 +110,8 @@ validate_embedding_connectivity() {
   local response_file
   local http_code
 
-  if [[ "$EMBEDDING_PROVIDER" == "volcengine" ]]; then
-    endpoint="${EMBEDDING_BASE_URL%/}/embeddings/multimodal"
-    payload="$(printf '{"model":"%s","input":[{"type":"text","text":"deployment preflight"}],"dimensions":%s}' \
-      "$EMBEDDING_MODEL" "$EMBEDDING_DIMENSION")"
-  else
-    endpoint="${EMBEDDING_BASE_URL%/}/embeddings"
-    payload="$(printf '{"model":"%s","input":["deployment preflight"]}' "$EMBEDDING_MODEL")"
-  fi
+  endpoint="${EMBEDDING_BASE_URL%/}/embeddings"
+  payload="$(printf '{"model":"%s","input":["deployment preflight"]}' "$EMBEDDING_MODEL")"
   response_file="$(mktemp)"
   echo "预检 Embedding 连通性: ${EMBEDDING_BASE_URL} / ${EMBEDDING_MODEL}"
   if ! http_code="$(curl -sS --connect-timeout 10 --max-time 45 \
@@ -302,8 +296,8 @@ done
 
 [[ "$INSTANCE_NAME" =~ ^[a-z][a-z0-9-]{0,30}$ ]] || \
   fail "INSTANCE_NAME 只能使用小写字母、数字和短横线，并以字母开头"
-[[ "$EMBEDDING_PROVIDER" == "openai" || "$EMBEDDING_PROVIDER" == "volcengine" ]] || \
-  fail "EMBEDDING_PROVIDER 只支持 openai 或 volcengine"
+[[ "$EMBEDDING_PROVIDER" == "openai" ]] || \
+  fail "EMBEDDING_PROVIDER 请设为 openai，使用兼容的文本 Embedding API"
 [[ "$EMBEDDING_DIMENSION" =~ ^[0-9]+$ ]] || fail "EMBEDDING_DIMENSION 必须是数字"
 [[ "$LLM_BASE_URL" != *"127.0.0.1"* && "$LLM_BASE_URL" != *"localhost"* ]] || \
   fail "LLM_BASE_URL 必须是容器可访问的地址，不能使用 127.0.0.1 或 localhost"

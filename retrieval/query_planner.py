@@ -49,10 +49,24 @@ _NOISE_PATTERNS: list[re.Pattern[str]] = [
     re.compile(r"\[[\w\s:\-]+UTC\]\s*"),                    # timestamp like [Fri 2026-03-27 06:16 UTC]
 ]
 
+_BROWSER_CONTEXT_PREFIX = re.compile(
+    r"\A\s*<in-app-browser-context\b"
+    r"(?=[^>]*\bsource\s*=\s*['\"]ambient-ui-state['\"])[^>]*>"
+    r"[\s\S]*?</in-app-browser-context>\s*"
+)
+_USER_REQUEST_PREFIX = re.compile(r"\A## My request:[ \t]*(?:\r?\n|$)")
+
 
 def sanitize_query(raw: str) -> str:
     """Strip upstream metadata noise, keeping only user intent."""
     text = raw
+    # Codex Desktop prepends UI state to the prompt. It is not user intent
+    # and can route retrieval to RESOURCE or overwhelm the query embedding.
+    # Only strip a leading, explicitly marked ambient block; preserve quoted
+    # examples and ordinary user text containing the request heading.
+    text, removed = _BROWSER_CONTEXT_PREFIX.subn("", text, count=1)
+    if removed:
+        text = _USER_REQUEST_PREFIX.sub("", text, count=1)
     for pat in _NOISE_PATTERNS:
         text = pat.sub("", text)
     return text.strip()
@@ -73,6 +87,7 @@ class QueryPlanner:
         hints: dict | None = None,
         categories: list[str] | None = None,
         top_k: int | None = None,
+        context_type: str | None = None,
     ) -> list[TypedQuery]:
         query = sanitize_query(query or "")
         if not query:
@@ -85,7 +100,11 @@ class QueryPlanner:
                 f"top_k={effective_top_k} exceeds maximum {self.config.max_top_k}",
             )
 
-        if categories:
+        context_type_override = (context_type or "").strip().upper() or None
+        if context_type_override and context_type_override not in {member.value for member in ContextType}:
+            raise ValidationError("context_type", "unsupported context type override")
+
+        if not context_type_override and categories:
             groups = [(ContextType.MEMORY.value, [c for c in categories if c != "skill"])]
             # ArchiveBuilder stores legacy tools and patterns as SKILL nodes.
             groups.append((ContextType.SKILL.value,
@@ -100,11 +119,20 @@ class QueryPlanner:
             logger.info("[QueryPlanner] decomposed '%s' into %d sub-queries: %s", query, len(sub_queries), sub_queries)
             return [
                 self._make_query(
-                    sq, ContextType.MEMORY.value, ctx,
-                    categories=categories, top_k=effective_top_k,
+                    sq,
+                    context_type_override or ContextType.MEMORY.value,
+                    ctx,
+                    categories=categories,
+                    top_k=effective_top_k,
                 )
                 for sq in sub_queries
             ]
+
+        if context_type_override:
+            return [self._make_query(
+                query, context_type_override, ctx,
+                categories=categories, top_k=effective_top_k,
+            )]
 
         matched_types = self._classify(query)
 
@@ -117,7 +145,8 @@ class QueryPlanner:
             return [
                 self._make_query(
                     query, matched_types[0], ctx,
-                    categories=categories, top_k=effective_top_k,
+                    categories=categories,
+                    top_k=effective_top_k,
                 )
             ]
 

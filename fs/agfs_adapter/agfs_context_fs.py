@@ -492,6 +492,39 @@ class AGFSContextFS:
                       and isinstance(entry.get("name"), str) and entry["name"] not in {".", ".."}
                       and "/" not in entry["name"] and "\\" not in entry["name"])
 
+    def find_archive_uri(self, archive_id: str, ctx: RequestContext) -> str | None:
+        """Resolve a unique archive ID within its account and owner scope."""
+        if not (ctx.user_id or ctx.agent_id):
+            return None
+        for part in (ctx.account_id, archive_id):
+            if not part or part in {".", ".."} or "/" in part or "\\" in part:
+                raise ValueError("invalid archive identity")
+        root = f"{self._mount_prefix}/accounts/{ctx.account_id}/sessions/"
+        try:
+            sessions = self._client.ls(root)
+        except AGFSClientError as exc:
+            if _is_not_found_error(exc):
+                return None
+            raise
+        matches = []
+        for entry in sessions:
+            name = entry.get("name")
+            if (not entry.get("isDir") or not isinstance(name, str) or not name
+                    or name in {".", ".."} or "/" in name or "\\" in name):
+                continue
+            uri = f"ctx://{ctx.account_id}/sessions/{name}/history/{archive_id}"
+            try:
+                meta = json.loads(self._read_file(self._uri_to_agfs_path(uri) + self.FILE_META))
+            except NodeNotFoundError:
+                continue
+            if (meta.get("status") == "ACTIVE"
+                    and meta.get("owner_user_id", "") == ctx.user_id
+                    and (not ctx.agent_id or meta.get("owner_agent_id", "") == ctx.agent_id)):
+                matches.append(uri)
+                if len(matches) > 1:
+                    return None
+        return matches[0] if matches else None
+
     def scan_session_recovery(self, account_id, *, cursor=None, limit=32):
         """Read one state page from a directory snapshot retained for this cycle."""
         if (not isinstance(account_id, str) or not account_id or account_id in {".", ".."}

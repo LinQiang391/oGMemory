@@ -300,7 +300,7 @@ class _AtomicMemoryAGFSClient:
             self.operations.append(("rm", target, recursive))
 
 
-def _atomic_code_context() -> RequestContext:
+def _memory_context() -> RequestContext:
     return RequestContext(
         account_id="acme",
         user_id="alice",
@@ -310,57 +310,12 @@ def _atomic_code_context() -> RequestContext:
     )
 
 
-def _atomic_code_node(
-    *,
-    description: str | None = None,
-    expected_version: int = 0,
-) -> ContextNode:
-    metadata = {
-        "_expected_version": expected_version,
-        "resource_type": "code",
-        "resource_root_slug": "repo",
-        "root_fingerprint": "f" * 64,
-        "file_key": "a" * 64,
-        "file_slug": "a" * 32,
-        "relative_path": "src/service.py",
-        "source_extension": ".py",
-        "language": "python",
-        "start_line": 1,
-        "end_line": 2,
-        "symbol": "load_config",
-        "symbol_kind": "function",
-        "signature": "load_config(path)",
-        "chunk_hash": "b" * 64,
-        "chunk_key": "c" * 64,
-    }
-    if description is not None:
-        metadata["description"] = description
-    return ContextNode(
-        uri="ctx://acme/resources/" + "d" * 32,
-        context_type="RESOURCE",
-        category="code",
-        level=4,
-        owner_space="resource:acme",
-        abstract="load config",
-        overview="path: src/service.py",
-        content="def load_config(path):\n    return path\n",
-        metadata=metadata,
-    )
-
-
-def _atomic_code_stack():
-    client = _AtomicMemoryAGFSClient()
-    fs = AGFSContextFS(client, mount_prefix="/local")
-    outbox = OutboxStore(client=client, fs=fs, mount_prefix="/local")
-    return client, fs, outbox
-
-
 def test_memory_identity_lock_serializes_two_agfs_adapters():
     client = _AtomicMemoryAGFSClient()
     first = AGFSContextFS(client, mount_prefix="/local")
     second = AGFSContextFS(client, mount_prefix="/local")
     directory = "ctx://acme/users/alice/memories/preferences"
-    ctx = _atomic_code_context()
+    ctx = _memory_context()
     entered = Event()
 
     def acquire_second():

@@ -244,13 +244,13 @@ def test_increment_retry_persists_failure_reason(mock_sql_outbox_store):
 
 def test_count_unfinished_counts_pending_and_processing_by_account(mock_sql_outbox_store):
     store, _, conn, cursor = mock_sql_outbox_store
-    cursor.fetchone.return_value = (2, 3)
+    cursor.fetchone.return_value = (2, 3, 4)
 
     counts = store.count_unfinished(account_id="acme")
 
-    assert counts == {"pending": 2, "processing": 3, "total": 5}
+    assert counts == {"pending": 2, "processing": 3, "failed": 4, "total": 5}
     sql, params = cursor.execute.call_args.args
-    assert "status IN ('PENDING', 'PROCESSING')" in sql
+    assert "status IN ('PENDING', 'PROCESSING', 'FAILED')" in sql
     assert "account_id = %s" in sql
     assert params == ("acme",)
     conn.commit.assert_called_once()
@@ -338,3 +338,11 @@ def test_is_event_current_commits_read_transaction(mock_sql_outbox_store):
 
     conn.commit.assert_called_once()
     conn.rollback.assert_not_called()
+
+
+def test_only_dead_letters_are_reported_even_with_zero_active_total(mock_sql_outbox_store):
+    store, _, _, cursor = mock_sql_outbox_store
+    cursor.fetchone.return_value = (0, 0, 1)
+    assert store.count_unfinished('acme') == {
+        'pending': 0, 'processing': 0, 'total': 0, 'failed': 1,
+    }

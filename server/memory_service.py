@@ -16,8 +16,6 @@ import threading
 from collections.abc import Mapping
 from contextlib import ExitStack, contextmanager, nullcontext
 import hashlib
-import hmac
-import json
 import time
 from copy import deepcopy
 from dataclasses import replace
@@ -494,8 +492,6 @@ def _extract_date_from_content(content: str):
     return None
 
 
-
-
 # ---------------------------------------------------------------------------
 # Archive helpers (stateless, testable)
 # ---------------------------------------------------------------------------
@@ -579,7 +575,10 @@ class MemoryService:
     Each handler method accepts a plain dict and returns a plain dict.
     """
 
-    def __init__(self, config: OgMemConfig | None = None):
+    def __init__(
+        self, config: OgMemConfig | None = None,
+        *, scene_manager=None, scene_ranker=None, scene_source=None,
+    ):
         cfg = config or get_config()
         self._cfg = cfg
         self._provider_cfg = ProviderConfig.from_ogmem_config(cfg)
@@ -630,8 +629,13 @@ class MemoryService:
         self._retrieval_monitoring: dict[tuple[str, str], dict[str, Any]] = {}
         self._retrieval_monitoring_lock = threading.Lock()
         self._init_lock = threading.RLock()
+        self._scene_manager = scene_manager
+        self._scene_ranker = scene_ranker
+        self._scene_source = scene_source
+        self._scene_service = None
         if self._cfg.skill_sedimentation_enabled:
             self._start_skill_sedimentation_worker()
+
 
     @property
     def _use_sql(self) -> bool:
@@ -2255,7 +2259,13 @@ class MemoryService:
     def _get_shared_vector_index(self):
         """Lazy-init shared vector index (same instance for read + outbox worker)."""
         if self._vector_index is None:
-            vector_index = self._provider_cfg.create_vector_index()
+            if (self._use_sql and self._cfg.vector_db_type == "opengauss"
+                    and self._cfg.opengauss_connection_string == self._cfg.sql_connection_string):
+                vector_index = self._provider_cfg.create_vector_index(
+                    pool=self._get_shared_sql_pool(),
+                )
+            else:
+                vector_index = self._provider_cfg.create_vector_index()
             projection_index = vector_index
             lexical_index = None
             if getattr(self._cfg, "retrieval_hybrid_enabled", False):
@@ -2354,13 +2364,17 @@ class MemoryService:
             if outbox_store is None:
                 return
 
+            directory_summary_enabled = bool(
+                getattr(self._cfg, "directory_summary_enabled", False)
+            )
             worker = OutboxWorker(
                 vector_index=vector_index,
                 embedder=embedder,
                 fs=fs,
-                llm=self.get_llm(),
-                directory_summary_enabled=getattr(self._cfg, 'directory_summary_enabled', False),
+                llm=self.get_llm() if directory_summary_enabled else None,
+                directory_summary_enabled=directory_summary_enabled,
                 agent_memory_handler=self._process_agent_memory,
+                memory_projection_handler=self._scene_projection_changed if self._cfg.scene_enabled else None,
             )
 
             # SQL backend: use notify-based listener for real-time processing
@@ -2459,13 +2473,17 @@ class MemoryService:
             if outbox_store is None:
                 return {"processed": 0, "succeeded": 0, "failed": 0, "skipped": 0}
 
+            directory_summary_enabled = bool(
+                getattr(self._cfg, "directory_summary_enabled", False)
+            )
             worker = OutboxWorker(
                 vector_index=vector_index,
                 embedder=embedder,
                 fs=fs,
-                llm=self.get_llm(),
-                directory_summary_enabled=getattr(self._cfg, 'directory_summary_enabled', False),
+                llm=self.get_llm() if directory_summary_enabled else None,
+                directory_summary_enabled=directory_summary_enabled,
                 agent_memory_handler=self._process_agent_memory,
+                memory_projection_handler=self._scene_projection_changed if self._cfg.scene_enabled else None,
             )
 
             account_ids = []
@@ -2485,7 +2503,14 @@ class MemoryService:
 
     def shutdown(self, join_timeout: float = 1.0) -> None:
         """Best-effort shutdown for background SQL listener threads."""
+        if self._scene_manager is not None and not self._scene_manager.stop(timeout=join_timeout):
+            logger.warning("Scene worker is completing its current request")
+            return
         self._extraction_retry.close(join_timeout)
+        scene_index = getattr(self._scene_source, "candidate_index", None)
+        if scene_index is not None and not scene_index.close(timeout=join_timeout):
+            logger.warning("Scene lexical index is still closing")
+            return
         self.stop_skill_sedimentation(timeout=join_timeout)
         if self._outbox_listener is not None:
             try:
@@ -2539,6 +2564,7 @@ class MemoryService:
                     openai_llm_model=cfg.openai_llm_model,
                     llm_temperature=cfg.llm_temperature,
                     llm_max_tokens=cfg.llm_max_tokens,
+                    llm_request_timeout_seconds=cfg.llm_request_timeout_seconds,
                     llm_json_mode=cfg.llm_json_mode,
                     llm_reasoning_effort=cfg.llm_reasoning_effort,
                     llm_is_reasoning_model=cfg.llm_is_reasoning_model,
@@ -2555,6 +2581,7 @@ class MemoryService:
                     model=cfg.openai_llm_model,
                     temperature=cfg.llm_temperature,
                     max_tokens=cfg.llm_max_tokens,
+                    request_timeout_seconds=cfg.llm_request_timeout_seconds,
                     json_mode=cfg.llm_json_mode,
                     reasoning_effort=cfg.llm_reasoning_effort,
                     is_reasoning_model=cfg.llm_is_reasoning_model,
@@ -2563,6 +2590,97 @@ class MemoryService:
             self._llm = self._bind_model_usage(llm)
             logger.info("LLM ready: %s", type(self._llm).__name__)
         return self._llm
+
+    def _ensure_scene_runtime(self):
+        if not self._cfg.scene_enabled or self._scene_manager is not None:
+            return
+        with self._init_lock:
+            if self._scene_manager is not None:
+                return
+            from scene.adapters import CanonicalSceneAdapter
+            from scene.config import SceneConfig
+            from scene.decision import SceneDecisionEngine
+            from scene.manager import SceneMemoryManager
+            from scene.retrieval import SceneRanker
+            from scene.service import SceneService
+            from scene.sql_store import SQLSceneConfigProvider, SQLSceneJobStore, SQLSceneRepository
+
+            if not self._use_sql:
+                raise RuntimeError("scene memory requires a configured durable scene-store adapter")
+            pool = self._get_shared_sql_pool()
+            config = SceneConfig().merged(self._cfg.scene_options)
+            repository = SQLSceneRepository(pool)
+            provider = SQLSceneConfigProvider(pool, default=config)
+            from copy import copy
+
+            from providers.lexical_index.factory import create_lexical_index
+            from scene.candidate_index import LazySceneIndex, SceneIndexRefresh
+
+            lexical_config = copy(self._cfg)
+            lexical_config.retrieval_lexical_options = {
+                **self._cfg.retrieval_lexical_options, "table_name": "scene_lexical_v1",
+            }
+            candidate_index = LazySceneIndex(lambda: create_lexical_index(lexical_config),
+                                             projection_queue=repository)
+            refresh_projection = SceneIndexRefresh(repository, candidate_index)
+
+            def projection_refresh():
+                if candidate_index.initialized:
+                    refresh_projection()
+            try:
+                adapter = CanonicalSceneAdapter(
+                    repository, self._get_context_fs(), self._get_shared_vector_index(),
+                    self._get_shared_embedder(), config=config, config_provider=provider,
+                    archive_store=self._get_archive_store(), candidate_index=candidate_index,
+                )
+                manager = SceneMemoryManager(
+                    SQLSceneJobStore(pool), adapter,
+                    SceneDecisionEngine(self.get_llm(), config, evidence_reader=adapter),
+                    config=config, config_provider=provider, projection_refresh=projection_refresh,
+                )
+                scene_service = SceneService(
+                    repository, adapter, manager, provider, self._get_shared_embedder(),
+                )
+                manager.start()
+            except Exception:
+                candidate_index.close()
+                raise
+            self._scene_source = adapter
+            self._scene_ranker = SceneRanker(config)
+            self._scene_service = scene_service
+            self._scene_manager = manager
+
+    def get_scene_service(self):
+        self._ensure_scene_runtime()
+        if self._scene_service is None:
+            raise RuntimeError("scene memory is disabled")
+        return self._scene_service
+
+    def _scene_projection_changed(self, event, ctx):
+        from urllib.parse import urlsplit
+
+        from core.errors import NodeNotFoundError
+
+        parsed = urlsplit(event.uri)
+        parts = parsed.path.strip("/").split("/")
+        if len(parts) < 4 or parts[0] not in {"users", "agents"} or parts[2] != "memories":
+            return
+        self._ensure_scene_runtime()
+        owner = f"{parts[0][:-1]}:{parts[1]}"
+        tokens = 0
+        try:
+            node = self._get_context_fs().read_node(event.uri, ctx)
+            if node.context_type != "MEMORY" or node.metadata.get("node_type") == "directory":
+                return
+            tokens = max(1, (len(node.content or node.abstract) + 3) // 4)
+        except NodeNotFoundError:
+            if event.event_type == "UPSERT_CONTEXT":
+                return
+        self._scene_manager.after_memory_write(
+            parsed.netloc, owner, [event.uri], token_count=tokens,
+            force=event.event_type in {"ARCHIVE_CONTEXT", "DELETE_CONTEXT"},
+            notice_id=event.event_id,
+        )
 
     @_serialize_lazy_initialization("_write_api")
     def get_write_api(self):
@@ -2601,6 +2719,7 @@ class MemoryService:
             # Get shared vector_index and embedder for prefetch
             vector_index = self._get_shared_vector_index()
             embedder = self._get_shared_embedder()
+            self._ensure_scene_runtime()
 
             self._write_api = MemoryWriteAPI(
                 fs=fs,
@@ -2712,6 +2831,7 @@ internal_tool_usage_tracker=self._internal_tool_usage,
         if self._read_api is None:
             embedder = self._get_shared_embedder()
             vector_index = self._get_shared_vector_index()
+            self._ensure_scene_runtime()
 
             cfg = RetrievalConfig(
                 include_agent_memories=self._cfg.agent_memory_enabled,
@@ -2773,6 +2893,8 @@ internal_tool_usage_tracker=self._internal_tool_usage,
                 assembly=ResultRanker(cfg, relation_store=relation_store),
                 config=cfg,
                 context_reader=context_reader,
+                scene_ranker=self._scene_ranker,
+                scene_source=self._scene_source,
             )
 
             self._read_api = ReadAPI(
@@ -2789,6 +2911,10 @@ internal_tool_usage_tracker=self._internal_tool_usage,
         if start_outbox_worker:
             self._start_outbox_worker()
         return self._read_api
+
+
+    # Alias for downstream adapters that use the service-level verb.
+
 
     # -- Lifecycle handlers ---------------------------------------------------
 
@@ -4242,7 +4368,7 @@ internal_tool_usage_tracker=self._internal_tool_usage,
                 self._invalidate_identity_cache_if_profile_written(session_id, write_result)
                 elapsed_ms = int((_time.monotonic() - start_time) * 1000)
                 logger.info(
-                    "after_turn background extract done: run=%s session=%s "
+                    "after_turn background extraction writes ready: run=%s session=%s "
                     "extracted=%d filtered=%d writes=%d skipped=%d failed=%d "
                     "watermark=%d->%d buffer_len_now=%d elapsed_ms=%d",
                     extraction_run_id,
@@ -4305,6 +4431,19 @@ internal_tool_usage_tracker=self._internal_tool_usage,
                 )
                 if commit_result.get("status") != "failed":
                     _complete_request({"ok": True, "status": "completed"})
+                    # Bench clients use this marker as a completion barrier.
+                    # Emitting it before commit_snapshot could announce
+                    # success even when durable session archival later failed.
+                    logger.info(
+                        "after_turn background extract done: run=%s session=%s "
+                        "extracted=%d writes=%d archived=%s elapsed_ms=%d",
+                        extraction_run_id,
+                        session_id[:8],
+                        write_result.get("candidates_extracted", 0),
+                        write_result.get("writes_completed", 0),
+                        commit_result.get("archived"),
+                        int((_time.monotonic() - start_time) * 1000),
+                    )
             except Exception as exc:
                 rewound = buf.rewind_watermark_to_ids(archive_snapshot_ids)
                 self._queue_card_format_recovery(
@@ -5375,6 +5514,37 @@ internal_tool_usage_tracker=self._internal_tool_usage,
 
     @_attribute_request_usage
     def wait_until_idle(self, params: dict | None = None) -> dict:
+        import time
+
+        params = params or {}
+        started = time.monotonic()
+        result = self._wait_until_session_idle(params)
+        if (not result.get("idle") or not self._cfg.scene_enabled
+                or not self._param_bool(params, "waitScenes", "wait_scenes", default=False)):
+            return result
+        self._ensure_scene_runtime()
+        ctx = params.get("_ctx") or self.build_context(params)
+        owners = (ctx.user_space_name(), ctx.agent_space_name())
+        for owner in owners:
+            self._scene_manager.flush(ctx.account_id, owner)
+        deadline = started + self._idle_timeout_seconds(params)
+        while True:
+            states = {owner: self._scene_manager.jobs.summary(ctx.account_id, owner) for owner in owners}
+            busy_owners = {owner for owner, state in states.items()
+                           if state["pending_nodes"] or (state.get("active_job") or {}).get("status")
+                           in {"PENDING", "RUNNING"}}
+            failed = self._scene_manager.halted or any(
+                owner not in busy_owners and (state.get("last_job") or {}).get("status") == "FAILED"
+                for owner, state in states.items()
+            )
+            busy = bool(busy_owners)
+            if failed or not busy or time.monotonic() >= deadline:
+                return {**result, "idle": not failed and not busy,
+                        "reason": "scene_failed" if failed else "scene_in_progress_timeout" if busy else result["reason"],
+                        "scenes": states}
+            time.sleep(min(.05, max(0, deadline - time.monotonic())))
+
+    def _wait_until_session_idle(self, params: dict | None = None) -> dict:
         """Wait for process-local dispose/extraction/indexing to settle."""
         params = params or {}
         session_id = params.get("sessionId") or params.get("session_id") or ""
@@ -5579,8 +5749,13 @@ internal_tool_usage_tracker=self._internal_tool_usage,
         deadline = _time.monotonic() + timeout_seconds
         last_counts = self._count_outbox_unfinished(ctx)
         while True:
+            # Idle does not mean successfully indexed. In particular, dead-lettered
+            # events and an unavailable status store must never certify completion.
+            if (last_counts.get("supported") is False or last_counts.get("error")
+                    or int(last_counts.get("failed") or 0) > 0):
+                return {"idle": False, "outbox": last_counts}
             total = int(last_counts.get("total") or 0)
-            if total <= 0 or last_counts.get("supported") is False:
+            if total <= 0:
                 return {"idle": True, "outbox": last_counts}
             if _time.monotonic() >= deadline:
                 return {"idle": False, "outbox": last_counts}

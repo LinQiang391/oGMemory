@@ -49,6 +49,14 @@ The plugin can connect to an existing remote oGMemory service. Create `.ogmemory
 
 For local development, install and start oGMemory with `ogmem onboard --mode headless`. The default local service URL is `http://127.0.0.1:8090`; local default settings require no configuration file.
 
+Automatic Skill recall requires authenticated Skill HTTP access. The administrator
+must enable `auth.role_control_enabled` and configure privileged API keys in the
+server configuration. Set the issued `api_key`, `account_id`, `user_id`, and
+`agent_id` in `~/.ogmemory/codex-plugin.json` above, using credentials authorized
+for that agent. Empty-key configurations support ordinary memory hooks; Skill
+HTTP authentication failures produce a diagnostic on hook stderr. A 401 means
+authentication configuration needs attention; a 403 means access needs attention.
+
 ## Install from this repository
 
 ```text

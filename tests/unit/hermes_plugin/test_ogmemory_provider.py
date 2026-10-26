@@ -10,7 +10,7 @@ from pathlib import Path
 import pytest
 
 ROOT = Path(__file__).resolve().parents[3]
-PLUGIN = ROOT / "hermes_memory_plugin" / "ogmemory" / "__init__.py"
+PLUGIN = ROOT / "plugins/hermes" / "ogmemory" / "__init__.py"
 
 
 class _MemoryProvider:

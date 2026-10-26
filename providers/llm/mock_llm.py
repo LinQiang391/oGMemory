@@ -4,8 +4,6 @@ Returns pre-defined fixture data based on the prompt content.
 Useful for unit tests and integration tests without real LLM calls.
 """
 
-import json
-from typing import Any
 
 from core.interfaces import LLM
 
@@ -190,6 +188,7 @@ class MockLLM(LLM):
             return [], mock_content
 
         return [], ""
+
 
     @property
     def call_count(self) -> int:

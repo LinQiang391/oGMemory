@@ -5,9 +5,10 @@ from __future__ import annotations
 import logging
 from dataclasses import replace
 
-from core.errors import AccessDeniedError, ValidationError
+from core.errors import AccessDeniedError, NodeBrokenError, NodeNotFoundError, ValidationError
 from core.interfaces import ContextFS
 from core.models import RequestContext, RetrievedBlock
+from retrieval.identity import canonical_uri
 
 logger = logging.getLogger(__name__)
 
@@ -53,6 +54,16 @@ class ContextReader:
         self._fs = fs
         self._storage_backend = storage_backend
 
+    def is_visible(self, uri: str, ctx: RequestContext) -> bool:
+        """Validate an index hit against the current node status and access scope."""
+        uri = canonical_uri(uri)
+        try:
+            self._check_acl(uri, ctx)
+            exists = getattr(self._fs, "exists", None)
+            return bool(exists(uri, ctx)) if callable(exists) else True
+        except (AccessDeniedError, PermissionError, NodeNotFoundError, NodeBrokenError, FileNotFoundError):
+            return False
+
     def read(
         self,
         uri: str,
@@ -75,7 +86,7 @@ class ContextReader:
             if read_uri.endswith("/content.md"):
                 read_uri = read_uri[: -len("/content.md")]
             node = self._fs.read_node(read_uri, ctx)
-        except (AccessDeniedError, PermissionError):
+        except (AccessDeniedError, PermissionError, NodeNotFoundError, NodeBrokenError, FileNotFoundError):
             raise
         except Exception as exc:
             logger.warning("[ContextReader] read_node failed for %s: %s", uri, exc, exc_info=True)

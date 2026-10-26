@@ -9,6 +9,9 @@ description: |
   A one-time action, another speaker's praise, or the meaning of a single artifact alone is not a preference.
   Keep the same topic key across conversations; source titles and observation dates are not topics.
   Store a reusable statement of the preference, not a retelling of how it was expressed.
+  Resolve project/system references to their established exact name in abstract, overview and content.
+  Keep project-specific requirements scoped to that named project; never generalize them to all projects.
+  Use scope_ref for the established project boundary. If its name is unresolved, state that uncertainty rather than guessing.
   Explicit values and opinions are eligible; do not infer habits or stronger commitments from a single action.
 directory: "ctx://{{ account_id }}/users/{{ user_id }}/memories/preferences"
 filename_template: "{{ routing_key }}.md"

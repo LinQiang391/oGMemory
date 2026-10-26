@@ -9,6 +9,7 @@ from typing import Any
 
 from core.interfaces import VectorIndex
 from core.models import IndexRecord, SeedHit, TypedQuery
+from fs.sql_adapter.pool import PoolAdapterMixin
 
 try:
     import psycopg2
@@ -73,22 +74,20 @@ def _ensure_dict(val: Any) -> dict:
     return {}
 
 
-class OpenGaussVectorIndex(VectorIndex):
-    """OpenGauss implementation for production use.
+class OpenGaussVectorIndex(PoolAdapterMixin, VectorIndex):
+    """Vector index for openGauss and PostgreSQL with pgvector.
 
-    Features:
-        - HNSW indexing for fast approximate nearest neighbor search
-        - Multi-tenant isolation via account_id filtering
-        - Idempotent upsert with ON CONFLICT
-        - Cosine similarity search
+    Supports HNSW cosine search, shared connection pools, tenant isolation,
+    idempotent MERGE upserts and explicit legacy-row migration.
     """
 
     def __init__(
         self,
-        connection_string: str,
+        connection_string: str = "",
         dimension: int = 1536,
         table_name: str = "vector_index",
         pool_size: int = 5,
+        pool=None,
     ):
         """Initialize OpenGauss index.
 
@@ -96,7 +95,8 @@ class OpenGaussVectorIndex(VectorIndex):
             connection_string: PostgreSQL connection string
             dimension: Embedding vector dimension (default 1536)
             table_name: Table name for vector storage (must be valid identifier)
-            pool_size: Connection pool size
+            pool_size: Connection pool size (when pool is not provided)
+            pool: Optional shared connection pool
 
         Raises:
             ImportError: If psycopg2 is not installed
@@ -108,35 +108,67 @@ class OpenGaussVectorIndex(VectorIndex):
                 "Install with: pip install psycopg2-binary"
             )
 
-        self._connection_string = connection_string
         self._dimension = dimension
         self._table_name = _validate_table_name(table_name)
-        self._pool_size = pool_size
-        self._pool: list = []
-        self._pool_index = 0
+        self._init_pool(pool, connection_string, pool_size)
 
         self._ensure_table()
 
     def _ensure_table(self) -> None:
-        """Create the vector_index table and indexes if they don't exist."""
+        """Create the table, security columns and search indexes.
+
+        Legacy data backfills use scripts/migrate_vector_index.py.
+        """
         tbl = self._table_name
         dim = self._dimension
-        conn = psycopg2.connect(self._connection_string)
+        conn = self._get_connection()
         try:
+            if self.sql_dialect.name == "postgresql":
+                try:
+                    with conn.cursor() as cur:
+                        cur.execute("CREATE EXTENSION IF NOT EXISTS vector")
+                    conn.commit()
+                except Exception as exc:
+                    conn.rollback()
+                    logger.debug("CREATE EXTENSION vector unavailable: %s", exc)
             with conn.cursor() as cur:
                 cur.execute(f"""
                     CREATE TABLE IF NOT EXISTS {tbl} (
-                        id          VARCHAR(16) PRIMARY KEY,
-                        uri         VARCHAR(512) NOT NULL,
-                        level       INTEGER NOT NULL,
-                        text        TEXT NOT NULL,
-                        embedding   vector({dim}) NOT NULL,
-                        filters     JSONB NOT NULL,
-                        metadata    JSONB NOT NULL DEFAULT '{{}}',
-                        created_at  TIMESTAMPTZ DEFAULT NOW(),
-                        updated_at  TIMESTAMPTZ DEFAULT NOW()
+                        id            VARCHAR(16) PRIMARY KEY,
+                        uri           VARCHAR(512) NOT NULL,
+                        level         INTEGER NOT NULL,
+                        text          TEXT NOT NULL,
+                        embedding     vector({dim}) NOT NULL,
+                        filters       JSONB NOT NULL,
+                        metadata      JSONB NOT NULL DEFAULT '{{}}',
+                        account_id    VARCHAR(128),
+                        owner_space   VARCHAR(128),
+                        node_uri      VARCHAR(512),
+                        record_kind   VARCHAR(32) DEFAULT 'node_content',
+                        node_status   VARCHAR(16) DEFAULT 'active',
+                        space_id      UUID,
+                        created_at    TIMESTAMPTZ DEFAULT NOW(),
+                        updated_at    TIMESTAMPTZ DEFAULT NOW()
                     )
                 """)
+
+                # Upgrade path: add columns to pre-existing tables
+                for col, col_type in [
+                    ("account_id",  "VARCHAR(128)"),
+                    ("owner_space", "VARCHAR(128)"),
+                    ("node_uri",    "VARCHAR(512)"),
+                    ("node_id",     "UUID"),
+                    ("record_kind", "VARCHAR(32) DEFAULT 'node_content'"),
+                    ("node_status", "VARCHAR(16) DEFAULT 'active'"),
+                    ("space_id",    "UUID"),
+                ]:
+                    cur.execute(
+                        f"ALTER TABLE {tbl} ADD COLUMN IF NOT EXISTS {col} {col_type}"
+                    )
+
+                # Legacy row backfills are explicitly run once by
+                # scripts/migrate_vector_index.py, never during process startup.
+
                 cur.execute(f"""
                     CREATE INDEX IF NOT EXISTS idx_{tbl}_account
                         ON {tbl} ((filters->>'account_id'))
@@ -153,13 +185,84 @@ class OpenGaussVectorIndex(VectorIndex):
                     CREATE INDEX IF NOT EXISTS idx_{tbl}_embedding_hnsw
                         ON {tbl} USING hnsw (embedding vector_cosine_ops)
                 """)
+                cur.execute(f"""
+                    CREATE INDEX IF NOT EXISTS idx_{tbl}_space_id
+                        ON {tbl} (account_id, space_id)
+                        WHERE space_id IS NOT NULL
+                """)
+                cur.execute(f"""
+                    CREATE INDEX IF NOT EXISTS idx_{tbl}_node_id
+                        ON {tbl} (node_id)
+                        WHERE node_id IS NOT NULL
+                """)
                 conn.commit()
             logger.info("Table '%s' ensured (dim=%d)", tbl, dim)
         except Exception as e:
             conn.rollback()
-            logger.warning("Failed to ensure table '%s': %s", tbl, e)
+            raise RuntimeError(
+                f"OpenGaussVectorIndex initialization failed for table "
+                f"'{tbl}' (dim={dim}): {e}"
+            ) from e
         finally:
-            conn.close()
+            self._return_connection(conn)
+
+    def migrate_legacy_rows(self) -> bool:
+        """Run the legacy backfill once, atomically with its completion marker.
+
+        Operators run this during a maintenance window, not at application boot.
+        The ledger lock serializes concurrent migration commands; a failed
+        migration rolls back both the data changes and the completion marker.
+        """
+        tbl = self._table_name
+        conn = self._get_connection()
+        try:
+            with conn.cursor() as cur:
+                cur.execute("""CREATE TABLE IF NOT EXISTS ogmem_vector_migrations (
+                    table_name TEXT NOT NULL, migration TEXT NOT NULL,
+                    completed_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+                    PRIMARY KEY (table_name, migration))""")
+                cur.execute("LOCK TABLE ogmem_vector_migrations IN EXCLUSIVE MODE")
+                key = (tbl, "legacy_columns_v1")
+                cur.execute("""SELECT 1 FROM ogmem_vector_migrations
+                    WHERE table_name = %s AND migration = %s""", key)
+                if cur.fetchone() is not None:
+                    conn.commit()
+                    return False
+                cur.execute(f"""
+                    UPDATE {tbl} SET
+                        account_id = COALESCE(account_id, filters->>'account_id'),
+                        owner_space = COALESCE(owner_space, filters->>'owner_space'),
+                        node_uri = COALESCE(node_uri, uri),
+                        node_status = COALESCE(node_status, 'active')
+                    WHERE account_id IS NULL OR owner_space IS NULL
+                       OR node_uri IS NULL OR node_status IS NULL
+                """)
+                cur.execute("""SELECT 1 FROM information_schema.tables
+                    WHERE table_schema = current_schema() AND table_name = 'context_nodes'""")
+                if cur.fetchone() is not None:
+                    cur.execute(f"""
+                        UPDATE {tbl} vi SET node_id = cn.node_id
+                        FROM context_nodes cn
+                        WHERE vi.node_uri = cn.uri AND vi.node_id IS NULL
+                          AND vi.account_id = cn.account_id
+                    """)
+                    cur.execute(f"""
+                        UPDATE {tbl} vi SET node_id = cn.node_id
+                        FROM context_nodes cn
+                        WHERE vi.node_id IS NULL
+                          AND vi.node_uri LIKE '%%/content.md'
+                          AND cn.uri = substring(vi.node_uri from '^(.+)/content[.]md')
+                          AND vi.account_id = cn.account_id
+                    """)
+                cur.execute("""INSERT INTO ogmem_vector_migrations (table_name, migration)
+                    VALUES (%s, %s)""", key)
+            conn.commit()
+            return True
+        except Exception:
+            conn.rollback()
+            raise
+        finally:
+            self._return_connection(conn)
 
     def _get_connection(self):
         """Get a connection from the pool or create a new one."""
@@ -170,8 +273,9 @@ class OpenGaussVectorIndex(VectorIndex):
 
         return psycopg2.connect(self._connection_string)
 
-    def _return_connection(self, conn):
-        """Return a connection to the pool, rolling back dirty transactions."""
+    @staticmethod
+    def _reset_connection(conn):
+        """End the index transaction before the connection becomes idle."""
         if conn.closed != 0:
             return
         try:
@@ -179,6 +283,17 @@ class OpenGaussVectorIndex(VectorIndex):
                 conn.rollback()
         except Exception:
             conn.close()
+
+    def _return_shared_connection(self, conn):
+        try:
+            self._reset_connection(conn)
+        finally:
+            self._shared_pool.return_connection(conn)
+
+    def _return_connection(self, conn):
+        """Return a connection to the pool, rolling back dirty transactions."""
+        self._reset_connection(conn)
+        if conn.closed != 0:
             return
         if len(self._pool) < self._pool_size:
             self._pool.append(conn)
@@ -206,12 +321,23 @@ class OpenGaussVectorIndex(VectorIndex):
                 filters_json = Json(record.filters)
                 metadata_json = Json(record.metadata)
 
+                # Extract explicit security columns from filters
+                acct = record.filters.get("account_id")
+                owner = record.filters.get("owner_space")
+                kind = record.metadata.get("record_kind", "node_content")
+                space_id = record.filters.get("space_id")
+                node_id = record.metadata.get("node_id")
+
                 try:
                     with conn.cursor() as cur:
+                        # IDs should already be account-scoped. Fail closed on
+                        # a legacy/global ID collision: it must hit the unique
+                        # constraint, never overwrite another tenant's row.
                         cur.execute(f"""
                             MERGE INTO {self._table_name} t
-                            USING (SELECT %s AS id) s
-                            ON t.id = s.id
+                            USING (SELECT %s AS id, %s AS account_id) s
+                            ON t.id = s.id AND (t.account_id = s.account_id
+                                OR (t.account_id IS NULL AND s.account_id IS NULL))
                             WHEN MATCHED THEN UPDATE SET
                                 uri = %s,
                                 level = %s,
@@ -219,16 +345,27 @@ class OpenGaussVectorIndex(VectorIndex):
                                 embedding = %s::vector,
                                 filters = %s,
                                 metadata = %s,
+                                owner_space = %s,
+                                node_uri = %s,
+                                node_id = COALESCE(%s, t.node_id),
+                                record_kind = %s,
+                                node_status = 'active',
+                                space_id = %s,
                                 updated_at = NOW()
                             WHEN NOT MATCHED THEN INSERT
-                                (id, uri, level, text, embedding, filters, metadata)
-                            VALUES (%s, %s, %s, %s, %s::vector, %s, %s)
+                                (id, uri, level, text, embedding, filters, metadata,
+                                 account_id, owner_space, node_uri, node_id, record_kind,
+                                 node_status, space_id)
+                            VALUES (%s, %s, %s, %s, %s::vector, %s, %s,
+                                    %s, %s, %s, %s, %s, 'active', %s)
                         """, (
-                            record.id,
+                            record.id, acct,
                             record.uri, record.level, record.text,
                             embedding_str, filters_json, metadata_json,
+                            owner, record.uri, node_id, kind, space_id,
                             record.id, record.uri, record.level, record.text,
                             embedding_str, filters_json, metadata_json,
+                            acct, owner, record.uri, node_id, kind, space_id,
                         ))
                     conn.commit()
                 except Exception as exc:
@@ -239,6 +376,7 @@ class OpenGaussVectorIndex(VectorIndex):
                     conn.rollback()
         finally:
             self._return_connection(conn)
+
 
     def delete(self, ids: list[str]) -> None:
         """Remove records from the index."""
@@ -268,7 +406,7 @@ class OpenGaussVectorIndex(VectorIndex):
         params["topk"] = top_k
 
         sql = f"""
-            SELECT id, uri, level, text, filters, metadata,
+            SELECT id, uri, level, text, filters, metadata, node_id, owner_space,
                    1 - (embedding <=> %(qvec)s::vector) AS score
             FROM   {self._table_name}
             WHERE  {where}
@@ -286,11 +424,13 @@ class OpenGaussVectorIndex(VectorIndex):
 
         return [self._row_to_hit(r) for r in rows]
 
+
     def get_embeddings(
         self,
         uris: list[str],
         filters: dict[str, Any],
         level: int = 0,
+        *, expected_texts: dict[str, str] | None = None,
     ) -> dict[str, list[float]]:
         if not uris:
             return {}
@@ -300,7 +440,7 @@ class OpenGaussVectorIndex(VectorIndex):
         try:
             with conn.cursor() as cur:
                 cur.execute(
-                    f"SELECT uri, embedding::text FROM {self._table_name} "
+                    f"SELECT uri, embedding::text{', text' if expected_texts is not None else ''} FROM {self._table_name} "
                     f"WHERE {where} AND uri=ANY(%(uris)s)",
                     params,
                 )
@@ -308,7 +448,9 @@ class OpenGaussVectorIndex(VectorIndex):
         finally:
             self._return_connection(conn)
         output: dict[str, list[float]] = {}
-        for uri, raw in rows:
+        for uri, raw, *source in rows:
+            if expected_texts is not None and (not source or source[0] != expected_texts.get(str(uri))):
+                continue
             text = str(raw).strip().strip("[]")
             output[str(uri)] = [float(value) for value in text.split(",") if value]
         return output
@@ -327,7 +469,7 @@ class OpenGaussVectorIndex(VectorIndex):
         params["parent_uri"] = parent_uri
 
         sql = f"""
-            SELECT id, uri, level, text, filters, metadata,
+            SELECT id, uri, level, text, filters, metadata, node_id, owner_space,
                    1 - (embedding <=> %(qvec)s::vector) AS score
             FROM   {self._table_name}
             WHERE  {where} AND metadata->>'parent_uri' = %(parent_uri)s
@@ -345,20 +487,32 @@ class OpenGaussVectorIndex(VectorIndex):
 
         return [self._row_to_hit(r) for r in rows]
 
-    def _build_where(self, f: dict[str, Any]) -> tuple[str, dict[str, Any]]:
-        """Build WHERE clause from filters."""
+    @staticmethod
+    def _build_where(f: dict[str, Any]) -> tuple[str, dict[str, Any]]:
+        """Build WHERE clause with legacy tenant-filter compatibility.
+
+        Older index writers populate JSON filters but not the denormalized
+        tenant columns. Fall back only when a column is NULL: an explicit
+        owner always takes precedence. Missing ownership remains excluded,
+        and space grants still require their explicit columns.
+
+        Pure function of ``f`` — reads no instance state, so it can be
+        exercised directly (``OpenGaussVectorIndex._build_where(...)``)
+        in unit tests without standing up a live PG connection. Mirrors
+        the ``@staticmethod`` treatment of :meth:`_row_to_hit`.
+        """
         clauses: list[str] = []
         params: dict[str, Any] = {}
 
         if "account_id" in f:
-            clauses.append("filters->>'account_id' = %(f_account_id)s")
+            clauses.append("COALESCE(account_id, filters->>'account_id') = %(f_account_id)s")
             params["f_account_id"] = f["account_id"]
         if "owner_space" in f:
             owner = f["owner_space"]
             if isinstance(owner, list):
-                clauses.append("filters->>'owner_space' = ANY(%(f_owner_space)s)")
+                clauses.append("COALESCE(owner_space, filters->>'owner_space') = ANY(%(f_owner_space)s)")
             else:
-                clauses.append("filters->>'owner_space' = %(f_owner_space)s")
+                clauses.append("COALESCE(owner_space, filters->>'owner_space') = %(f_owner_space)s")
             params["f_owner_space"] = owner
         if "context_type" in f:
             ct = f["context_type"]
@@ -388,7 +542,16 @@ class OpenGaussVectorIndex(VectorIndex):
             else:
                 clauses.append("level = %(f_level)s")
             params["f_level"] = lvl
-
+        if "space_id" in f:
+            sid = f["space_id"]
+            if isinstance(sid, list):
+                # Strict space isolation: legacy records with NULL space_id
+                # are NOT auto-matched — they would silently bypass the
+                # caller's space grant. Backfill them or exclude them.
+                clauses.append("space_id = ANY(%(f_space_id)s)")
+            else:
+                clauses.append("space_id = %(f_space_id)s")
+            params["f_space_id"] = sid
         return (" AND ".join(clauses) or "TRUE"), params
 
     @staticmethod
@@ -397,6 +560,12 @@ class OpenGaussVectorIndex(VectorIndex):
         meta = _ensure_dict(row.get("metadata"))
         filt = _ensure_dict(row.get("filters"))
         level = int(row.get("level", 2))
+        # Prefer explicit column, fall back to JSONB for old rows
+        owner = row.get("owner_space") or filt.get("owner_space", "")
+        node_id = row.get("node_id")
+        hit_metadata: dict[str, Any] = dict(meta)
+        if node_id is not None:
+            hit_metadata["node_id"] = str(node_id)
         return SeedHit(
             uri=row["uri"],
             score=float(row.get("score", 0)),
@@ -404,13 +573,13 @@ class OpenGaussVectorIndex(VectorIndex):
             parent_uri=meta.get("parent_uri"),
             context_type=meta.get("context_type", ""),
             category=meta.get("category", ""),
-            owner_space=filt.get("owner_space", ""),
+            owner_space=owner,
             abstract=meta.get("abstract", row.get("text", "")[:200]),
             has_overview=meta.get("has_overview", False),
             has_content=meta.get("has_content", False),
             active_count=meta.get("active_count", 0),
             updated_at=meta.get("updated_at"),
-            metadata=dict(meta),
+            metadata=hit_metadata,
         )
 
     def delete_account_data(self, account_id: str) -> int:
@@ -473,11 +642,14 @@ class OpenGaussVectorIndex(VectorIndex):
             self._return_connection(conn)
 
     def close(self) -> None:
-        """Close all connections in the pool."""
-        for conn in self._pool:
+        """Close owned connections, leaving a shared pool to its owner."""
+        if getattr(self, "_shared_pool", None) is not None:
+            return
+        for conn in getattr(self, "_pool", []):
             if conn.closed == 0:
                 conn.close()
-        self._pool.clear()
+        if hasattr(self, "_pool"):
+            self._pool.clear()
 
     def __enter__(self):
         return self

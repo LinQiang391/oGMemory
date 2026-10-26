@@ -733,6 +733,7 @@ class ReadAPI:
         include_debug: bool = False,
         mode: str = RetrieverMode.QUICK,
         fill_content_for_top_k: int = 0,
+        context_type: str | None = None,
         memory_directories: list[str] | None = None,
     ) -> SearchMemoryResult:
         if not (query or "").strip():
@@ -754,6 +755,7 @@ class ReadAPI:
             score_threshold=score_threshold,
             mode=mode,
             fill_content_for_top_k=fill_content_for_top_k,
+            context_type=context_type,
             memory_directories=memory_directories,
         )
 

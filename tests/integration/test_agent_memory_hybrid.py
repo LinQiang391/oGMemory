@@ -61,7 +61,7 @@ def sql_database():
     admin.autocommit = True
     with admin.cursor() as cur:
         cur.execute(sql.SQL("CREATE DATABASE {}").format(sql.Identifier(name)))
-    params = admin.get_dsn_parameters()
+    params = psycopg2.extensions.parse_dsn(dsn)
     params["dbname"] = name
     connection = psycopg2.extensions.make_dsn(**params)
     try:

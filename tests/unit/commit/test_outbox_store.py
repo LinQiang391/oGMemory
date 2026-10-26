@@ -708,3 +708,161 @@ class TestListPendingLockFiltering:
 
         assert len(results) == 1
         assert results[0][1].event_id == "expired-lock-event"
+
+
+class TestCountUnfinished:
+    """Tests for the fail-closed AGFS freshness counter."""
+
+    def setup_method(self):
+        self.mock_client = Mock()
+        self.store = OutboxStore(self.mock_client, Mock())
+
+    @staticmethod
+    def _event(event_id, *, status="PENDING", next_retry_at=None):
+        return json.dumps(
+            {
+                "event_id": event_id,
+                "event_type": "UPSERT_CONTEXT",
+                "uri": "ctx://test-account/users/user-123/memories/profile",
+                "payload": {"records": []},
+                "status": status,
+                "retry_count": 0,
+                "created_at": datetime.now(timezone.utc).isoformat(),  # noqa: UP017
+                "next_retry_at": next_retry_at,
+            }
+        ).encode("utf-8")
+
+    def test_count_unfinished_includes_locked_and_deferred_events(self):
+        self.mock_client.ls.side_effect = [
+            [{"name": "resources", "is_dir": True}],
+            [{"name": ".outbox", "is_dir": True}],
+            [
+                {"name": "pending.json", "is_dir": False},
+                {"name": "active.json", "is_dir": False},
+                {"name": "active.processing", "is_dir": False},
+                {"name": "deferred.json", "is_dir": False},
+                {"name": "dlq", "is_dir": True},
+            ],
+        ]
+        payloads = {
+            "pending.json": self._event("pending"),
+            "active.json": self._event("active"),
+            "deferred.json": self._event(
+                "deferred",
+                next_retry_at="2030-01-01T00:00:00+00:00",
+            ),
+        }
+        self.mock_client.read.side_effect = (
+            lambda path: payloads[path.rsplit("/", 1)[-1]]
+        )
+
+        assert self.store.count_unfinished("test-account") == {
+            "pending": 2,
+            "processing": 1,
+            "total": 3,
+        }
+
+    @pytest.mark.parametrize("lock_name", [
+        ".state.json.resource-mutation-lock",
+        ".state.json.resource-mutation-lock-" + "a" * 32,
+        ".profile.update-lock",
+        ".profile.update-lock-" + "b" * 32,
+    ])
+    def test_count_unfinished_during_metadata_lock_publication(self, lock_name):
+        directories = {
+            "/local/accounts/test-account/": [
+                {"name": lock_name, "is_dir": True},
+                {"name": "profile", "is_dir": True},
+            ],
+            "/local/accounts/test-account/profile/": [
+                {"name": ".outbox", "is_dir": True},
+            ],
+            "/local/accounts/test-account/profile/.outbox/": [
+                {"name": "live.json", "is_dir": False},
+            ],
+        }
+
+        def list_directory(path):
+            if path not in directories:
+                raise FileNotFoundError(f"no such directory: {path}")
+            return directories[path]
+
+        self.mock_client.ls.side_effect = list_directory
+        self.mock_client.read.return_value = self._event("live")
+        assert self.store.count_unfinished("test-account") == {
+            "pending": 1,
+            "processing": 0,
+            "total": 1,
+        }
+
+    def test_count_unfinished_includes_owner_named_like_metadata_lock(self):
+        self.mock_client.ls.side_effect = [
+            [{"name": "users", "is_dir": True}],
+            [{"name": ".alice.update-lock", "is_dir": True}],
+            [{"name": "memories", "is_dir": True}],
+            [{"name": "profile", "is_dir": True}],
+            [{"name": ".outbox", "is_dir": True}],
+            [{"name": "live.json", "is_dir": False}],
+        ]
+        self.mock_client.read.return_value = self._event("live")
+
+        assert self.store.count_unfinished("test-account") == {
+            "pending": 1,
+            "processing": 0,
+            "total": 1,
+        }
+
+    def test_count_unfinished_during_event_completion(self):
+        self.mock_client.ls.side_effect = [
+            [{"name": ".outbox", "is_dir": True}],
+            [{"name": "completed.json", "is_dir": False}],
+        ]
+        self.mock_client.read.side_effect = FileNotFoundError("event not found")
+
+        assert self.store.count_unfinished("test-account") == {
+            "pending": 0,
+            "processing": 0,
+            "total": 0,
+        }
+
+    def test_count_unfinished_skips_dlq_entries(self):
+        self.mock_client.ls.side_effect = [
+            [{"name": ".outbox", "is_dir": True}],
+            [{"name": "dlq", "is_dir": True}],
+        ]
+
+        assert self.store.count_unfinished("test-account") == {
+            "pending": 0,
+            "processing": 0,
+            "total": 0,
+        }
+        self.mock_client.read.assert_not_called()
+
+    def test_count_unfinished_scans_a_live_resource_directory_named_dlq(self):
+        self.mock_client.ls.side_effect = [
+            [{"name": "dlq", "is_dir": True}],
+            [{"name": ".outbox", "is_dir": True}],
+            [{"name": "live.json", "is_dir": False}],
+        ]
+        self.mock_client.read.return_value = self._event("live")
+
+        assert self.store.count_unfinished("test-account") == {
+            "pending": 1,
+            "processing": 0,
+            "total": 1,
+        }
+
+    def test_count_unfinished_rejects_unsafe_account_before_scanning(self):
+        with pytest.raises(ValueError, match="account_id is invalid"):
+            self.store.count_unfinished("../other-account")
+
+        self.mock_client.ls.assert_not_called()
+
+    def test_count_unfinished_raises_when_a_nested_scan_fails(self):
+        self.mock_client.ls.side_effect = [
+            [{"name": "resources", "is_dir": True}],
+            RuntimeError("AGFS unavailable"),
+        ]
+
+        with pytest.raises(RuntimeError, match="AGFS unavailable"):
+            self.store.count_unfinished("test-account")

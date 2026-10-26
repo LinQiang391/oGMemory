@@ -133,16 +133,20 @@ class InMemoryVectorIndex(VectorIndex):
         hits.sort(key=lambda h: h.score, reverse=True)
         return hits[:top_k]
 
+
     def get_embeddings(
         self,
         uris: list[str],
         filters: dict[str, Any],
         level: int = 0,
+        *, expected_texts: dict[str, str] | None = None,
     ) -> dict[str, list[float]]:
         wanted = set(uris)
         output: dict[str, list[float]] = {}
         for record_id, record in self._records.items():
             if record.uri not in wanted or record.level != level:
+                continue
+            if expected_texts is not None and record.text != expected_texts.get(record.uri):
                 continue
             if self._matches_raw_filters(record, filters):
                 output[record.uri] = list(self._vectors[record_id])
@@ -204,6 +208,7 @@ class InMemoryVectorIndex(VectorIndex):
     def _record_to_vector_hit(record: IndexRecord, score: float) -> SeedHit:
         meta = record.metadata or {}
         return SeedHit(
+            metadata=dict(meta),
             uri=record.uri,
             score=score,
             level=record.level,
@@ -216,8 +221,8 @@ class InMemoryVectorIndex(VectorIndex):
             has_content=meta.get("has_content", False),
             active_count=meta.get("active_count", 0),
             updated_at=meta.get("updated_at"),
-            metadata=dict(meta),
         )
+
 
     def get_record(self, record_id: str) -> IndexRecord | None:
         """Get a record by ID (for testing).
