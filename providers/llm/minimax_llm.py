@@ -143,12 +143,10 @@ class MiniMaxLLM(OpenAILLM):
             request_timeout_seconds=request_timeout_seconds,
         )
 
-    def _create_completion(self, **kwargs):
-        """Canonicalize a provider-specific wire shape, not tool names/values."""
-        response = super()._create_completion(**kwargs)
-        tools = kwargs.get("tools")
+    def _normalize_tool_response(self, response, tools) -> None:
+        """Canonicalize wire arguments after the caller has recorded usage."""
         if not tools:
-            return response
+            return
         schemas = {t["function"]["name"]: t["function"].get("parameters", {})
                    for t in tools if t.get("type") == "function"}
         for choice in getattr(response, "choices", None) or []:
@@ -167,7 +165,6 @@ class MiniMaxLLM(OpenAILLM):
                 named = _named_scalar_arguments(arguments, schema)
                 call.function.arguments = json.dumps(named, ensure_ascii=False)
                 logger.info("Normalized unambiguous MiniMax positional arguments for %s", call.function.name)
-        return response
 
 
 __all__ = ["MiniMaxLLM", "DEFAULT_BASE_URL", "DEFAULT_MODEL"]

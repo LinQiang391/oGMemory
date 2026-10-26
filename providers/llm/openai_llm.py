@@ -268,6 +268,9 @@ class OpenAILLM(LLM):
             "cache_write": cache_write,
         }
 
+    def _normalize_tool_response(self, response, tools) -> None:
+        """Provider hook run only after usage accounting and truncation checks."""
+
     def _ensure_complete_response(self, response, *, kind: str = "structured") -> None:
         """Keep dev's typed failure/deadline contract and metadata-only diagnostics."""
         check_deadline()
@@ -793,6 +796,7 @@ class OpenAILLM(LLM):
                 )
                 usage = self._track_usage(response)
                 self._ensure_complete_response(response)
+                self._normalize_tool_response(response, openai_tools)
 
                 message = response.choices[0].message
                 raw_tool_calls = message.tool_calls
@@ -1009,6 +1013,7 @@ class OpenAILLM(LLM):
             )
             usage = self._track_usage(response)
             self._ensure_complete_response(response)
+            self._normalize_tool_response(response, openai_tools)
 
             message = response.choices[0].message
 

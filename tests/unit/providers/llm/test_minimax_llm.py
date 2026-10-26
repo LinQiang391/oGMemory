@@ -5,7 +5,7 @@ from __future__ import annotations
 import json
 from copy import deepcopy
 from types import SimpleNamespace
-from unittest.mock import patch
+from unittest.mock import Mock, call, patch
 
 import pytest
 
@@ -148,6 +148,7 @@ def test_provider_normalizes_wire_shape_without_changing_prompt_or_values(argume
         finish_reason="tool_calls", message=SimpleNamespace(tool_calls=[call]))])
     with patch.object(OpenAILLM, "_create_completion", return_value=response) as create:
         assert llm._create_completion(messages=messages, tools=tools) is response
+    llm._normalize_tool_response(response, tools)
     assert messages == original
     assert create.call_args.kwargs["messages"] is messages
     assert call.id == "real-call-id"
@@ -161,7 +162,8 @@ def test_non_tool_calls_are_not_changed():
     llm = minimax_llm_module.MiniMaxLLM(api_key="test-key")
     messages = [{"role": "system", "content": "Extract memory."}]
     with patch.object(OpenAILLM, "_create_completion") as create:
-        llm._create_completion(messages=messages, tools=None, response_format={"type": "json_object"})
+        response = llm._create_completion(messages=messages, tools=None, response_format={"type": "json_object"})
+    llm._normalize_tool_response(response, None)
     assert create.call_args.kwargs["messages"] is messages
 
 
@@ -173,4 +175,86 @@ def test_truncated_response_is_left_for_shared_truncation_guard():
         finish_reason="length", message=SimpleNamespace(tool_calls=[call]))])
     with patch.object(OpenAILLM, "_create_completion", return_value=response):
         llm._create_completion(messages=[], tools=[{"type": "function", "function": {"name": "Answer"}}])
+    llm._normalize_tool_response(response, [{"type": "function", "function": {"name": "Answer"}}])
     assert call.function.arguments == '["partial"]'
+
+
+@pytest.mark.parametrize("mode", ["tools", "messages"])
+@pytest.mark.parametrize("failure", ["ambiguous", "undeclared", "truncated"])
+def test_failed_normalization_and_retry_each_record_usage_once(mode, failure):
+    from core.errors import LLMOutputTruncatedError, ToolCallProtocolError
+
+    llm = minimax_llm_module.MiniMaxLLM(api_key="test-key")
+    llm._client = Mock()
+    llm.token_tracker = Mock()
+    llm.token_tracker.record_llm.side_effect = ["failed-round", "retry-round"]
+    tools = [{"name": "Search", "description": "Search", "input_schema": {
+        "type": "object", "properties": {
+            "left": {"type": "string"}, "right": {"type": "string"}},
+        "required": ["left", "right"],
+    }}]
+
+    def response(name, arguments, inp, out, finish_reason="tool_calls"):
+        return SimpleNamespace(
+            model="MiniMax-M3",
+            usage=SimpleNamespace(prompt_tokens=inp, completion_tokens=out),
+            choices=[SimpleNamespace(finish_reason=finish_reason, message=SimpleNamespace(
+                content=None, tool_calls=[SimpleNamespace(
+                    id="search", function=SimpleNamespace(name=name, arguments=arguments),
+                )],
+            ))],
+        )
+
+    failed = response("Unknown" if failure == "undeclared" else "Search",
+                      '["a", "b"]', 100, 20,
+                      "length" if failure == "truncated" else "tool_calls")
+    retried = response("Search", '{"left":"a","right":"b"}', 150, 30)
+    llm._client.chat.completions.create.side_effect = [failed, retried]
+
+    def complete():
+        if mode == "tools":
+            return llm.complete_with_tools("Search", tools)
+        return llm.complete_with_tools_messages(
+            [{"role": "user", "content": "Search"}], tools,
+        )[0]
+
+    error = LLMOutputTruncatedError if failure == "truncated" else ToolCallProtocolError
+    with pytest.raises(error):
+        complete()
+    llm.token_tracker.record_llm.assert_called_once_with(
+        100, 20, 0, 0, usage_known=True, model="MiniMax-M3")
+    result = complete()
+    assert result[0]["input"] == {"left": "a", "right": "b"}
+    assert result[0]["_llm_usage"]["round_id"] == "retry-round"
+    assert llm.token_tracker.record_llm.call_args_list == [
+        call(100, 20, 0, 0, usage_known=True, model="MiniMax-M3"),
+        call(150, 30, 0, 0, usage_known=True, model="MiniMax-M3"),
+    ]
+
+
+@pytest.mark.parametrize("mode", ["tools", "messages"])
+@pytest.mark.parametrize("arguments", ['["scissors"]', '{"query":"scissors"}'])
+def test_successful_tool_normalization_records_usage_once(mode, arguments):
+    llm = minimax_llm_module.MiniMaxLLM(api_key="test-key")
+    llm._client = Mock()
+    llm.token_tracker = Mock()
+    llm.token_tracker.record_llm.return_value = "round"
+    llm._client.chat.completions.create.return_value = SimpleNamespace(
+        model="MiniMax-M3", usage=SimpleNamespace(prompt_tokens=100, completion_tokens=20),
+        choices=[SimpleNamespace(finish_reason="tool_calls", message=SimpleNamespace(
+            content=None, tool_calls=[SimpleNamespace(
+                id="search", function=SimpleNamespace(name="Search", arguments=arguments),
+            )],
+        ))],
+    )
+    tools = [{"name": "Search", "description": "Search", "input_schema": {
+        "type": "object", "properties": {"query": {"type": "string"}}, "required": ["query"],
+    }}]
+    if mode == "tools":
+        result = llm.complete_with_tools("Search", tools)
+    else:
+        result, _ = llm.complete_with_tools_messages([{"role": "user", "content": "Search"}], tools)
+    assert result[0]["input"] == {"query": "scissors"}
+    assert result[0]["_llm_usage"]["round_id"] == "round"
+    llm.token_tracker.record_llm.assert_called_once_with(
+        100, 20, 0, 0, usage_known=True, model="MiniMax-M3")
