@@ -1075,3 +1075,37 @@ def test_json_values_preserve_literal_content(value, wrapper):
     assert openai_llm_module.OpenAILLM._extract_json_from_text(
         wrapper.format(json.dumps(payload)),
     ) == payload
+
+@pytest.mark.parametrize("with_ids", [True, False])
+def test_search_compaction_uses_unambiguous_provider_call_ids(fake_client, monkeypatch, with_ids):
+    from core.models import RequestContext
+    from core.react_loop import ReactLoop
+    from m3.control_adapter import M3TaskContext, OGMemoryControlAdapter
+
+    raw_calls = [SimpleNamespace(
+        **({"id": f"search_{i}"} if with_ids else {}),
+        function=SimpleNamespace(name="Search", arguments=json.dumps({"query": query})),
+    ) for i, query in enumerate(("scissors", "glue", "scissors"))]
+    fake_client.chat.completions.create.return_value = _chat_response(tool_calls=raw_calls)
+    llm = openai_llm_module.OpenAILLM(api_key="test-key")
+    calls, _ = llm.complete_with_tools_messages(
+        [{"role": "user", "content": "Where?"}],
+        [{"name": "Search", "description": "Search", "input_schema": {"type": "object"}}],
+    )
+    if with_ids:
+        assert [call["id"] for call in calls] == ["search_0", "search_1", "search_2"]
+    adapter = OGMemoryControlAdapter(llm=llm, graph=Mock(), embedder=Mock())
+    ctx = RequestContext(account_id="a", user_id="u", agent_id="g", session_id="s", trace_id="t")
+    messages = adapter._build_messages(ctx, M3TaskContext(question="Where?"))
+    monkeypatch.setattr(ReactLoop, "_execute_tool", lambda self, name, args, ctx: {
+        "hits": [{"node_id": args["query"], "description": "Full original evidence"}],
+        "context_hits": [], "boundary_hits": [],
+    })
+    adapter._execute_and_append_tool_calls(messages, calls, [], set(), ctx)
+    results = [m for m in messages if m["role"] == "tool"]
+    ids = [m["tool_call_id"] for m in results]
+    assert len(set(ids)) == 3
+    assert "unknown" not in ids
+    assert [m["tool_calls"][0]["id"] for m in messages if m.get("tool_calls")] == ids
+    assert json.loads(results[2]["content"])["evidence_reference_tool_call_id"] == ids[0]
+    assert all(not json.loads(m["content"]).get("evidence_payload_omitted") for m in results[:2])

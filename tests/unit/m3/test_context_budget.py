@@ -223,6 +223,7 @@ def test_total_result_cap_includes_boundary_and_neighbors(monkeypatch):
             return [entry(i) for i in range(2, 18, 2)]
 
         def get_evidence_by_clips(self, clips, *args, **kwargs):
+            assert len(clips) == 1  # ten slots minus eight main hits and one boundary
             return [entry(i) for i in clips]
 
         def get_boundary_transcript(self, *args, **kwargs):
@@ -240,7 +241,73 @@ def test_total_result_cap_includes_boundary_and_neighbors(monkeypatch):
     assert sum(len(result[g]) for g in ("hits", "context_hits", "boundary_hits")) == 10
     assert len(result["boundary_hits"]) == 1
     assert result["boundary_hits"][0]["description"] == ""
-    assert result["retrieved_before_result_limit"] > 10
+    assert result["retrieved_before_result_limit"] == 10
+
+
+@pytest.mark.parametrize("context_k,cap,expected", [(1, 2, 1), (2000, 3, 2), (2000, 1, 0)])
+def test_neighbor_requests_are_bounded_before_graph_read(monkeypatch, context_k, cap, expected):
+    from types import SimpleNamespace
+    from m3.context_retrieval import neighbor_plan
+
+    graph = Mock()
+    graph.search_by_embedding.return_value = [SimpleNamespace(
+        node=SimpleNamespace(node_id="parent", extracted_content={"description": "scissors"}),
+        score=1., video_id="v1", clip_id=5000,
+    )]
+    graph.get_evidence_by_clips.return_value = []
+    embedder = Mock()
+    embedder.embed_texts.return_value = [[1.]]
+    planner = Mock(wraps=neighbor_plan)
+    monkeypatch.setattr("m3.control_adapter.neighbor_plan", planner)
+    monkeypatch.setattr("m3.transcript_rerank.rerank_with_transcript_bm25",
+                        lambda query, hits, **kwargs: hits)
+    Search("scissors", graph=graph, embedder=embedder, ctx=context(),
+           search_config=SearchConfig(
+               video_id="v1", include_neighbors=2000, context_k=context_k,
+               context_budget=ContextBudget(max_result_nodes=cap)))
+    if expected:
+        assert planner.call_args.kwargs["radius"] <= cap
+        assert planner.call_args.kwargs["max_clips"] == expected
+        clips = graph.get_evidence_by_clips.call_args.args[0]
+        assert len(clips) == len(set(clips)) == expected
+        assert all(abs(clip - 5000) <= cap for clip in clips)
+    else:
+        planner.assert_not_called()
+        graph.get_evidence_by_clips.assert_not_called()
+
+
+def test_shared_neighbors_keep_each_parent_relation_without_new_content_versions():
+    original = messages(exchange("a", "scissors", [hit("parent1"), hit("parent2")]),
+                        exchange("b", "toolbox", []))
+    for index, parents in ((3, [("parent1", 1), ("parent2", 2)]),
+                           (5, [("parent2", 3)])):
+        payload = json.loads(original[index]["content"])
+        payload["context_hits"] = [
+            hit("neighbor", context_for=parent, context_distance=distance)
+            for parent, distance in parents
+        ]
+        original[index]["content"] = json.dumps(payload)
+    before = deepcopy(original)
+    view, stats = pack_context(original, [], "scissors", ContextBudget())
+    records, docs = evidence(view)
+    refs = [ref for record in records for ref in record["evidence_refs"]
+            if ref["role"] == "context_hits"]
+    assert [(r["context_for"], r["context_distance"]) for r in refs] == [
+        ("parent1", 1), ("parent2", 2), ("parent2", 3)]
+    assert len({r["id"] for r in refs}) == 1
+    assert stats["unique_evidence_versions"] == len(docs) == 3
+    assert original == before
+
+
+def test_bounded_neighbor_plan_preserves_priority_and_shared_neighbor_parent():
+    from m3.context_retrieval import neighbor_plan
+
+    seeds = [("v1", 10, "parent1"), ("v1", 12, "parent2"), ("v1", 0, "parent3")]
+    full = neighbor_plan(seeds, radius=5, before_clip=13)
+    for count in range(1, len(full) + 1):
+        bounded = neighbor_plan(seeds, radius=5, before_clip=13, max_clips=count)
+        assert list(bounded.items()) == list(full.items())[:count]
+    assert full[("v1", 11)] == (1, 0, "parent1")
 
 
 def test_oversized_query_is_rejected_before_retrieval(monkeypatch):

@@ -1015,6 +1015,7 @@ class OpenAILLM(LLM):
             raw_tool_calls = message.tool_calls or []
             tool_calls = [
                 {
+                    "id": getattr(call, "id", None),
                     "tool": call.function.name,
                     "input": self._parse_tool_args(call.function.arguments),
                     # Usage belongs to the whole LLM response. Multiple tool

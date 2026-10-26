@@ -488,12 +488,37 @@ def Search(
         hits, identity=lambda hit: hit.node.node_id, score=lambda hit: hit.score,
         top_k=budget.final_top_k,
     )
+    boundary = []
+    # Class capability check avoids inventing capabilities on dynamic mocks
+    # and legacy adapters. The real GraphService provides the safe projection.
+    boundary_reader = getattr(type(graph), "get_boundary_transcript", None)
+    if (callable(boundary_reader) and search_config.video_id
+            and search_config.before_sec is not None):
+        from service.graph_service import ClipScope
+        boundary = graph.get_boundary_transcript(
+            ctx, scope=ClipScope(search_config.video_id, search_config.before_clip, search_config.before_sec),
+            extractor_types=search_config.extractor_types,
+        )
+        if boundary:
+            retrieval_branches.append({"kind": "boundary_transcript", "clip_ids": [h.clip_id for h in boundary]})
+
+    main_count = len(hits)
+    context_k = search_config.context_k
+    radius = search_config.include_neighbors
+    if limits:
+        # Reserve boundary/main evidence before planning or reading neighbors.
+        # Bound both the scan radius and the number of backend clip parameters.
+        boundary = boundary[:1]
+        hits = hits[:limits.max_result_nodes - len(boundary)]
+        context_k = min(context_k, limits.max_result_nodes - len(boundary) - len(hits))
+        radius = min(radius, limits.max_result_nodes)
     contexts = []
-    if search_config.context_k and hits:
+    if context_k and hits:
         from service.graph_service import ClipScope
         plan = neighbor_plan(
             [(h.video_id, h.clip_id, h.node.node_id) for h in hits],
-            radius=search_config.include_neighbors, before_clip=search_config.before_clip,
+            radius=radius, before_clip=search_config.before_clip,
+            max_clips=context_k if limits else None,
         )
         if plan:
             raw_context = graph.get_evidence_by_clips(
@@ -513,7 +538,7 @@ def Search(
                 if h.node.node_id not in seen:
                     seen.add(h.node.node_id)
                     contexts.append((h, parent, distance))
-            contexts = contexts[:search_config.context_k]
+            contexts = contexts[:context_k]
             retrieval_branches.append({"kind": "exact_neighbor", "clip_ids": [clip for _, clip in plan]})
 
     def serialize(h):
@@ -540,28 +565,7 @@ def Search(
             ),
         }
 
-    boundary = []
-    # Class capability check avoids inventing capabilities on dynamic mocks
-    # and legacy adapters. The real GraphService provides the safe projection.
-    boundary_reader = getattr(type(graph), "get_boundary_transcript", None)
-    if (callable(boundary_reader) and search_config.video_id
-            and search_config.before_sec is not None):
-        from service.graph_service import ClipScope
-        boundary = graph.get_boundary_transcript(
-            ctx, scope=ClipScope(search_config.video_id, search_config.before_clip, search_config.before_sec),
-            extractor_types=search_config.extractor_types,
-        )
-        if boundary:
-            retrieval_branches.append({"kind": "boundary_transcript", "clip_ids": [h.clip_id for h in boundary]})
-
-    retrieved_before_limit = len(hits) + len(contexts) + len(boundary)
-    if limits:
-        # Boundary evidence has already been temporally projected; retain its
-        # slot before main hits and neighbors. Never replace it with full text.
-        boundary = boundary[:1]
-        available = limits.max_result_nodes - len(boundary)
-        hits = hits[:available]
-        contexts = contexts[:max(0, available - len(hits))]
+    retrieved_before_limit = main_count + len(contexts) + len(boundary)
     return {
         "query": query,
         "retrieval_queries": retrieval_queries,
@@ -571,7 +575,7 @@ def Search(
                            if transcript_top_k else "vector_transcript_bm25"),
         "retrieval_branches": retrieval_branches,
         "transcript_top_k": transcript_top_k,
-        "context_k": search_config.context_k,
+        "context_k": context_k,
         "boundary_k": 1,
         "retrieved_before_result_limit": retrieved_before_limit,
         "boundary_hits": [

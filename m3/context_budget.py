@@ -210,7 +210,8 @@ def pack_context(messages, tools, question, budget: ContextBudget):
                         "first": index, "rank": rank, "passages": [],
                     }
                 documents[version]["rank"] = min(documents[version]["rank"], rank)
-                occurrences.append((version, group))
+                relation = {k: hit[k] for k in ("context_for", "context_distance") if k in hit}
+                occurrences.append((version, group, relation))
         records.append((index, payload, occurrences))
 
     notice = ("Budgeted original excerpts, not complete memory. Omitted evidence is not "
@@ -220,21 +221,19 @@ def pack_context(messages, tools, question, budget: ContextBudget):
 
     def render():
         for index, payload, occurrences in records:
-            refs, bodies, seen = [], {}, set()
-            for version, role in occurrences:
+            refs, bodies = [], {}
+            for version, role, relation in occurrences:
                 if version not in selected:
                     continue
                 doc = documents[version]
-                if (version, role) not in seen:
-                    refs.append({"id": doc["id"], "role": role})
-                    seen.add((version, role))
+                refs.append({"id": doc["id"], "role": role, **relation})
                 if doc["first"] == index:
                     bodies[doc["id"]] = selected[version]
             packet = {
                 "query": payload.get("query", ""),
                 "retrieved_nodes": sum(len(payload[g]) for g in _GROUPS),
                 "omitted_nodes": (sum(len(payload[g]) for g in _GROUPS)
-                                  - sum(1 for version, _ in occurrences if version in selected)),
+                                  - sum(1 for version, _, _ in occurrences if version in selected)),
                 "evidence_refs": refs, "evidence": bodies, "budgeted": True,
             }
             if index == records[0][0]:

@@ -69,4 +69,4 @@ uv run python scripts/run_m3_bench_subset.py \
     --set speaker_diarization.params.force=true \
     --set speaker_embedding.params.force=true \
     --set "voice_segmentation.params.force=$asr_vad_force" \
-    --judge "${extra[@]}" "$@" 2>&1 | tee -a "$RUN_ROOT/driver.log"
+    --judge ${extra[@]+"${extra[@]}"} "$@" 2>&1 | tee -a "$RUN_ROOT/driver.log"
