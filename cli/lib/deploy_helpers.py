@@ -16,6 +16,7 @@ logger = logging.getLogger(__name__)
 QUICKSTART_LLM_PROVIDERS = ("openai", "volcengine", "dashscope", "zhipu")
 QUICKSTART_EMBEDDING_PROVIDERS = {
     "openai": "openai",
+    "volcengine": "volcengine",
     "dashscope": "openai",
     "zhipu": "openai",
 }

@@ -13,7 +13,7 @@ from cli.lib.prompt import confirm, input_masked, input_validated, select
 # Provider defaults
 PROVIDER_DEFAULTS = {
     "openai": {"base_url": "https://api.openai.com/v1", "model": "gpt-4o-mini", "embedding_model": "text-embedding-ada-002", "embedding_dim": 1536},
-    "volcengine": {"base_url": "https://ark.cn-beijing.volces.com/api/v3", "model": "doubao-seed-2-0-code-preview-260215"},
+    "volcengine": {"base_url": "https://ark.cn-beijing.volces.com/api/v3", "model": "doubao-seed-2-0-code-preview-260215", "embedding_model": "doubao-embedding-vision-250615", "embedding_dim": 1024},
     "dashscope": {"base_url": "https://dashscope.aliyuncs.com/compatible-mode/v1", "model": "qwen-plus", "embedding_model": "text-embedding-v3", "embedding_dim": 1024},
     "zhipu": {"base_url": "https://open.bigmodel.cn/api/paas/v4", "model": "glm-4-flash", "embedding_model": "embedding-3", "embedding_dim": 2048},
     "mock": {"base_url": "", "model": "mock", "embedding_model": "mock", "embedding_dim": 1024},
@@ -70,7 +70,7 @@ def _step2_llm(args) -> dict:
 
 def _embedding_adapter(provider: str) -> str:
     adapter = {"zhipu": "openai", "dashscope": "openai"}.get(provider, provider)
-    if adapter not in {"openai", "openai-cached", "st", "mock"}:
+    if adapter not in {"openai", "openai-cached", "volcengine", "st", "mock"}:
         raise ValueError("Unsupported embedding provider; use openai for an OpenAI-compatible API")
     return adapter
 

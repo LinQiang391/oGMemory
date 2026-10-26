@@ -75,6 +75,7 @@ def test_printed_deferred_command_matches_immediate_execution(tmp_path, monkeypa
 @pytest.mark.skipif(not HAS_BASH, reason="POSIX shell required")
 @pytest.mark.parametrize("llm_provider,embedding_provider,adapter", [
     ("openai", "openai", "openai"), ("volcengine", "openai", "openai"),
+    ("volcengine", "volcengine", "volcengine"),
     ("dashscope", "dashscope", "openai"), ("zhipu", "zhipu", "openai"),
 ])
 def test_supported_providers_pass_actual_quickstart_validation(tmp_path, llm_provider, embedding_provider, adapter):
