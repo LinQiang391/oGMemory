@@ -391,3 +391,20 @@ def test_retry_update_preserves_concurrent_foreground_checkpoint(ctx, foreground
         assert durable[EXTENSION_KEY]["batch"]["slots"] == expected
     else:
         assert durable.get(EXTENSION_KEY) == expected
+
+
+def test_recovered_source_emits_completion_after_durable_receipt(ctx, caplog):
+    import logging
+
+    fs, service, writer, manager, identity = queued(ctx)
+    writer._pipeline.extract.side_effect = None
+    writer._pipeline.extract.return_value = [candidate()]
+    ready(manager, ctx)
+    with caplog.at_level(logging.INFO, logger="ogmem.service"):
+        assert service._extraction_retry.run_once(ctx, identity) is None
+    assert manager.get_or_create(ctx.session_id).request_completed("original")
+    assert len(nodes(fs, "event")) == 1
+    assert len(nodes(fs, "session_archive")) == 1
+    completed = [r for r in caplog.records if "after_turn background extract done" in r.getMessage()]
+    assert len(completed) == 1
+    assert "session=" + ctx.session_id[:8] in completed[0].getMessage()
