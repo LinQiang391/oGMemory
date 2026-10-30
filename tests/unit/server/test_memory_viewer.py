@@ -1160,3 +1160,43 @@ def test_memory_viewer_pages_legacy_and_unicode_names(monkeypatch, admin, typed)
 
     assert seen == ["李雷", "atlas", "李雷"]
     assert len(cursors) == len(set(cursors))
+
+
+def test_memory_viewer_detail_maps_access_denied_to_403(monkeypatch):
+    from core.errors import AccessDeniedError
+
+    service = _Service()
+
+    def read_node(uri, ctx):
+        raise AccessDeniedError(uri, ctx.account_id, "permission changed")
+
+    service.context_fs.read_node = read_node
+    monkeypatch.setattr(app_module, "_service", service)
+
+    response = app_module.app.test_client().get(
+        "/api/v1/memories/detail",
+        query_string={"uri": "ogmemory://memories/pattern/demo", "agentId": "agent"},
+    )
+
+    assert response.status_code == 403
+    assert "Access denied" in response.get_json()["error"]
+
+
+def test_memory_viewer_detail_maps_not_found_node_to_404(monkeypatch):
+    from core.errors import NodeNotFoundError
+
+    service = _Service()
+
+    def read_node(uri, ctx):
+        raise NodeNotFoundError(uri)
+
+    service.context_fs.read_node = read_node
+    monkeypatch.setattr(app_module, "_service", service)
+
+    response = app_module.app.test_client().get(
+        "/api/v1/memories/detail",
+        query_string={"uri": "ogmemory://memories/pattern/demo", "agentId": "agent"},
+    )
+
+    assert response.status_code == 404
+    assert "not found" in response.get_json()["error"].lower()
