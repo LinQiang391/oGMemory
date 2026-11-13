@@ -118,7 +118,7 @@ def validate_evidence(output, tag):
     require(gate['judge_failures'] == 0 and gate['llm_model'] == 'doubao-seed-2.1-lite'
             and gate['embedding_model'] == 'doubao-embedding-vision'
             and gate['autoCapture_qa'] is True and gate['initial_vector_count'] == 0
-            and gate['test_revision'] == '10b9983ad19e7a6954a8c46de48a6835b6e45302'
+            and gate['test_revision'] == 'e6544ee8ca11dbfc6bfc192cfefe03cfc163513e'
             and gate['qa_captured_sessions'] == 35
             and type(gate['qa_after_turn_requests']) is int and gate['qa_after_turn_requests'] >= 35,
             'LoCoMo model/capture/freshness contract mismatch.')

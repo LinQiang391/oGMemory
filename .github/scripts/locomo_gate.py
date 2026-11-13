@@ -20,8 +20,10 @@ import yaml
 
 OPENCLAW_IMAGE = 'ghcr.io/openclaw/openclaw@sha256:b6cde69b0ede1160070cc9605b2c5feb0615fd036c98c41acc8f782dca1f6991'
 DB_IMAGE = 'swr.cn-north-4.myhuaweicloud.com/kunpeng-ai/opengauss-distributed@sha256:53ec657ac4c22d221202acd8d23c88a8386acda00ea3a5c06c5fb932340553ef'
-TEST_URL = 'https://gitcode.com/weixin_44204324/locomo-test.git'
-TEST_SHA = '10b9983ad19e7a6954a8c46de48a6835b6e45302'
+TEST_URL = 'https://gitcode.com/opengauss/openGauss-MemoryWorkload.git'
+TEST_SHA = 'e6544ee8ca11dbfc6bfc192cfefe03cfc163513e'
+DATA_URL = 'https://gitcode.com/weixin_44204324/locomo-test.git'
+DATA_REVISION = '10b9983ad19e7a6954a8c46de48a6835b6e45302'
 DATA_SHA = '85ef7d7bbf41c0a40105030d1ef075ccd64d14c295daba1ff73e3d3a573141d8'
 SECRET_VALUES = [os.environ.get(name, '') for name in ('LLM_API_KEY', 'EMBEDDING_API_KEY')]
 
@@ -176,10 +178,18 @@ def main():
         gate.update(image_id=record['Id'], source_revision=manifest['source_revision'])
         runtime = tempfile.TemporaryDirectory(prefix='ogmemory-locomo-', dir=os.environ.get('RUNNER_TEMP'))
         root = Path(runtime.name)
-        test = root / 'locomo-test'
-        run(['git', 'clone', '--branch', 'master', TEST_URL, str(test)])
-        run(['git', 'checkout', '--detach', TEST_SHA], cwd=test)
-        data = test / 'data/locomo_small.json'
+        workload = root / 'memory-workload'
+        run(['git', 'clone', '--branch', 'master', TEST_URL, str(workload)])
+        run(['git', 'checkout', '--detach', TEST_SHA], cwd=workload)
+        test = workload / 'locomo_test'
+        dataset_source = root / 'benchmark-data'
+        run(['git', 'clone', '--branch', 'master', DATA_URL, str(dataset_source)])
+        run(['git', 'checkout', '--detach', DATA_REVISION], cwd=dataset_source)
+        data = dataset_source / 'data/locomo_small.json'
+        (output/'benchmark-provenance.json').write_text(json.dumps({
+            'test_repository': TEST_URL, 'test_revision': TEST_SHA, 'entrypoint': 'locomo_test/locomo_test/cli.py',
+            'dataset_repository': DATA_URL, 'dataset_revision': DATA_REVISION, 'dataset_sha256': DATA_SHA,
+            'completion': 'exact_request_write_receipts'}, indent=2))
         if hashlib.sha256(data.read_bytes()).hexdigest() != DATA_SHA:
             raise RuntimeError('Benchmark data changed')
         dataset = json.loads(data.read_text())
@@ -318,8 +328,14 @@ policy = "isolated"
 tail = "[]"
 ''')
         def phase(steps):
-            process = subprocess.Popen([sys.executable, '-m', 'locomo_test.cli', 'run', str(config_path), '--only', steps],
-                                       cwd=test, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
+            phase_env = dict(os.environ)
+            phase_env['PYTHONPATH'] = os.pathsep.join((str(test), str(workload/'memory_bench_platform')))
+            process = subprocess.Popen([sys.executable, str(Path(__file__).with_name('workload_locomo.py')),
+                                        '--config', str(config_path), '--steps', steps, '--api-url', api_url,
+                                        '--gateway-config', str(state/'openclaw.json'), '--state', str(state),
+                                        '--gateway-container', oc,
+                                        '--evidence', str(output/('write-receipts-'+steps.replace(',', '-')+'.json'))],
+                                       env=phase_env, cwd=test, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
             timed_out = threading.Event()
             def expire():
                 timed_out.set()
@@ -361,7 +377,7 @@ tail = "[]"
                     raise RuntimeError('Extraction settlement timed out')
         phase('health_check,ingest')
         results = result_dir/'small'
-        ingest_failures = json.loads((results/'.ingest_failures.json').read_text())
+        ingest_failures = json.loads((results/'.ingest_failures.json').read_text()) if (results/'.ingest_failures.json').exists() else {}
         ingest_records = json.loads((results/'.ingest_record.json').read_text())
         if ingest_failures or len(ingest_records) != expected_sessions:
             raise RuntimeError('Incomplete/failed ingestion: release blocked, no fallback to idle-only')
@@ -393,8 +409,11 @@ tail = "[]"
         docker('stop', '--time', '30', oc)
         settle('qa-conv-26-q', 35)
         meta = json.loads((results/'meta.json').read_text())
+        # MemoryWorkload no longer emits pending_questions; derive it from the actual CSV below.
+
         rows = list(csv.DictReader((results/'qa_results.csv').open()))
-        qa_failures = json.loads((results/'.qa_failures.json').read_text())
+        meta['pending_questions'] = sum(str(row.get('category')) != '5' and row.get('result') not in ('CORRECT', 'WRONG') for row in rows)
+        qa_failures = json.loads((results/'.qa_failures.json').read_text()) if (results/'.qa_failures.json').exists() else {}
         logs = docker('logs', app, check=False)
         text = logs.stdout+logs.stderr
         oc_logs = docker('logs', oc, check=False)
@@ -416,6 +435,7 @@ tail = "[]"
             decision['passed'] = False
             decision['failure_reasons'].append('All 35 distinct QA sessions must capture successfully; repeated successful calls are allowed')
         gate.update(decision, test_repository=TEST_URL, test_revision=TEST_SHA, dataset_sha256=DATA_SHA, dataset='small',
+                    dataset_repository=DATA_URL, dataset_revision=DATA_REVISION, completion_contract='exact_request_write_receipts',
                     autoCapture_ingest=True, autoCapture_qa=True, llm_model=os.environ['LLM_MODEL'], judge_model=os.environ['LLM_MODEL'],
                     embedding_model=os.environ['EMBEDDING_MODEL'], embedding_dimension=1024, initial_vector_count=initial_count,
                     opengauss_image=DB_IMAGE, openclaw_image=OPENCLAW_IMAGE, openclaw_version=version,

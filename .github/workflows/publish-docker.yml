@@ -18,11 +18,11 @@ on:
       push_image:
         description: 'Push tested image to SWR (requires SWR_USERNAME and SWR_PASSWORD)'
         type: boolean
-        default: true
+        default: false
       create_release:
         description: 'Archive the same gated image as tar.gz in GitHub Release'
         type: boolean
-        default: true
+        default: false
       allow_overwrite:
         description: 'Allow replacing existing SWR tag and Release/tag/assets (old archive is replaced)'
         type: boolean
@@ -158,7 +158,7 @@ jobs:
       - name: Install benchmark client dependencies
         run: |
           python3 -m venv "$RUNNER_TEMP/locomo-client"
-          "$RUNNER_TEMP/locomo-client/bin/pip" install requests httpx websocket-client openai pyyaml
+          "$RUNNER_TEMP/locomo-client/bin/pip" install requests httpx websocket-client openai pyyaml pydantic jsonschema
           printf '%s\n' "$RUNNER_TEMP/locomo-client/bin" >> "$GITHUB_PATH"
 
       - name: Verify real LLM and Embedding access before building
