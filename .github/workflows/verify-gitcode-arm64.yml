@@ -1,0 +1,123 @@
+name: Verify GitCode source on ARM64
+run-name: gitcode-verify-${{ inputs.request_id }}
+
+on:
+  workflow_dispatch:
+    inputs:
+      source_sha:
+        description: 'Exact GitCode master ancestor (40 lowercase hexadecimal characters)'
+        required: true
+        type: string
+      request_id:
+        description: 'Bridge request UUID without hyphens (32 lowercase hexadecimal characters)'
+        required: true
+        type: string
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ogmemory-gitcode-arm64-verify
+  cancel-in-progress: false
+
+jobs:
+  verify:
+    if: github.repository == 'LinQiang391/oGMemory' && github.ref == 'refs/heads/ci'
+    runs-on: ubuntu-24.04-arm
+    timeout-minutes: 180
+    env:
+      REQUESTED_SHA: ${{ inputs.source_sha }}
+      REQUEST_ID: ${{ inputs.request_id }}
+      GIT_TERMINAL_PROMPT: '0'
+    steps:
+      - name: Initialize isolated bridge paths
+        shell: bash
+        run: |
+          printf 'BRIDGE_DIR=%s/gitcode-verify-%s-%s\n' "$RUNNER_TEMP" "$GITHUB_RUN_ID" "$GITHUB_RUN_ATTEMPT" >> "$GITHUB_ENV"
+          printf 'SOURCE_DIR=%s/gitcode-source-%s-%s\n' "$RUNNER_TEMP" "$GITHUB_RUN_ID" "$GITHUB_RUN_ATTEMPT" >> "$GITHUB_ENV"
+
+      - name: Checkout trusted CI at dispatch commit
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ github.sha }}
+          path: ci
+          persist-credentials: false
+
+      - name: Validate inputs and detach exact GitCode master ancestor
+        run: python3 ci/.github/scripts/verify_gitcode_source.py prepare
+
+      - name: Release only unused hosted toolchains and check capacity
+        run: python3 ci/.github/scripts/verify_gitcode_source.py capacity
+
+      - name: Execute a real simple ARM64 container before the full pipeline
+        run: python3 ci/.github/scripts/verify_gitcode_source.py simple
+
+      - name: Set up Python 3.11
+        uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1 # v6
+        with:
+          python-version: '3.11'
+
+      - name: Install isolated pipeline dependencies
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 -m venv "$RUNNER_TEMP/gitcode-verify-venv"
+          "$RUNNER_TEMP/gitcode-verify-venv/bin/python" -m pip install --disable-pip-version-check \
+            --retries 3 --timeout 60 requests httpx websocket-client openai pyyaml
+
+      - name: Full source pipeline - build, smoke and real LoCoMo, never publish
+        id: pipeline
+        timeout-minutes: 140
+        env:
+          ATOMGIT_REF: refs/heads/master
+          ATOMGIT_SHA: ${{ inputs.source_sha }}
+          ATOMGIT_ENV: ${{ github.env }}
+          GITCODE_REPOSITORY: lin-qiang123/oGMemory
+          INPUT_PUSH_IMAGE: 'false'
+          INPUT_CREATE_RELEASE: 'false'
+          INPUT_ALLOW_OVERWRITE: 'false'
+          CREATE_RELEASE: 'false'
+          ALLOW_OVERWRITE: 'false'
+          INPUT_RUNNER_PROBE_ONLY: 'false'
+          LLM_BASE_URL: https://ark.cn-beijing.volces.com/api/coding/v3
+          LLM_MODEL: doubao-seed-2.1-lite
+          LLM_API_KEY: ${{ secrets.LLM_API_KEY }}
+          EMBEDDING_BASE_URL: https://ark.cn-beijing.volces.com/api/coding/v3
+          EMBEDDING_MODEL: doubao-embedding-vision
+          EMBEDDING_API_KEY: ${{ secrets.EMBEDDING_API_KEY }}
+        run: '"$RUNNER_TEMP/gitcode-verify-venv/bin/python" ci/.github/scripts/verify_gitcode_source.py pipeline'
+
+      - name: Always finalize fail-closed bridge result
+        if: always()
+        env:
+          PIPELINE_OUTCOME: ${{ steps.pipeline.outcome }}
+          JOB_STATUS: ${{ job.status }}
+        shell: bash
+        run: |
+          python3 - <<'PY'
+          import json, os, pathlib, subprocess, sys
+          helper = pathlib.Path('ci/.github/scripts/verify_gitcode_source.py')
+          if helper.is_file():
+              sys.exit(subprocess.run([sys.executable, str(helper), 'finalize']).returncode)
+          output = pathlib.Path(os.environ['BRIDGE_DIR']) / 'artifact'
+          output.mkdir(parents=True, exist_ok=True)
+          result = {
+              'schema_version': 1, 'request_id': os.environ['REQUEST_ID'],
+              'source_sha': os.environ['REQUESTED_SHA'], 'status': 'completed',
+              'completed': True, 'passed': False, 'conclusion': 'failure',
+              'validated': {}, 'pipeline_exit_code': None,
+              'failure_reasons': ['Trusted CI checkout/helper unavailable'],
+          }
+          (output / 'bridge-result.json').write_text(json.dumps(result, indent=2) + '\n')
+          sys.exit(1)
+          PY
+
+      - name: Upload the single redacted bridge evidence artifact
+        if: always()
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: gitcode-verify-${{ inputs.request_id }}
+          path: ${{ env.BRIDGE_DIR }}/artifact/
+          include-hidden-files: true
+          retention-days: 14
+          if-no-files-found: warn
