@@ -23,6 +23,14 @@ class ReceiptTests(unittest.TestCase):
             item[key] = value
             self.assertFalse(module.receipt_complete(item))
 
+    def test_qa_receipt_coverage_rejects_missing_duplicate_and_partial(self):
+        proofs = [{'phase': 'qa', 'session_id': 's', 'receipts': [self.complete()]}]
+        self.assertEqual(module.qa_receipt_coverage(proofs, {'s'}), 1)
+        for values, expected in [(proofs, {'s', 'missing'}), (proofs + proofs, {'s'}),
+                                 ([{'phase': 'qa', 'session_id': 's', 'receipts': []}], {'s'})]:
+            with self.assertRaises(RuntimeError):
+                module.qa_receipt_coverage(values, expected)
+
     def test_exact_receipt_polling(self):
         with module.ReceiptProxy('http://127.0.0.1:1') as proxy:
             proxy.writes['session'] = {'oc-request': {'identity': {'accountId': 'a', 'userId': 'u', 'agentId': 'main'}}}

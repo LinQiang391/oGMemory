@@ -382,7 +382,6 @@ tail = "[]"
         if ingest_failures or len(ingest_records) != expected_sessions:
             raise RuntimeError('Incomplete/failed ingestion: release blocked, no fallback to idle-only')
         settle('ingest-conv-26-session_', 4)
-        qa_start = time.time()
         phase('qa,judge')
         retry_records = []
         csv_path = results/'qa_results.csv'
@@ -421,10 +420,11 @@ tail = "[]"
         fatal = [line for line in text.splitlines() if ' ERROR ' in line or 'background extract failed' in line
                  or 'ExtractionIncompleteError:' in line or '[og-memory] HTTP' in line and 'failed' in line]
         decision = verdict(meta, rows, ingest_failures, qa_failures, ingest_records, expected_sessions, fatal)
-        qa_logs = docker('logs', '--since', str(qa_start), app)
-        qa_capture_requests = sum('POST /api/v1/after_turn HTTP/1.1" 200 ' in line for line in (qa_logs.stdout+qa_logs.stderr).splitlines())
+        qa_proofs = json.loads((output/'write-receipts-qa-judge.json').read_text())
+        from workload_locomo import qa_receipt_coverage
         session_index = json.loads((state/'agents/main/sessions/sessions.json').read_text())
         qa_session_ids = {v['sessionId'] for key, v in session_index.items() if 'qa-conv-26-q' in key}
+        qa_capture_requests = qa_receipt_coverage(qa_proofs, qa_session_ids)
         lifecycle_log = oc_logs.stdout+oc_logs.stderr
         captured_ids = set(re.findall(r'afterTurn called, sessionId=([^,\s]+)', lifecycle_log))
         # OpenClaw can redact part of a UUID in logs; correlate using its same logged ID.

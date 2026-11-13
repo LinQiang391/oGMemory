@@ -124,6 +124,27 @@ def receipt_complete(receipt):
             and receipt.get('projection_status') in ('DONE', 'NOT_REQUIRED'))
 
 
+def qa_receipt_coverage(proofs, expected_ids):
+    by_session = {}
+    seen_requests = set()
+    for proof in proofs:
+        sid = proof.get('session_id')
+        receipts = proof.get('receipts', [])
+        if proof.get('phase') != 'qa' or sid not in expected_ids or sid in by_session or not receipts:
+            raise RuntimeError('Unexpected, duplicate or empty QA receipt evidence')
+        for receipt in receipts:
+            rid = receipt.get('request_id')
+            buffered = (receipt.get('accepted') is True and receipt.get('request_status') == 'ACCEPTED'
+                        and receipt.get('source_status') == 'BUFFERED' and receipt.get('ok') is not False)
+            if not rid or rid in seen_requests or not (receipt_complete(receipt) or buffered):
+                raise RuntimeError('Invalid or duplicated exact QA write receipt')
+            seen_requests.add(rid)
+        by_session[sid] = receipts
+    if set(by_session) != expected_ids:
+        raise RuntimeError('Not every expected QA session has exact write receipts')
+    return len(seen_requests)
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('--config', required=True)
@@ -147,7 +168,17 @@ def main():
         os.chmod(args.gateway_config, 0o600)
         try:
             subprocess.run(['docker', 'restart', args.gateway_container], check=True, capture_output=True, timeout=90)
-            time.sleep(5)
+            ready_deadline = time.monotonic() + 90
+            while time.monotonic() < ready_deadline:
+                try:
+                    response = requests.get('http://127.0.0.1:' + str(config['gateway']['port']) + '/health', timeout=3)
+                    if response.status_code == 200:
+                        break
+                except requests.RequestException:
+                    pass
+                time.sleep(1)
+            else:
+                raise RuntimeError('Restarted Gateway did not become ready')
             def wait_exact(*, session_key, timeout, interval, **kwargs):
                 sessions = json.loads((args.state / 'agents/main/sessions/sessions.json').read_text())
                 ids = {row['sessionId'] for key, row in sessions.items() if key == 'agent:main:' + session_key and isinstance(row, dict)}
