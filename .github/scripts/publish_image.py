@@ -140,10 +140,10 @@ def push(output, image):
             or gate.get('pending_questions') != 0 or gate.get('qa_failures') != 0
             or gate.get('ingest_failures') != 0 or gate.get('service_error_count') != 0 or gate.get('judge_failures') != 0
             or gate.get('llm_model') != 'doubao-seed-2.1-lite' or gate.get('embedding_model') != 'doubao-embedding-vision'
-            or gate.get('autoCapture_qa') is not True or gate.get('initial_vector_count') != 0
+            or gate.get('autoCapture_ingest') is not True or gate.get('autoCapture_qa') is not False
+            or gate.get('autoRecall_qa') is not True or gate.get('qa_gateway_restarted') is not True
+            or gate.get('qa_capture_validation') != 'configuration_only' or gate.get('initial_vector_count') != 0
             or gate.get('test_revision') != 'e6544ee8ca11dbfc6bfc192cfefe03cfc163513e'
-            or gate.get('qa_captured_sessions') != 35
-            or type(gate.get('qa_after_turn_requests')) is not int or gate['qa_after_turn_requests'] < 35
             or type(gate.get('correct')) is not int or not 29 <= gate['correct'] <= 35):
         raise RuntimeError('A complete real LoCoMo gate above 80% is required before SWR push')
     if inspect(image)['Id'] != manifest['image_id']:

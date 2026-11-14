@@ -382,6 +382,10 @@ tail = "[]"
         if ingest_failures or len(ingest_records) != expected_sessions:
             raise RuntimeError('Incomplete/failed ingestion: release blocked, no fallback to idle-only')
         settle('ingest-conv-26-session_', 4)
+        plugin_config = config['plugins']['entries']['og-memory-context-engine']['config']
+        plugin_config['autoCapture'] = False
+        plugin_config['autoRecall'] = True
+        private(state/'openclaw.json', json.dumps(config))
         phase('qa,judge')
         retry_records = []
         csv_path = results/'qa_results.csv'
@@ -406,7 +410,6 @@ tail = "[]"
             phase('judge')
         phase('stats')
         docker('stop', '--time', '30', oc)
-        settle('qa-conv-26-q', 35)
         meta = json.loads((results/'meta.json').read_text())
         # MemoryWorkload no longer emits pending_questions; derive it from the actual CSV below.
 
@@ -420,26 +423,16 @@ tail = "[]"
         fatal = [line for line in text.splitlines() if ' ERROR ' in line or 'background extract failed' in line
                  or 'ExtractionIncompleteError:' in line or '[og-memory] HTTP' in line and 'failed' in line]
         decision = verdict(meta, rows, ingest_failures, qa_failures, ingest_records, expected_sessions, fatal)
-        qa_proofs = json.loads((output/'write-receipts-qa-judge.json').read_text())
-        from workload_locomo import qa_receipt_coverage
-        session_index = json.loads((state/'agents/main/sessions/sessions.json').read_text())
-        qa_session_ids = {v['sessionId'] for key, v in session_index.items() if 'qa-conv-26-q' in key}
-        qa_capture_requests = qa_receipt_coverage(qa_proofs, qa_session_ids)
-        lifecycle_log = oc_logs.stdout+oc_logs.stderr
-        captured_ids = set(re.findall(r'afterTurn called, sessionId=([^,\s]+)', lifecycle_log))
-        # OpenClaw can redact part of a UUID in logs; correlate using its same logged ID.
-        logged_qa = dict(re.findall(r'sessionKey=agent:main:(qa-conv-26-q\d+), sessionId=([^,\s]+)', lifecycle_log))
-        expected_qa_keys = {'qa-conv-26-q'+str(row['qi']) for row in rows}
-        captured_sessions = sum(key in expected_qa_keys and logged_id in captured_ids for key, logged_id in logged_qa.items())
-        if len(qa_session_ids) != 35 or set(logged_qa) != expected_qa_keys or captured_sessions != 35 or qa_capture_requests < 35:
-            decision['passed'] = False
-            decision['failure_reasons'].append('All 35 distinct QA sessions must capture successfully; repeated successful calls are allowed')
+        qa_policy = json.loads((output/'qa-memory-policy.json').read_text())
+        if qa_policy.get('autoCapture') is not False or qa_policy.get('autoRecall') is not True or qa_policy.get('gateway_restarted') is not True:
+            raise RuntimeError('QA requires capture disabled, recall enabled and a restarted Gateway')
         gate.update(decision, test_repository=TEST_URL, test_revision=TEST_SHA, dataset_sha256=DATA_SHA, dataset='small',
                     dataset_repository=DATA_URL, dataset_revision=DATA_REVISION, completion_contract='exact_request_write_receipts',
-                    autoCapture_ingest=True, autoCapture_qa=True, llm_model=os.environ['LLM_MODEL'], judge_model=os.environ['LLM_MODEL'],
+                    autoCapture_ingest=True, autoCapture_qa=False, autoRecall_qa=True,
+                    qa_capture_validation='configuration_only', qa_gateway_restarted=True,
+                    llm_model=os.environ['LLM_MODEL'], judge_model=os.environ['LLM_MODEL'],
                     embedding_model=os.environ['EMBEDDING_MODEL'], embedding_dimension=1024, initial_vector_count=initial_count,
-                    opengauss_image=DB_IMAGE, openclaw_image=OPENCLAW_IMAGE, openclaw_version=version,
-                    qa_after_turn_requests=qa_capture_requests, qa_captured_sessions=captured_sessions)
+                    opengauss_image=DB_IMAGE, openclaw_image=OPENCLAW_IMAGE, openclaw_version=version)
         gate_path.write_text(json.dumps(gate, indent=2)+'\n')
         print('LoCoMo gate: '+json.dumps(decision), flush=True)
         if not gate['passed']:

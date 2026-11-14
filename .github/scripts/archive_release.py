@@ -20,7 +20,8 @@ GATE_FIELDS = (
     'passed', 'image_id', 'source_revision', 'correct', 'total_questions',
     'total_graded', 'pending_questions', 'qa_failures', 'ingest_failures',
     'service_error_count', 'judge_failures', 'llm_model', 'embedding_model',
-    'autoCapture_qa', 'initial_vector_count', 'test_revision', 'qa_after_turn_requests', 'qa_captured_sessions',
+    'autoCapture_ingest', 'autoCapture_qa', 'autoRecall_qa', 'qa_gateway_restarted',
+    'qa_capture_validation', 'initial_vector_count', 'test_revision',
 )
 MANIFEST_FIELDS = (
     'source_revision', 'image', 'platform', 'image_id', 'dockerfile',
@@ -117,10 +118,10 @@ def validate_evidence(output, tag):
             'LoCoMo service_error_count must be an integer zero.')
     require(gate['judge_failures'] == 0 and gate['llm_model'] == 'doubao-seed-2.1-lite'
             and gate['embedding_model'] == 'doubao-embedding-vision'
-            and gate['autoCapture_qa'] is True and gate['initial_vector_count'] == 0
-            and gate['test_revision'] == 'e6544ee8ca11dbfc6bfc192cfefe03cfc163513e'
-            and gate['qa_captured_sessions'] == 35
-            and type(gate['qa_after_turn_requests']) is int and gate['qa_after_turn_requests'] >= 35,
+            and gate['autoCapture_ingest'] is True and gate['autoCapture_qa'] is False
+            and gate['autoRecall_qa'] is True and gate['qa_gateway_restarted'] is True
+            and gate['qa_capture_validation'] == 'configuration_only' and gate['initial_vector_count'] == 0
+            and gate['test_revision'] == 'e6544ee8ca11dbfc6bfc192cfefe03cfc163513e',
             'LoCoMo model/capture/freshness contract mismatch.')
     require(manifest.get('python_dependencies_sha256') ==
             hashlib.sha256(dependencies).hexdigest(),

@@ -124,25 +124,15 @@ def receipt_complete(receipt):
             and receipt.get('projection_status') in ('DONE', 'NOT_REQUIRED'))
 
 
-def qa_receipt_coverage(proofs, expected_ids):
-    by_session = {}
-    seen_requests = set()
-    for proof in proofs:
-        sid = proof.get('session_id')
-        receipts = proof.get('receipts', [])
-        if proof.get('phase') != 'qa' or sid not in expected_ids or sid in by_session or not receipts:
-            raise RuntimeError('Unexpected, duplicate or empty QA receipt evidence')
-        for receipt in receipts:
-            rid = receipt.get('request_id')
-            buffered = (receipt.get('accepted') is True and receipt.get('request_status') == 'ACCEPTED'
-                        and receipt.get('source_status') == 'BUFFERED' and receipt.get('ok') is not False)
-            if not rid or rid in seen_requests or not (receipt_complete(receipt) or buffered):
-                raise RuntimeError('Invalid or duplicated exact QA write receipt')
-            seen_requests.add(rid)
-        by_session[sid] = receipts
-    if set(by_session) != expected_ids:
-        raise RuntimeError('Not every expected QA session has exact write receipts')
-    return len(seen_requests)
+def validate_phase_policy(config, steps):
+    plugin = config['plugins']['entries']['og-memory-context-engine']['config']
+    phases = set(steps.split(','))
+    if 'ingest' in phases and 'qa' in phases:
+        raise RuntimeError('Ingest and QA require separate capture configurations')
+    if 'ingest' in phases and plugin.get('autoCapture') is not True:
+        raise RuntimeError('Ingest requires autoCapture enabled')
+    if 'qa' in phases and (plugin.get('autoCapture') is not False or plugin.get('autoRecall') is not True):
+        raise RuntimeError('QA requires autoCapture disabled and autoRecall enabled')
 
 
 def main():
@@ -158,6 +148,7 @@ def main():
     from locomo_test import cli
     from locomo_test import eval as evaluation
     config = json.loads(args.gateway_config.read_text())
+    validate_phase_policy(config, args.steps)
     upstream = config['plugins']['entries']['og-memory-context-engine']['config']['memoryApiBaseUrl']
     if upstream != args.api_url:
         raise RuntimeError('Gateway backend does not match tested image')
@@ -179,6 +170,14 @@ def main():
                 time.sleep(1)
             else:
                 raise RuntimeError('Restarted Gateway did not become ready')
+            loaded_config = json.loads(args.gateway_config.read_text())
+            validate_phase_policy(loaded_config, args.steps)
+            if 'qa' in args.steps.split(','):
+                plugin = loaded_config['plugins']['entries']['og-memory-context-engine']['config']
+                policy = {'autoCapture': plugin['autoCapture'], 'autoRecall': plugin['autoRecall'],
+                          'gateway_restarted': True, 'validation': 'configuration_only'}
+                (args.evidence.parent / 'qa-memory-policy.json').write_text(json.dumps(policy, indent=2) + '\n')
+                print('[CI] QA configuration: autoCapture=false, autoRecall=true; Gateway restarted and healthy', flush=True)
             def wait_exact(*, session_key, timeout, interval, **kwargs):
                 sessions = json.loads((args.state / 'agents/main/sessions/sessions.json').read_text())
                 ids = {row['sessionId'] for key, row in sessions.items() if key == 'agent:main:' + session_key and isinstance(row, dict)}
@@ -194,14 +193,6 @@ def main():
             evaluation.wait_for_ogmem_after_turn_extract = wait_exact
             sys.argv = ['locomo-test', 'run', args.config, '--only', args.steps]
             cli.main()
-            if 'qa' in args.steps.split(','):
-                sessions = json.loads((args.state / 'agents/main/sessions/sessions.json').read_text())
-                ids = {row['sessionId'] for key, row in sessions.items() if 'qa-conv-26-q' in key and isinstance(row, dict)}
-                if len(ids) != 35:
-                    raise RuntimeError('Expected all 35 QA capture sessions')
-                for sid in sorted(ids):
-                    receipts = proxy.wait(sid, 900, 2, capture_only=True)
-                    proofs.append({'phase': 'qa', 'session_id': sid, 'receipts': receipts})
         finally:
             config['plugins']['entries']['og-memory-context-engine']['config']['memoryApiBaseUrl'] = upstream
             args.gateway_config.write_text(json.dumps(config))
